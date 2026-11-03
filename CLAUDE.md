@@ -37,6 +37,12 @@ State and invariants only; the reasoning is in `docs/design.md`.
   4090 it cuts peak VRAM by 1.3 GB (CUDA) / 1.5 GB (WebGPU) at equal speed,
   and moves the clip less than switching backends does: 34.6 dB vs a 33.5 dB
   bf16-vs-f32 baseline (`docs/runs/2026-11-03-vast-4090-int8`). Off by default.
+- 4-bit (`--weights int4-sim[-hqq][-gN][-ffn]`, `quant::Q4`) is simulated
+  (dequantized at load, no memory saving) and evaluation-only: every variant
+  changes the sample for a seed (fox 19.7–23.1 dB, market 17.4–18.7 vs int8's
+  34.6 / 27.1) without visible artifacts, for ~0.4–0.7 GB more saving
+  (`docs/runs/2026-11-03-vast-4090-int4`). No int4 kernels unless download
+  size becomes the goal.
 - WGSL: zero loop-local accumulators explicitly. Dawn (Chrome) on SwiftShader
   carried a `var` declared in a loop body across iterations, which broke
   multi-chunk flash attention while naga/wgpu passed. Run the bench page in

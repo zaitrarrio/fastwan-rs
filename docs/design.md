@@ -128,6 +128,11 @@ step caches (FasterCache, PAB) target 30–50-step samplers, not 3 DMD steps.
 Its HQQ quantizer remains the candidate for an offline int4 export if int8
 is not small enough.
 
+4-bit was evaluated (HQQ ported, groups 32–128, FFN-only): weight SNR
+20–22.5 dB vs int8's 43.6, and every variant changes the sample a seed
+produces, without visible artifacts. It saves only ~0.4–0.7 GB beyond int8,
+so no int4 kernels were written (`docs/runs/2026-11-03-vast-4090-int4`).
+
 Next: an int8 safetensors export so the download shrinks too (the weights
 are quantized at load today, which also adds ~5–7 s to it).
 
