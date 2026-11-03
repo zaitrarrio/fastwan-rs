@@ -155,7 +155,8 @@ const grid = (n) => { n = Math.max(1, n); if (n <= MAX_DIM) return [n, 1, 1]; co
 // ---- ops ------------------------------------------------------------------
 const GPU = {
   linear(x, xRow, rows, w, bias, act, y, yRow) {
-    const p = pipeline(w.f16 ? "linear_f16" : "linear_f32", () => weightSrc(SHADERS.linear, w.f16));
+    // linear3: the engine's default GEMM (hand-unrolled vec4 accumulators).
+    const p = pipeline(w.f16 ? "linear3_f16" : "linear3_f32", () => weightSrc(SHADERS.linear3, w.f16));
     dispatch(p, [rows, w.rows, w.cols, xRow, yRow, bias ? 1 : 0, act], [x, w.buf, bias ?? dummy, y], [Math.ceil(w.rows / 64), Math.ceil(rows / 64), 1]);
   },
   norm(h, a, rows, dim, mods, gate, norm, eps, out) {

@@ -748,13 +748,15 @@ impl Backend for Wgpu {
         // 128×128 tiles for the big GEMMs (FASTWAN_WGPU_LINEAR=1 forces the
         // 64×64 kernel, for A/B); small row counts keep the 64×64 kernel.
         // FASTWAN_WGPU_LINEAR selects the GEMM kernel for A/B runs:
-        // 1 = 64×64 array accumulators (linear.wgsl, the default),
+        // 1 = 64×64 array accumulators (linear.wgsl),
         // 2 = 128×128 (linear2.wgsl: measured 38% slower on an RTX 4090),
-        // 3 = 64×64 with hand-unrolled vec4 accumulators (linear3.wgsl).
+        // 3 = 64×64 with hand-unrolled vec4 accumulators (linear3.wgsl, the
+        //     default: 5.75× faster than 1 on an RTX 4090, 446 → 77.5 ms per
+        //     FFN GEMM; the arrays of 1 and 2 were spilled to local memory).
         let variant = std::env::var("FASTWAN_WGPU_LINEAR")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(1);
+            .unwrap_or(3);
         let variant = if variant == 2 && rows < 128 {
             1
         } else {
@@ -762,8 +764,8 @@ impl Backend for Wgpu {
         };
         let (src, tile, name) = match variant {
             2 => (LINEAR2, 128, "linear2"),
-            3 => (LINEAR3, 64, "linear3"),
-            _ => (LINEAR, 64, "linear"),
+            1 => (LINEAR, 64, "linear"),
+            _ => (LINEAR3, 64, "linear3"),
         };
         let key = format!("{name}_{}", if f16 { "f16" } else { "f32" });
         let pipe = self.pipeline(&key, || Self::weight_src(src, f16));

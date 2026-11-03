@@ -10,7 +10,8 @@ root = pathlib.Path(__file__).resolve().parent
 sh = root.parent / "crates/fastwan-wgpu/src/shaders"
 names = {"common": "common", "linear": "linear", "conv": "conv", "attention": "attention",
          "norm": "norm", "head_split": "head_split", "elementwise": "elementwise",
-         "flash": "flash", "vsa_pool": "vsa_pool", "vsa_coarse": "vsa_coarse"}
+         "flash": "flash", "vsa_pool": "vsa_pool", "vsa_coarse": "vsa_coarse",
+         "linear3": "linear3"}
 shaders = {k: (sh / f"{v}.wgsl").read_text() for k, v in names.items()}
 page = (root / "test-page.template.html").read_text().replace("/*SHADERS*/{}", json.dumps(shaders, indent=1, ensure_ascii=False))
 (root / "dist").mkdir(exist_ok=True)

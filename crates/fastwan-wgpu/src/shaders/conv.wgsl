@@ -49,7 +49,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     let m0 = (wid.y + wid.z * nwg.y) * 64u;
     let n0 = wid.x * 64u;
     let tid = lid.y * 16u + lid.x;
-    var acc: array<array<f32, 4>, 4>;
+    // 4×4 block as named vec4 (rows ty + 16i, cols tx + 16j): arrays here are
+    // kept in local memory by NVIDIA's Vulkan compiler (see linear3.wgsl).
+    var c0 = vec4<f32>(0.0);
+    var c1 = vec4<f32>(0.0);
+    var c2 = vec4<f32>(0.0);
+    var c3 = vec4<f32>(0.0);
     for (var k0 = 0u; k0 < kt; k0 = k0 + 16u) {
         for (var i = 0u; i < 4u; i = i + 1u) {
             let e = tid + i * 256u;
@@ -65,21 +70,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 16u; kk = kk + 1u) {
-            var av: array<f32, 4>;
-            var bv: array<f32, 4>;
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                av[i] = xs[kk][lid.y + 16u * i];
-                bv[i] = ws[kk][lid.x + 16u * i];
-            }
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                for (var j = 0u; j < 4u; j = j + 1u) {
-                    acc[i][j] = fma(av[i], bv[j], acc[i][j]);
-                }
-            }
+            let b = vec4<f32>(ws[kk][lid.x], ws[kk][lid.x + 16u], ws[kk][lid.x + 32u], ws[kk][lid.x + 48u]);
+            c0 = fma(vec4<f32>(xs[kk][lid.y]), b, c0);
+            c1 = fma(vec4<f32>(xs[kk][lid.y + 16u]), b, c1);
+            c2 = fma(vec4<f32>(xs[kk][lid.y + 32u]), b, c2);
+            c3 = fma(vec4<f32>(xs[kk][lid.y + 48u]), b, c3);
         }
         workgroupBarrier();
     }
     let plane = oh * ow;
+    let accs = array<vec4<f32>, 4>(c0, c1, c2, c3);
     for (var i = 0u; i < 4u; i = i + 1u) {
         let m = m0 + lid.y + 16u * i;
         if (m >= mt) { continue; }
@@ -88,7 +88,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
         for (var j = 0u; j < 4u; j = j + 1u) {
             let n = n0 + lid.x + 16u * j;
             if (n >= p.cout) { continue; }
-            var v = acc[i][j];
+            var v = accs[i][j];
             if (p.has_bias != 0u) { v = v + bias[n]; }
             let o = (f * p.cout + n) * plane + px;
             if (p.ep == 1u) { v = max(v, 0.0); }
