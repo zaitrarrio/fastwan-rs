@@ -8,5 +8,5 @@ pub mod pipeline;
 pub mod taehv;
 
 pub use dit::WanDit;
-pub use pipeline::{Pipeline, Timings, Video};
+pub use pipeline::{Event, Options, Pipeline, Timings, Video};
 pub use taehv::TaeHv;

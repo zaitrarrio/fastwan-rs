@@ -32,7 +32,26 @@ cargo build --release --features cuda      # + CUDA (no CUDA toolkit needed to b
 ./target/release/fastwan bench --layers 4  # synthetic weights, real 480p geometry
 ```
 
-Generate (prompt embeddings come from `scripts/encode_prompt.py`):
+### Prompt-to-clip demo
+
+```bash
+huggingface-cli download FastVideo/FastWan2.1-T2V-1.3B-Diffusers \
+    --include "transformer/*" "text_encoder/*" "tokenizer/*" --local-dir fastwan
+huggingface-cli download madebyollin/taehv taew2_1.safetensors --local-dir fastwan
+./target/release/fastwan serve --model-dir fastwan      # then open http://127.0.0.1:7860/
+```
+
+`fastwan serve` keeps the DiT and TAEHV resident on the GPU, encodes prompts
+with a native UMT5-XXL port on the CPU (reading the bf16 weights straight from
+the mmapped files; budget ~12 GB of RAM for the page cache), and serves
+`web/demo.html`: type a prompt, pick a size, length and seed, and watch the
+three steps and the decode land, with frames playing as they arrive. Save as
+WebM or PNG from the page. `--synthetic` runs a tiny random model, for trying
+the engine and page without downloading anything (the clips are noise).
+
+### One clip from the command line
+
+Prompt embeddings come from `scripts/encode_prompt.py`:
 
 ```bash
 huggingface-cli download FastVideo/FastWan2.1-T2V-1.3B-Diffusers --include "transformer/*" --local-dir fastwan
@@ -59,8 +78,10 @@ crates/fastwan-cpu     reference backend
 crates/fastwan-wgpu    WebGPU backend (src/shaders/*.wgsl)
 crates/fastwan-cuda    CUDA backend (src/kernels.cu, NVRTC + cuBLAS)
 crates/fastwan-model   Wan DiT, TAEHV, DMD pipeline, conformance checker
-crates/fastwan-cli     the `fastwan` binary
-web/                   WebGPU test page
+crates/fastwan-text    tokenizer + UMT5-XXL encoder (CPU, bf16 weights in place)
+crates/fastwan-cli     the `fastwan` binary (plan / check / bench / generate / serve)
+web/                   demo.html (prompt to clip, served by `fastwan serve`), WebGPU test page
+scripts/reference/     fixtures from transformers / diffusers that the Rust ports are tested against
 docs/design.md         what is fused and why, what is verified, what is next
 ```
 

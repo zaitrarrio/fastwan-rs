@@ -33,6 +33,27 @@ impl Timings {
     }
 }
 
+/// Progress of a generation, in order: `Prepared`, one `Step` per DMD step,
+/// then `Frames` once per decoded chunk (8-bit RGB, `count` frames starting
+/// at frame `first`).
+pub enum Event<'a> {
+    Prepared {
+        secs: f64,
+    },
+    Step {
+        index: usize,
+        total: usize,
+        secs: f64,
+    },
+    Frames {
+        first: usize,
+        count: usize,
+        width: usize,
+        height: usize,
+        rgb: &'a [u8],
+    },
+}
+
 /// `frames × height × width × RGB`, 8-bit.
 pub struct Video {
     pub frames: usize,
@@ -50,6 +71,17 @@ impl<B: Backend> Pipeline<B> {
         opt: &Options,
         t: &mut Timings,
     ) -> Result<Vec<f32>> {
+        self.denoise_with(be, embeds, opt, t, &mut |_| {})
+    }
+
+    pub fn denoise_with(
+        &self,
+        be: &B,
+        embeds: &[f32],
+        opt: &Options,
+        t: &mut Timings,
+        on: &mut dyn FnMut(Event<'_>),
+    ) -> Result<Vec<f32>> {
         let cfg = &self.dit.cfg;
         opt.geometry.validate(cfg)?;
         let n = opt.geometry.latent_len(cfg);
@@ -66,6 +98,7 @@ impl<B: Backend> Pipeline<B> {
         let ws = self.dit.workspace(be, opt.geometry.latent(), opt.ffn_chunk);
         be.sync();
         t.prompt_s = t0.elapsed().as_secs_f64();
+        on(Event::Prepared { secs: t.prompt_s });
 
         let x = be.upload(&rng.normal(n));
         let v = be.alloc(n);
@@ -80,6 +113,11 @@ impl<B: Backend> Pipeline<B> {
             be.dmd_step(&x, &v, next.map(|_| &noise), st, next.unwrap_or(0.0), n);
             be.sync();
             t.steps_s.push(t0.elapsed().as_secs_f64());
+            on(Event::Step {
+                index: i,
+                total: mods.len(),
+                secs: t0.elapsed().as_secs_f64(),
+            });
         }
         Ok(be.download(&x))
     }
@@ -92,6 +130,18 @@ impl<B: Backend> Pipeline<B> {
         g: &Geometry,
         chunk: usize,
         t: &mut Timings,
+    ) -> Video {
+        self.decode_with(be, latent, g, chunk, t, &mut |_| {})
+    }
+
+    pub fn decode_with(
+        &self,
+        be: &B,
+        latent: &[f32],
+        g: &Geometry,
+        chunk: usize,
+        t: &mut Timings,
+        on: &mut dyn FnMut(Event<'_>),
     ) -> Video {
         let t0 = Instant::now();
         let (lt, lh, lw) = g.latent();
@@ -115,6 +165,7 @@ impl<B: Backend> Pipeline<B> {
             (width, height) = (fr.width, fr.height);
             frames += fr.frames;
             let px = fr.width * fr.height;
+            let start = out.len();
             for f in 0..fr.frames {
                 for i in 0..px {
                     for ch in 0..3 {
@@ -123,6 +174,13 @@ impl<B: Backend> Pipeline<B> {
                     }
                 }
             }
+            on(Event::Frames {
+                first: frames - fr.frames,
+                count: fr.frames,
+                width,
+                height,
+                rgb: &out[start..],
+            });
             f0 += nfr;
         }
         t.decode_s = t0.elapsed().as_secs_f64();
@@ -135,9 +193,20 @@ impl<B: Backend> Pipeline<B> {
     }
 
     pub fn generate(&self, be: &B, embeds: &[f32], opt: &Options) -> Result<(Video, Timings)> {
+        self.generate_with(be, embeds, opt, &mut |_| {})
+    }
+
+    /// [`Pipeline::generate`], reporting progress to `on` as it goes.
+    pub fn generate_with(
+        &self,
+        be: &B,
+        embeds: &[f32],
+        opt: &Options,
+        on: &mut dyn FnMut(Event<'_>),
+    ) -> Result<(Video, Timings)> {
         let mut t = Timings::default();
-        let latent = self.denoise(be, embeds, opt, &mut t)?;
-        let video = self.decode(be, &latent, &opt.geometry, opt.tae_chunk, &mut t);
+        let latent = self.denoise_with(be, embeds, opt, &mut t, on)?;
+        let video = self.decode_with(be, &latent, &opt.geometry, opt.tae_chunk, &mut t, on);
         Ok((video, t))
     }
 }

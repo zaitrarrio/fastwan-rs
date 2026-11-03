@@ -67,6 +67,24 @@ impl SafetensorsDir {
         Ok(Self { maps, index })
     }
 
+    /// The stored bytes of a tensor, without conversion: `(dtype, shape, data)`.
+    /// Lets a host-side model (the UMT5 encoder) read bf16 weights straight
+    /// out of the page cache instead of materialising an f32 copy.
+    pub fn raw(&self, name: &str) -> Result<(safetensors::Dtype, Vec<usize>, &[u8])> {
+        let i = *self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::Weights(format!("missing tensor `{name}`")))?;
+        let st = safetensors::SafeTensors::deserialize(&self.maps[i])
+            .map_err(|e| Error::Weights(e.to_string()))?;
+        let t = st.tensor(name).map_err(|e| Error::Weights(e.to_string()))?;
+        Ok((t.dtype(), t.shape().to_vec(), t.data()))
+    }
+
+    pub fn contains_raw(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.index.keys().map(String::as_str)
     }

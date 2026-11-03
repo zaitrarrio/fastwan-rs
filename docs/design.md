@@ -55,7 +55,9 @@ checks cover them):
 
 | claim | evidence |
 |---|---|
-| CPU model math = fastvideo-rs/Diffusers semantics | ported line by line (keys, slot order, RoPE split, DMD table); **not yet compared against a real FastWan output** |
+| Wan DiT = Diffusers `WanTransformer3DModel` | one forward on tiny random weights, rel 3.7e-7 (`fastwan-model/tests/hf_parity.rs`, diffusers 0.42) |
+| UMT5 encoder = transformers `UMT5EncoderModel` | tiny random weights, rel 1.5e-6, reference run padded + masked as WanPipeline does it, Rust run on the real tokens only (`fastwan-text/tests/hf_parity.rs`, transformers 5.22) |
+| a real FastWan clip looks right | **not run**: needs the 14 GB of weights and a GPU |
 | WebGPU kernels = CPU reference | 25 checks in `fastwan-model::check`, worst rel. error 2.6e-4 (f16 weights), on wgpu/naga + lavapipe; 18 kernel checks in the test page on Chrome/Dawn + SwiftShader |
 | tiny DiT 3 DMD steps, WebGPU vs CPU | rel 1.6e-4 |
 | FFN chunking and TAEHV chunking change nothing | CPU tests, < 1e-6 |
@@ -89,8 +91,11 @@ self-attention. That drives the next steps:
 
 ## Other known gaps
 
-- The UMT5-XXL text encoder is not ported. Prompts are encoded by
-  `scripts/encode_prompt.py`.
+- UMT5 runs on the CPU: about 4.6 GMAC per prompt token over 11.4 GB of
+  bf16 weights, so it is bound by memory bandwidth (expect a few seconds per
+  prompt on a desktop, unmeasured). A GPU path would need ~11.4 GB of VRAM on
+  top of the DiT. Wan's ftfy text fixing is not ported; whitespace and HTML
+  entities are cleaned.
 - On CUDA the latents are bf16; FastVideo keeps them f32. Move `dmd_step`'s
   state to f32 if the 3-step drift shows.
 - `linear`'s bias/GELU on CUDA is a second pass; cuBLASLt epilogues would
@@ -99,6 +104,16 @@ self-attention. That drives the next steps:
 - The full Wan VAE is not implemented (TAEHV only). fastvideo-rs measures the
   full VAE at 2.91 s vs TAEHV 0.26 s on an RTX PRO 6000, with lower quality
   for TAEHV.
+
+## The demo engine (`fastwan serve`)
+
+One engine thread owns the backend and the resident models and runs jobs one
+at a time; the HTTP thread only reads a shared job table, so a page polling
+for progress never waits on the GPU. The pipeline reports `Prepared`, one
+`Step` per DMD step, and `Frames` per TAEHV chunk, so the page plays frames
+while the rest of the clip decodes. The server binds 127.0.0.1 and sends no
+CORS headers, so another website cannot queue work on your GPU. It keeps the
+last eight clips (their RGB frames are the memory cost).
 
 ## Reference numbers (fastvideo-rs, not this repo)
 

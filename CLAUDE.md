@@ -19,6 +19,13 @@ State and invariants only; the reasoning is in `docs/design.md`.
   `weights::wan_manifest` / `tae_manifest`. A missing key is an error, never a
   default.
 - No speed claim without a measurement on named hardware.
+- The Wan DiT and UMT5 are tested against transformers / diffusers fixtures
+  (`scripts/reference/make_fixtures.py`, tiny random weights, checked in). A
+  change to either model must keep `hf_parity` green; regenerate fixtures
+  only when the reference library changes, and say which version.
+- `fastwan serve` binds 127.0.0.1 and sends no CORS headers on purpose (a
+  page on another origin must not be able to queue GPU jobs). `web/demo.html`
+  is compiled into the binary (`include_str!`); rebuild after editing it.
 - Tests: `cargo test --workspace` (needs a Vulkan driver for the WebGPU suite:
   `mesa-vulkan-drivers`); NVRTC kernel compile needs libnvrtc on
   `LD_LIBRARY_PATH` (`pip install nvidia-cuda-nvrtc-cu12`).

@@ -10,7 +10,11 @@ fastwan-core = { version = "0.1.0", path = "../fastwan-core" }
 fastwan-cpu = { version = "0.1.0", path = "../fastwan-cpu" }
 fastwan-cuda = { version = "0.1.0", path = "../fastwan-cuda", optional = true }
 fastwan-model = { version = "0.1.0", path = "../fastwan-model" }
+fastwan-text = { version = "0.1.0", path = "../fastwan-text" }
 fastwan-wgpu = { version = "0.1.0", path = "../fastwan-wgpu" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny_http = "0.12.0"
 
 [features]
 default = []

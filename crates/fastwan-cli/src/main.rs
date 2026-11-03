@@ -18,6 +18,8 @@ use fastwan_model::{
 };
 use std::path::{Path, PathBuf};
 
+mod serve;
+
 #[derive(Parser)]
 #[command(
     name = "fastwan",
@@ -90,6 +92,30 @@ enum Cmd {
         layers: usize,
         #[arg(long, default_value_t = false)]
         decode: bool,
+    },
+    /// Run the local engine and the prompt-to-clip demo page.
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7860")]
+        addr: String,
+        #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
+        backend: BackendKind,
+        /// A FastVideo/FastWan2.1-T2V-1.3B-Diffusers download (transformer/,
+        /// text_encoder/, tokenizer/); TAEHV is read from <dir>/taew2_1.safetensors
+        /// unless --tae says otherwise.
+        #[arg(long, required_unless_present = "synthetic")]
+        model_dir: Option<PathBuf>,
+        #[arg(long)]
+        tae: Option<PathBuf>,
+        /// Tiny random model: test the engine and page without weights.
+        #[arg(long, default_value_t = false)]
+        synthetic: bool,
+        /// Largest frame the page may ask for, in pixels (832×480 = 399360).
+        #[arg(long, default_value_t = 832 * 480)]
+        max_pixels: usize,
+        #[arg(long, default_value_t = 81)]
+        max_frames: usize,
+        #[arg(long, default_value_t = 2)]
+        tae_chunk: usize,
     },
     /// Generate a clip from precomputed UMT5 prompt embeddings.
     Generate {
@@ -192,6 +218,38 @@ fn main() -> Result<()> {
                 layers,
                 decode
             )?)
+        }
+        Cmd::Serve {
+            addr,
+            backend,
+            model_dir,
+            tae,
+            synthetic,
+            max_pixels,
+            max_frames,
+            tae_chunk,
+        } => {
+            let weights = if synthetic {
+                serve::Weights::Synthetic
+            } else {
+                let d = model_dir.expect("clap requires --model-dir");
+                serve::Weights::Real {
+                    transformer: d.join("transformer"),
+                    text_encoder: d.join("text_encoder"),
+                    tokenizer: d.join("tokenizer").join("tokenizer.json"),
+                    tae: tae.unwrap_or_else(|| d.join("taew2_1.safetensors")),
+                }
+            };
+            let settings = serve::Settings {
+                addr,
+                weights,
+                max_pixels,
+                max_frames,
+                tae_chunk,
+            };
+            serve::serve(settings, move |s, shared, rx| {
+                with_backend!(backend, |be| serve::engine(be, s, shared, rx))
+            })?;
         }
         Cmd::Generate {
             shape,
