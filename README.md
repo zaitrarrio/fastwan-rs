@@ -20,6 +20,9 @@ model and written for consumer hardware instead of a datacenter.
 CUDA 5.0 GB peak for 832×480×81 (3.6 GB at 480×272×33); WebGPU 7.2 GB
 (4.4 GB). The text encoder runs on the CPU (11–22 GB of RAM).
 
+On AMD, Intel or Apple GPUs try `FASTWAN_WGPU_F16=1` (f16 math kernels:
+same output to 43.8 dB PSNR; no gain on NVIDIA GeForce, unmeasured elsewhere).
+
 `--backend auto` picks CUDA when it is built in and a device answers, and
 WebGPU otherwise.
 

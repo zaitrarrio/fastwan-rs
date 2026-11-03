@@ -87,7 +87,9 @@ self-attention. That drives the next steps:
    accumulators instead of arrays, which NVIDIA's Vulkan compiler kept in
    local memory) took the GEMM to ≈ 11.6 TFLOP/s and a VSA 480p step from
    83 s to 12.9 s (`docs/runs/2026-11-03-vast-4090-webgpu-perf`). Bigger
-   tiles alone were 38% slower. Next: f16 math with `shader-f16`, then
+   tiles alone were 38% slower. f16 math with `shader-f16` is implemented and
+   opt-in: same output (43.8 dB PSNR) but 8.5% slower on a 4090, where f16
+   has no rate advantage; it awaits an AMD / Intel / Apple measurement. Next:
    subgroups / cooperative matrices where the adapter has them.
 4. **AMD fast path.** WebGPU (Vulkan) already runs on AMD. A HIP backend
    would be a mechanical port of `kernels.cu` (hipRTC + hipBLASLt) for ROCm

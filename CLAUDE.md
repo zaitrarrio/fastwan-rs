@@ -27,6 +27,10 @@ State and invariants only; the reasoning is in `docs/design.md`.
   arrays indexed in loops. NVIDIA's Vulkan compiler kept those arrays in local
   memory: unrolling made the GEMM 5.75× and flash attention 7.8× faster.
   `FASTWAN_PROFILE=1` gives per-kernel GPU time; check it after kernel work.
+- WebGPU f16 math (`linear3h`, `flash_h`, `FASTWAN_WGPU_F16=1`) is opt-in: correct
+  (PSNR 43.8 dB vs f32 on a real clip) but 8.5% slower on an RTX 4090, where
+  f16 runs at the f32 rate (`docs/runs/2026-11-03-vast-4090-f16`). Unmeasured
+  on AMD / Intel / Apple, where it should pay; measure before defaulting it on.
 - WGSL: zero loop-local accumulators explicitly. Dawn (Chrome) on SwiftShader
   carried a `var` declared in a loop body across iterations, which broke
   multi-chunk flash attention while naga/wgpu passed. Run the bench page in
