@@ -174,9 +174,17 @@ pub fn engine<B: Backend>(
     rx: mpsc::Receiver<u64>,
 ) -> Result<()> {
     let t0 = Instant::now();
+    let stage = |what: &str| {
+        eprintln!("engine: {what} ({:.1}s)", t0.elapsed().as_secs_f64());
+        let mut info = shared.info.lock().unwrap();
+        info["loading"] = json!(what);
+        info["loading_s"] = json!(t0.elapsed().as_secs_f64());
+    };
+    stage(&format!("starting on {}", be.name()));
     let (pipe, text, model) = match &s.weights {
         Weights::Synthetic => {
-            let (cfg, tcfg) = (WanConfig::tiny(), TaeConfig::tiny());
+            // head_dim 32: small, but runs VSA on every backend.
+            let (cfg, tcfg) = (WanConfig::tiny_vsa(), TaeConfig::tiny());
             let src = Synthetic { seed: 1 };
             let text = Text::Synthetic {
                 len: cfg.text_len,
@@ -208,6 +216,7 @@ pub fn engine<B: Backend>(
                     tae.display()
                 ));
             }
+            stage("checking the checkpoint");
             let w = SafetensorsDir::open(transformer)?;
             let miss = missing(&w, &wan_manifest(&cfg));
             if !miss.is_empty() {
@@ -226,14 +235,19 @@ pub fn engine<B: Backend>(
                     &miss[..miss.len().min(3)]
                 ));
             }
+            stage("opening the text encoder");
             let enc = fastwan_text::PromptEncoder::open(
                 tokenizer,
                 text_encoder,
                 fastwan_text::Umt5Config::xxl(),
             )?;
+            stage("loading the transformer onto the GPU (1.4B parameters)");
+            let dit = WanDit::load(&be, cfg, &w)?;
+            stage("loading the TAEHV decoder");
+            let tae = TaeHv::load(&be, tcfg, &tw)?;
             let pipe = Pipeline {
-                dit: WanDit::load(&be, cfg, &w)?,
-                tae: TaeHv::load(&be, tcfg, &tw)?,
+                dit,
+                tae,
                 schedule: DmdSchedule::fastwan_1_3b(),
             };
             (
@@ -243,6 +257,7 @@ pub fn engine<B: Backend>(
             )
         }
     };
+    stage("waiting for the GPU");
     be.sync();
     {
         let mut info = shared.info.lock().unwrap();
@@ -440,9 +455,34 @@ pub fn serve(
         std::thread::Builder::new()
             .name("engine".into())
             .spawn(move || {
-                if let Err(e) = start_engine(&s, shared.clone(), rx) {
-                    eprintln!("engine failed: {e:#}");
-                    shared.info.lock().unwrap()["error"] = json!(format!("{e:#}"));
+                // A panic (GPU out of memory, a driver validation error, a
+                // failed assertion) must reach the page: without this the
+                // thread died silently and the page waited for ever.
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    start_engine(&s, shared.clone(), rx)
+                }));
+                let msg = match run {
+                    Ok(Ok(())) => return,
+                    Ok(Err(e)) => format!("{e:#}"),
+                    Err(p) => format!(
+                        "engine crashed: {}",
+                        p.downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| p.downcast_ref::<&str>().copied())
+                            .unwrap_or("panic")
+                    ),
+                };
+                eprintln!("engine failed: {msg}");
+                {
+                    let mut info = shared.info.lock().unwrap();
+                    info["ready"] = json!(false);
+                    info["error"] = json!(msg.clone());
+                }
+                for j in shared.jobs.lock().unwrap().iter_mut() {
+                    if !matches!(j.stage, Stage::Done | Stage::Failed) {
+                        j.stage = Stage::Failed;
+                        j.error = Some(msg.clone());
+                    }
                 }
             })
             .context("spawn engine")?;

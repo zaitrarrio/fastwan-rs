@@ -204,6 +204,13 @@ pub trait Backend {
         out: &Self::Buf,
     );
 
+    /// Whether [`Backend::vsa_attention`] can run at this head dim on this
+    /// device (WebGPU needs its flash kernel: head_dim % 16 == 0, ≤ 128, and
+    /// enough workgroup memory).
+    fn vsa_supported(&self, _head_dim: usize) -> bool {
+        true
+    }
+
     /// Build the VSA state for one token grid ([`crate::vsa::VsaSpec`]).
     fn vsa_prepare(&self, spec: &crate::vsa::VsaSpec) -> Self::Vsa;
 

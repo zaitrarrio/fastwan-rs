@@ -186,7 +186,11 @@ async function refreshInfo() {
     $("go").disabled = true; schedule(3000); return;
   }
   if (info.error) { setEngine("bad", "Engine failed to start: " + info.error); $("go").disabled = true; return; }
-  if (!info.ready) { setEngine("wait", "Loading the model…"); $("go").disabled = true; schedule(1500); return; }
+  if (!info.ready) {
+    const secs = info.loading_s != null ? ` · ${Math.round(info.loading_s)} s` : "";
+    setEngine("wait", `Loading the model: ${info.loading || "starting"}${secs}`);
+    $("go").disabled = true; schedule(1500); return;
+  }
   setEngine("ok", `${info.model} · ${info.backend}`);
   if (!SAME) $("connect").hidden = true;
   $("synthetic").hidden = !info.synthetic;

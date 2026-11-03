@@ -301,7 +301,8 @@ impl<B: Backend> WanDit<B> {
     }
 
     /// `attention: None` picks VSA at the default sparsity on a VSA checkpoint
-    /// (what it was distilled with) and dense attention otherwise.
+    /// (what it was distilled with) when the backend can run it, and dense
+    /// attention otherwise.
     pub fn workspace(
         &self,
         be: &B,
@@ -315,13 +316,14 @@ impl<B: Backend> WanDit<B> {
         let d = c.dim();
         let chunk = ffn_chunk.clamp(1, s);
         let rope = rope_table(c, grid, 0);
-        let attention = attention.unwrap_or(if self.has_vsa_gates() {
-            Attention::Vsa {
-                sparsity: fastwan_core::vsa::DEFAULT_SPARSITY,
-            }
-        } else {
-            Attention::Dense
-        });
+        let attention =
+            attention.unwrap_or(if self.has_vsa_gates() && be.vsa_supported(c.head_dim) {
+                Attention::Vsa {
+                    sparsity: fastwan_core::vsa::DEFAULT_SPARSITY,
+                }
+            } else {
+                Attention::Dense
+            });
         let vsa = match attention {
             Attention::Vsa { sparsity } => {
                 assert!(

@@ -723,6 +723,10 @@ impl Backend for Wgpu {
         );
     }
 
+    fn vsa_supported(&self, head_dim: usize) -> bool {
+        self.flash_ok && head_dim % 16 == 0 && head_dim <= 128
+    }
+
     fn vsa_prepare(&self, spec: &fastwan_core::vsa::VsaSpec) -> GVsa {
         let (nb, h, d) = (spec.plan.num_tiles(), spec.heads, spec.head_dim);
         assert!(
