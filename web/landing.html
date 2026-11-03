@@ -48,7 +48,7 @@ footer { color: var(--muted); font-size: 0.85rem; }
 
   <figure class="clip">
     <video src="/media/fox-832x480.mp4" autoplay muted loop playsinline width="832" height="480"></video>
-    <figcaption>"A red fox trots through fresh snow in a birch forest at dawn…" · 832×480, 81 frames, seed 7 · generated in 10.8 s on an RTX 4090</figcaption>
+    <figcaption>"A red fox trots through fresh snow in a birch forest at dawn…" · 832×480, 81 frames, seed 7 · generated in 10.8 s on an RTX 4090 (dense attention; 6.9 s with VSA)</figcaption>
   </figure>
 
   <div class="pages">
@@ -81,7 +81,7 @@ fastwan serve --model-dir fastwan --allow-origin <span id="origin">https://fastw
     <ul>
       <li>The Wan DiT matches Diffusers to 4·10⁻⁷ and the UMT5 text encoder matches transformers to 2·10⁻⁶, on random-weight test models.</li>
       <li>Every WebGPU kernel passes against a CPU reference in both wgpu and Chrome's WebGPU.</li>
-      <li>On an RTX 4090 with CUDA, a 5-second 832×480 clip takes 10.8 s: three denoising steps of 2.9 s with tensor-core attention, plus 1.9 s to decode. The WebGPU path is correct on the same card but still far too slow at this size; its attention kernel is next.</li>
+      <li>On an RTX 4090 with CUDA, a 5-second 832×480 clip takes 6.9 s: three denoising steps of 1.35 s with video sparse attention, plus the decode. The WebGPU path is correct on the same card at about a minute per step; its kernels are the next target.</li>
     </ul>
   </section>
 

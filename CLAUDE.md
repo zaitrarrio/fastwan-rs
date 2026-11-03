@@ -7,8 +7,11 @@ State and invariants only; the reasoning is in `docs/design.md`.
   `fastwan-model/src/check.rs`, all in the same change.
 - The CPU backend is ground truth. GPU code is trusted only after
   `fastwan check --backend <b>` passes on that hardware. Both pass on an RTX
-  4090 (2026-11-03, `docs/runs/2026-11-03-vast-4090`): CUDA 2.9 s per 480p
-  step, WebGPU > 20 min (scalar attention). Neither has run on AMD yet.
+  4090 (`docs/runs/2026-11-03-vast-4090-vsa`): 480p step CUDA 1.35 s (VSA) /
+  2.48 s (dense), WebGPU ≈ 65 s (VSA) / 136 s (dense). Neither has run on AMD.
+- Attention: VSA (sparsity 0.8) is the default whenever every block has
+  `to_gate_compress` (FastWan does); `--attention dense` to compare. The VSA
+  CPU path is fastvideo-rs's host oracle; keep GPU kernels checked against it.
 - Rentals: `scripts/vast/` (no SSH; R2 command channel). Arm a destroy timer
   at rent time, `timeout` every command, run the decisive work first.
 - WebGPU refuses software adapters for bench/generate/serve

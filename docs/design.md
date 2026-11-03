@@ -64,7 +64,8 @@ checks cover them):
 | CUDA kernels compile | NVRTC 12.9, compute_80/89/120, in `cargo test` when libnvrtc loads |
 | CUDA results | all 27 checks pass on an RTX 4090 (`docs/runs/2026-11-03-vast-4090`) |
 | WebGPU on a real GPU | all checks pass on the 4090 through NVIDIA Vulkan |
-| speed | RTX 4090, 832×480×81: 2.9 s per DMD step, 10.8 s per clip with TAEHV (CUDA, tensor-core attention). WebGPU: over 20 min per step |
+| speed | RTX 4090, 832×480×81, CUDA: 1.35 s per DMD step with VSA (2.48 s dense), **6.9 s per clip** with TAEHV. WebGPU: ≈ 65 s per step with VSA (`docs/runs/2026-11-03-vast-4090-vsa`) |
+| VSA = fastvideo-rs's host reference | CPU path is that oracle; wgpu and CUDA match it on 3 grids (rel ≤ 6e-7 / 5e-3) and end to end on a tiny model, on an RTX 4090 |
 
 ## Cost model (480p, 81 frames, 32,760 tokens)
 
@@ -80,13 +81,13 @@ self-attention. That drives the next steps:
 1. ~~**Tensor-core attention on CUDA.**~~ Done (`fw_attention_mma`, bf16
    `mma.sync` m16n8k16, FlashAttention-2 structure): 137 → 2.9 s per 480p step
    on an RTX 4090.
-2. **Video sparse attention (VSA).** FastWan was trained with it
-   (`to_gate_compress` weights load but are unused today). It cuts the 198
-   TFLOP several-fold on every backend, and it is the only route to 480p
-   being practical in WebGPU.
-3. **WebGPU subgroups / cooperative matrices** where the adapter exposes
-   them. Without them the WGSL GEMM and attention are register-tiled scalar
-   code. The test page measures what that gets on a given card.
+2. ~~**Video sparse attention (VSA).**~~ Done, on all three backends, the
+   default for FastWan: 1.83× on the CUDA denoise (2.48 → 1.35 s per step).
+3. **WebGPU throughput.** The register-tiled flash kernel took a 480p dense
+   step from > 20 min to 136 s, but GEMM and attention both still run at a
+   few % of a 4090's f32 rate. Next: wider register tiles and vec4 loads,
+   f16 math with `shader-f16`, then subgroups / cooperative matrices where
+   the adapter has them.
 4. **AMD fast path.** WebGPU (Vulkan) already runs on AMD. A HIP backend
    would be a mechanical port of `kernels.cu` (hipRTC + hipBLASLt) for ROCm
    cards.

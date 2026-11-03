@@ -12,8 +12,8 @@ model and written for consumer hardware instead of a datacenter.
 
 | backend | runs on | precision | status |
 |---|---|---|---|
-| `wgpu` | **NVIDIA, AMD, Intel, Apple**: Vulkan / DX12 / Metal, and browsers | f32 activations, f16 weights | conformance passes on an RTX 4090 (Vulkan) and on software rasterizers; **too slow at 480p** (> 20 min per step: scalar attention) |
-| `cuda` | NVIDIA sm_80+ | bf16, cuBLAS GEMMs, tensor-core attention | conformance passes on an RTX 4090; **832×480×81 clip in 10.8 s** (2.9 s per DMD step + 1.9 s TAEHV) |
+| `wgpu` | **NVIDIA, AMD, Intel, Apple**: Vulkan / DX12 / Metal, and browsers | f32 activations, f16 weights | conformance passes on an RTX 4090 (Vulkan); 480p ≈ 65 s per step with VSA: correct, still slow |
+| `cuda` | NVIDIA sm_80+ | bf16, cuBLAS GEMMs, tensor-core attention + VSA | conformance passes on an RTX 4090; **832×480×81 clip in 6.9 s** (1.35 s per DMD step with VSA + TAEHV) |
 | `cpu` | anywhere | f32 | the reference every backend is checked against |
 
 `--backend auto` picks CUDA when it is built in and a device answers, and
