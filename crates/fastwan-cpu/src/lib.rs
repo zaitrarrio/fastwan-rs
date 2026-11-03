@@ -230,6 +230,10 @@ impl Backend for Cpu {
     }
     fn sync(&self) {}
 
+    fn weight_q8(&self, q: &fastwan_core::quant::Q8) -> CpuWeight {
+        self.weight(&q.dequantize(), q.rows, q.cols)
+    }
+
     fn linear(
         &self,
         x: &CpuBuf,

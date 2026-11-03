@@ -92,6 +92,9 @@ pub struct GWeight {
     rows: usize,
     cols: usize,
     f16: bool,
+    /// int8 codes (4 per word) with these per-group scales
+    /// ([`fastwan_core::quant::Q8`]); `buf` then holds the codes.
+    q8: Option<(GBuf, usize)>,
 }
 
 struct Pending {
@@ -323,6 +326,21 @@ impl Wgpu {
             src.replace("{W_TYPE}", "f32")
                 .replace("{W_LOAD}", "return w[i];")
         }
+    }
+
+    /// A GEMM shader reading int8 codes packed 4 per word, sign-extended and
+    /// scaled per group (`p._p` columns per scale, binding 5).
+    fn q8_src(src: &str) -> String {
+        src.replace("{W_TYPE}", "u32")
+            .replace(
+                "fn load_w(",
+                "@group(0) @binding(5) var<storage, read> wscale: array<f32>;\nfn load_w(",
+            )
+            .replace(
+                "{W_LOAD}",
+                "let b = (w[i >> 2u] >> ((i & 3u) * 8u)) << 24u; \
+                 return f32(bitcast<i32>(b) >> 24u) * wscale[i / p._p];",
+            )
     }
 
     /// Record one dispatch. `params` is the uniform block as 32-bit words.
@@ -765,6 +783,7 @@ impl Backend for Wgpu {
                 rows,
                 cols,
                 f16: true,
+                q8: None,
             }
         } else {
             GWeight {
@@ -772,7 +791,26 @@ impl Backend for Wgpu {
                 rows,
                 cols,
                 f16: false,
+                q8: None,
             }
+        }
+    }
+
+    fn weight_q8(&self, q: &fastwan_core::quant::Q8) -> GWeight {
+        let packed: Vec<u32> =
+            q.q.chunks(4)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .fold(0u32, |a, (j, &v)| a | ((v as u8 as u32) << (8 * j)))
+                })
+                .collect();
+        GWeight {
+            buf: self.upload_u32(&packed),
+            rows: q.rows,
+            cols: q.cols,
+            f16: false,
+            q8: Some((self.upload(&q.scales), q.group)),
         }
     }
 
@@ -828,7 +866,9 @@ impl Backend for Wgpu {
             _ => (LINEAR3, 64, "linear3"),
         };
         let half = self.f16 && f16 && variant == 3 && rows >= F16_MIN_ROWS;
-        let pipe = if half {
+        let pipe = if w.q8.is_some() {
+            self.pipeline(&format!("{name}_q8"), || Self::q8_src(src))
+        } else if half {
             self.pipeline("linear3h", || LINEAR3H.to_string())
         } else {
             let key = format!("{name}_{}", if f16 { "f16" } else { "f32" });
@@ -842,14 +882,14 @@ impl Backend for Wgpu {
             y_row as u32,
             bias.is_some() as u32,
             (act == Act::GeluTanh) as u32,
+            w.q8.as_ref().map_or(0, |q| q.1) as u32,
         ];
         let groups = (w.rows.div_ceil(tile) as u32, rows.div_ceil(tile) as u32, 1);
-        self.dispatch(
-            &pipe,
-            &p,
-            &[x, &w.buf, bias.unwrap_or(&self.dummy), y],
-            groups,
-        );
+        let b = bias.unwrap_or(&self.dummy);
+        match &w.q8 {
+            Some((scales, _)) => self.dispatch(&pipe, &p, &[x, &w.buf, b, y, scales], groups),
+            None => self.dispatch(&pipe, &p, &[x, &w.buf, b, y], groups),
+        }
     }
 
     fn layer_norm(
@@ -1106,6 +1146,7 @@ impl Backend for Wgpu {
         out: &GBuf,
     ) {
         assert_eq!((w.rows, w.cols), (s.cout, s.k_len()), "conv weight shape");
+        assert!(w.q8.is_none(), "conv weights are not quantized");
         let f16 = w.f16;
         if self.prof.is_some() {
             *self.tag.lock().unwrap() = Some(format!("{}->{} k{}", s.cin(), s.cout, s.k));

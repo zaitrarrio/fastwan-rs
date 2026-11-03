@@ -8,6 +8,7 @@ pub mod backend;
 pub mod config;
 pub mod geometry;
 pub mod plan;
+pub mod quant;
 pub mod rng;
 pub mod rope;
 pub mod schedule;

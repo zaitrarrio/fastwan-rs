@@ -565,3 +565,15 @@ extern "C" __global__ void fw_vsa_fine(u64 q_, u64 k_, u64 v_, u64 out_, int hea
             out[((long)qs * heads + h) * d + c] = bf(acc[c] / l + cr[c] * ld(gate, ((long)h * seq + qs) * d + c));
     }
 }
+
+// int8 weight-only (fastwan_core::quant::Q8): codes packed 2 per u16 word,
+// one f32 scale per `group` columns. Expands to bf16 `q · s` for cuBLAS — the
+// twin of `load_w` in the WGSL `_q8` GEMMs.
+extern "C" __global__ void fw_dequant_q8(u64 out_, u64 q_, u64 s_, long n, int group) {
+    bf16_t* out = (bf16_t*)out_;
+    const signed char* q = (const signed char*)q_;
+    const float* s = (const float*)s_;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = bf((float)q[i] * s[i / group]);
+}

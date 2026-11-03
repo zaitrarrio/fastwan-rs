@@ -62,6 +62,7 @@ pub struct Settings {
     /// for that origin only. `None` = same-origin only (the default).
     pub allow_origin: Option<String>,
     pub attention: Option<fastwan_model::Attention>,
+    pub quant: fastwan_core::quant::WeightQuant,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -191,7 +192,7 @@ pub fn engine<B: Backend>(
                 dim: cfg.text_dim,
             };
             let pipe = Pipeline {
-                dit: WanDit::load(&be, cfg, &src)?,
+                dit: WanDit::load_with(&be, cfg, &src, s.quant)?,
                 tae: TaeHv::load(&be, tcfg, &src)?,
                 schedule: DmdSchedule::fastwan_1_3b(),
             };
@@ -242,7 +243,7 @@ pub fn engine<B: Backend>(
                 fastwan_text::Umt5Config::xxl(),
             )?;
             stage("loading the transformer onto the GPU (1.4B parameters)");
-            let dit = WanDit::load(&be, cfg, &w)?;
+            let dit = WanDit::load_with(&be, cfg, &w, s.quant)?;
             stage("loading the TAEHV decoder");
             let tae = TaeHv::load(&be, tcfg, &tw)?;
             let pipe = Pipeline {

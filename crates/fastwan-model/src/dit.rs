@@ -23,6 +23,7 @@ use fastwan_core::{
     Result,
     backend::{Act, Backend, NormKind},
     config::WanConfig,
+    quant::{Q8, WeightQuant},
     rope::rope_table,
     timestep::{matvec, silu, sinusoid},
     weights::WeightSource,
@@ -49,6 +50,7 @@ fn load_linear<B: Backend>(
     src: &dyn WeightSource,
     shapes: &Shapes,
     keys: &[&str],
+    quant: WeightQuant,
 ) -> Result<Linear<B>> {
     let (mut w, mut b, mut rows, mut cols) = (Vec::new(), Vec::new(), 0, 0);
     for k in keys {
@@ -62,7 +64,10 @@ fn load_linear<B: Backend>(
         cols = i;
     }
     Ok(Linear {
-        w: be.weight(&w, rows, cols),
+        w: match quant {
+            WeightQuant::Native => be.weight(&w, rows, cols),
+            WeightQuant::Int8 => be.weight_q8(&Q8::quantize(&w, rows, cols)),
+        },
         b: be.upload(&b),
     })
 }
@@ -155,6 +160,18 @@ pub struct Workspace<B: Backend> {
 
 impl<B: Backend> WanDit<B> {
     pub fn load(be: &B, cfg: WanConfig, src: &dyn WeightSource) -> Result<Self> {
+        Self::load_with(be, cfg, src, WeightQuant::Native)
+    }
+
+    /// `quant` applies to the transformer blocks' linears (attention, FFN,
+    /// gate) — 97% of the DiT's weights. The patch embedding, text and output
+    /// projections stay in the backend's precision.
+    pub fn load_with(
+        be: &B,
+        cfg: WanConfig,
+        src: &dyn WeightSource,
+        quant: WeightQuant,
+    ) -> Result<Self> {
         let d = cfg.dim();
         let mut shapes: Shapes = fastwan_core::weights::wan_manifest(&cfg)
             .into_iter()
@@ -162,27 +179,28 @@ impl<B: Backend> WanDit<B> {
         for l in 0..cfg.layers {
             shapes.insert(format!("blocks.{l}.to_gate_compress.weight"), vec![d, d]);
         }
-        let lin = |keys: &[&str]| load_linear(be, src, &shapes, keys);
+        let lin = |keys: &[&str]| load_linear(be, src, &shapes, keys, WeightQuant::Native);
+        let qlin = |keys: &[&str]| load_linear(be, src, &shapes, keys, quant);
         let vec = |k: &str, n: usize| -> Result<B::Buf> { Ok(be.upload(&src.get(k, &[n])?)) };
         let mut blocks = Vec::with_capacity(cfg.layers);
         for l in 0..cfg.layers {
             let p = |s: &str| format!("blocks.{l}.{s}");
             blocks.push(Block {
-                qkv: lin(&[&p("attn1.to_q"), &p("attn1.to_k"), &p("attn1.to_v")])?,
+                qkv: qlin(&[&p("attn1.to_q"), &p("attn1.to_k"), &p("attn1.to_v")])?,
                 norm_q1: vec(&p("attn1.norm_q.weight"), d)?,
                 norm_k1: vec(&p("attn1.norm_k.weight"), d)?,
-                out1: lin(&[&p("attn1.to_out.0")])?,
-                q2: lin(&[&p("attn2.to_q")])?,
-                kv2: lin(&[&p("attn2.to_k"), &p("attn2.to_v")])?,
+                out1: qlin(&[&p("attn1.to_out.0")])?,
+                q2: qlin(&[&p("attn2.to_q")])?,
+                kv2: qlin(&[&p("attn2.to_k"), &p("attn2.to_v")])?,
                 norm_q2: vec(&p("attn2.norm_q.weight"), d)?,
                 norm_k2: vec(&p("attn2.norm_k.weight"), d)?,
-                out2: lin(&[&p("attn2.to_out.0")])?,
+                out2: qlin(&[&p("attn2.to_out.0")])?,
                 norm2_w: vec(&p("norm2.weight"), d)?,
                 norm2_b: vec(&p("norm2.bias"), d)?,
-                ffn1: lin(&[&p("ffn.net.0.proj")])?,
-                ffn2: lin(&[&p("ffn.net.2")])?,
+                ffn1: qlin(&[&p("ffn.net.0.proj")])?,
+                ffn2: qlin(&[&p("ffn.net.2")])?,
                 gate: if src.contains(&p("to_gate_compress.weight")) {
-                    Some(lin(&[&p("to_gate_compress")])?)
+                    Some(qlin(&[&p("to_gate_compress")])?)
                 } else {
                     None
                 },

@@ -14,6 +14,7 @@ use fastwan_core::{
     backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind},
     config::{TaeConfig, WanConfig},
     geometry::Geometry,
+    quant::WeightQuant,
     rng::Rng,
     schedule::DmdSchedule,
     weights::Synthetic,
@@ -65,7 +66,8 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     let mut rng = Rng::new(42);
     ops(&mut p, &mut rng);
     model(&mut p);
-    model_vsa(&mut p);
+    model_vsa(&mut p, WeightQuant::Native);
+    model_vsa(&mut p, WeightQuant::Int8);
     p.out
 }
 
@@ -99,6 +101,25 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         };
         let (g, c) = run(&x);
         p.record(format!("linear {m}x{k}x{n} {act:?}"), g, c);
+        if k % 2 == 0 && m > 1 {
+            // int8 weight-only: grouped when k is a multiple of 128, per row
+            // otherwise; the CPU dequantizes, so this checks the kernels'
+            // unpacking and scaling, not the quantization error.
+            let q = fastwan_core::quant::Q8::quantize(&w, n, k);
+            let gx = be.upload(&x);
+            let gb = be.upload(&b);
+            let gy = be.alloc((m + 2) * n);
+            be.linear(&gx, 3, m, &be.weight_q8(&q), Some(&gb), act, &gy, 2);
+            let cx = cpu.upload(&x);
+            let cb = cpu.upload(&b);
+            let cy = cpu.alloc((m + 2) * n);
+            cpu.linear(&cx, 3, m, &cpu.weight_q8(&q), Some(&cb), act, &cy, 2);
+            p.record(
+                format!("linear int8/{} {m}x{k}x{n} {act:?}", q.group),
+                be.download(&gy),
+                cpu.download(&cy),
+            );
+        }
     }
 
     // Norms: AdaLN, residual+affine, residual+mod, gated residual.
@@ -538,7 +559,7 @@ fn model<B: Backend>(p: &mut Pair<'_, B>) {
 
 /// The VSA path end to end: a tiny head_dim-32 DiT, 3 DMD steps, 4 tiles at
 /// sparsity 0.5, on both backends.
-fn model_vsa<B: Backend>(p: &mut Pair<'_, B>) {
+fn model_vsa<B: Backend>(p: &mut Pair<'_, B>, quant: WeightQuant) {
     let (be, cpu) = (p.be, &Cpu);
     let cfg = WanConfig::tiny_vsa();
     let src = Synthetic { seed: 6 };
@@ -557,19 +578,28 @@ fn model_vsa<B: Backend>(p: &mut Pair<'_, B>) {
     };
     let mk = |_: &WanConfig| DmdSchedule::fastwan_1_3b();
     let gp = Pipeline {
-        dit: WanDit::load(be, cfg.clone(), &src).unwrap(),
+        dit: WanDit::load_with(be, cfg.clone(), &src, quant).unwrap(),
         tae: TaeHv::load(be, TaeConfig::tiny(), &src).unwrap(),
         schedule: mk(&cfg),
     };
     let cp = Pipeline {
-        dit: WanDit::load(cpu, cfg.clone(), &src).unwrap(),
+        dit: WanDit::load_with(cpu, cfg.clone(), &src, quant).unwrap(),
         tae: TaeHv::load(cpu, TaeConfig::tiny(), &src).unwrap(),
         schedule: mk(&cfg),
     };
     let (mut t1, mut t2) = (Timings::default(), Timings::default());
     let gl = gp.denoise(be, &embeds, &opt, &mut t1).unwrap();
     let cl = cp.denoise(cpu, &embeds, &opt, &mut t2).unwrap();
-    p.record("tiny DiT, VSA 4 tiles, 3 DMD steps (latent)", gl, cl);
+    let tag = if quant == WeightQuant::Int8 {
+        ", int8"
+    } else {
+        ""
+    };
+    p.record(
+        format!("tiny DiT, VSA 4 tiles, 3 DMD steps{tag} (latent)"),
+        gl,
+        cl,
+    );
 }
 
 #[cfg(test)]

@@ -54,6 +54,10 @@ struct AttnArgs {
     /// Fraction of key tiles VSA skips (FastVideo's default 0.8).
     #[arg(long, default_value_t = fastwan_core::vsa::DEFAULT_SPARSITY)]
     vsa_sparsity: f64,
+    /// DiT block weights on the device: `native` (bf16 / f16) or `int8`
+    /// (weight-only, per-128-column scales: half the memory).
+    #[arg(long, default_value = "native")]
+    weights: fastwan_core::quant::WeightQuant,
 }
 
 impl AttnArgs {
@@ -288,7 +292,8 @@ fn main() -> Result<()> {
                 &shape.geometry()?,
                 layers,
                 decode,
-                attn.get()
+                attn.get(),
+                attn.weights
             )?)
         }
         Cmd::Serve {
@@ -322,6 +327,7 @@ fn main() -> Result<()> {
                 tae_chunk,
                 allow_origin,
                 attention: attn.get(),
+                quant: attn.weights,
             };
             serve::serve(settings, move |s, shared, rx| {
                 with_backend!(backend, |be| serve::engine(be, s, shared, rx))
@@ -377,7 +383,8 @@ fn main() -> Result<()> {
                 ffn_chunk,
                 tae_chunk,
                 runs,
-                attn.get()
+                attn.get(),
+                attn.weights
             )?)
         }
     }
@@ -420,6 +427,7 @@ fn bench<B: Backend>(
     layers: usize,
     decode: bool,
     attention: Option<fastwan_model::Attention>,
+    quant: fastwan_core::quant::WeightQuant,
 ) -> Result<()> {
     let cfg = WanConfig {
         layers,
@@ -437,7 +445,7 @@ fn bench<B: Backend>(
     let src = Synthetic { seed: 1 };
     let t0 = std::time::Instant::now();
     let pipe = Pipeline {
-        dit: WanDit::load(be, cfg.clone(), &src)?,
+        dit: WanDit::load_with(be, cfg.clone(), &src, quant)?,
         tae: TaeHv::load(be, TaeConfig::taew2_1(), &src)?,
         schedule: DmdSchedule::fastwan_1_3b(),
     };
@@ -513,6 +521,7 @@ fn generate<B: Backend>(
     tae_chunk: usize,
     runs: usize,
     attention: Option<fastwan_model::Attention>,
+    quant: fastwan_core::quant::WeightQuant,
 ) -> Result<()> {
     let cfg = WanConfig::fastwan_1_3b();
     let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
@@ -547,7 +556,7 @@ fn generate<B: Backend>(
         );
     }
     let pipe = Pipeline {
-        dit: WanDit::load(be, cfg.clone(), &wsrc)?,
+        dit: WanDit::load_with(be, cfg.clone(), &wsrc, quant)?,
         tae: TaeHv::load(be, tcfg, &tsrc)?,
         schedule: DmdSchedule::fastwan_1_3b(),
     };

@@ -48,6 +48,10 @@ pub struct CuWeight {
     buf: CuBuf,
     rows: usize,
     cols: usize,
+    /// int8 weight-only: `buf` holds the codes (2 per word), these the f32
+    /// per-group scales; [`Backend::linear`] expands them into the shared
+    /// bf16 scratch before the GEMM.
+    q8: Option<(CuBuf, usize)>,
 }
 
 pub struct Cuda {
@@ -61,6 +65,9 @@ pub struct Cuda {
     name: String,
     /// Compute capability major ≥ 8: bf16 mma.sync is available.
     ampere: bool,
+    /// bf16 scratch for the int8 weight being multiplied (grown on demand;
+    /// one stream, so consecutive GEMMs reuse it safely).
+    q8_scratch: std::sync::Mutex<Option<CuBuf>>,
 }
 
 struct Kernels {
@@ -78,6 +85,7 @@ struct Kernels {
     tanh_clamp: CudaFunction,
     patch: CudaFunction,
     conv2d: CudaFunction,
+    dequant_q8: CudaFunction,
 }
 
 #[derive(Debug)]
@@ -137,6 +145,7 @@ impl Cuda {
             tanh_clamp: get("fw_tanh_clamp")?,
             patch: get("fw_patch")?,
             conv2d: get("fw_conv2d")?,
+            dequant_q8: get("fw_dequant_q8")?,
         };
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
@@ -149,6 +158,7 @@ impl Cuda {
             f,
             name,
             ampere: maj >= 8,
+            q8_scratch: std::sync::Mutex::new(None),
         })
     }
 
@@ -301,6 +311,27 @@ impl Backend for Cuda {
             buf: self.upload(data),
             rows,
             cols,
+            q8: None,
+        }
+    }
+
+    fn weight_q8(&self, q: &fastwan_core::quant::Q8) -> CuWeight {
+        let mut words: Vec<u16> =
+            q.q.chunks(2)
+                .map(|c| c[0] as u8 as u16 | (c.get(1).map_or(0, |&v| v as u8 as u16) << 8))
+                .collect();
+        if words.is_empty() {
+            words.push(0);
+        }
+        CuWeight {
+            buf: CuBuf {
+                s: Arc::new(self.stream.clone_htod(&words).expect("upload")),
+                len: words.len(),
+                f32: false,
+            },
+            rows: q.rows,
+            cols: q.cols,
+            q8: Some((Backend::upload_table(self, &q.scales), q.group)),
         }
     }
 
@@ -321,6 +352,29 @@ impl Backend for Cuda {
     ) {
         let (n, k) = (w.rows, w.cols);
         assert!((x_row + rows) * k <= x.len && (y_row + rows) * n <= y.len);
+        let mut scratch = self.q8_scratch.lock().unwrap();
+        let wp = match &w.q8 {
+            None => self.ptr(&w.buf),
+            Some((scales, group)) => {
+                if scratch.as_ref().is_none_or(|b| b.len < n * k) {
+                    *scratch = Some(self.alloc(n * k));
+                }
+                let dst = scratch.as_ref().unwrap();
+                self.launch(
+                    &self.f.dequant_q8,
+                    Self::elems(n * k),
+                    (256, 1, 1),
+                    &[
+                        Arg::P(self.ptr(dst)),
+                        Arg::P(self.ptr(&w.buf)),
+                        Arg::P(self.ptr(scales)),
+                        Arg::L((n * k) as i64),
+                        Arg::I(*group as i32),
+                    ],
+                );
+                self.ptr(dst)
+            }
+        };
         let (alpha, beta) = (1.0f32, 0.0f32);
         let yp = self.ptr(y) + (y_row * n * 2) as u64;
         // Row-major y[m,n] = x[m,k]·W[n,k]ᵀ is column-major yᵀ = W·xᵀ:
@@ -335,7 +389,7 @@ impl Backend for Cuda {
                 rows as i32,
                 k as i32,
                 (&alpha) as *const f32 as *const _,
-                self.ptr(&w.buf) as *const _,
+                wp as *const _,
                 blas_sys::cudaDataType_t::CUDA_R_16BF,
                 k as i32,
                 (self.ptr(x) + (x_row * k * 2) as u64) as *const _,
@@ -641,6 +695,7 @@ impl Backend for Cuda {
         out: &CuBuf,
     ) {
         assert_eq!((w.rows, w.cols), (s.cout, s.k_len()));
+        assert!(w.q8.is_none(), "conv weights are not quantized");
         let (epc, res) = match ep {
             ConvEpilogue::None => (0, None),
             ConvEpilogue::Relu => (1, None),

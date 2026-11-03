@@ -108,6 +108,10 @@ pub trait Backend {
     /// `dst[dst_off..][..len] = src[src_off..][..len]`.
     fn copy(&self, src: &Self::Buf, src_off: usize, dst: &Self::Buf, dst_off: usize, len: usize);
     fn weight(&self, data: &[f32], rows: usize, cols: usize) -> Self::Weight;
+    /// An int8 weight-only matrix for [`Backend::linear`]. The result must
+    /// equal `linear` with `weight(&q.dequantize())` up to the backend's own
+    /// activation rounding.
+    fn weight_q8(&self, q: &crate::quant::Q8) -> Self::Weight;
     /// Wait for queued work (timing only; downloads synchronise themselves).
     fn sync(&self);
 
