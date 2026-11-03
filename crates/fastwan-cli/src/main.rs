@@ -447,7 +447,11 @@ fn bench<B: Backend>(
         attention,
     };
     let mut t = fastwan_model::Timings::default();
+    be.profile_reset();
     let latent = pipe.denoise(be, &embeds, &opt, &mut t)?;
+    if let Some(r) = be.profile_report() {
+        print!("denoise {r}");
+    }
     println!("prompt prep {:.3}s", t.prompt_s);
     for (i, s) in t.steps_s.iter().enumerate() {
         println!(
@@ -462,7 +466,11 @@ fn bench<B: Backend>(
         t.denoise_s() * 30.0 / layers as f64
     );
     if decode {
+        be.profile_reset();
         let v = pipe.decode(be, &latent, g, opt.tae_chunk, &mut t);
+        if let Some(r) = be.profile_report() {
+            print!("decode {r}");
+        }
         println!(
             "decode (TAEHV) {:.3}s -> {} frames {}x{}",
             t.decode_s, v.frames, v.width, v.height
@@ -549,6 +557,7 @@ fn generate<B: Backend>(
         attention,
     };
     let mut last = None;
+    be.profile_reset();
     for run in 0..runs.max(1) {
         let t0 = std::time::Instant::now();
         let (video, t) = pipe.generate(be, e, &opt)?;
@@ -564,6 +573,9 @@ fn generate<B: Backend>(
             t.decode_s
         );
         last = Some(video);
+    }
+    if let Some(r) = be.profile_report() {
+        print!("all runs: {r}");
     }
     let video = last.expect("at least one run");
     write_y4m(out, &video, 16)?;

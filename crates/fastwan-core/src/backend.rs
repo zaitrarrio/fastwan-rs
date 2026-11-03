@@ -111,6 +111,13 @@ pub trait Backend {
     /// Wait for queued work (timing only; downloads synchronise themselves).
     fn sync(&self);
 
+    /// Per-kernel GPU time since the last [`Backend::profile_reset`], when the
+    /// backend was built with profiling on (`FASTWAN_PROFILE=1` on WebGPU).
+    fn profile_report(&self) -> Option<String> {
+        None
+    }
+    fn profile_reset(&self) {}
+
     // ---- transformer -----------------------------------------------------
     /// `y[y_row + i, :] = act(x[x_row + i, :] · Wᵀ + b)` for `i < rows`.
     /// Row offsets let the FFN run in token chunks.

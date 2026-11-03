@@ -55,6 +55,15 @@ pub struct GVsa {
     scale: f32,
 }
 
+/// GPU timestamps around every dispatch, summed per kernel.
+struct Prof {
+    qs: wgpu::QuerySet,
+    cap: u32,
+    slots: Vec<String>,
+    totals: HashMap<String, (f64, u64)>,
+    period_ns: f64,
+}
+
 pub struct GWeight {
     buf: GBuf,
     rows: usize,
@@ -75,6 +84,12 @@ pub struct Wgpu {
     /// The register-tiled flash kernel fits this adapter's shared memory.
     flash_ok: bool,
     pipelines: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
+    /// Pipeline name by address, for the profiler.
+    names: Mutex<HashMap<usize, String>>,
+    /// Shape detail for the next dispatch's profile entry (linear / conv).
+    tag: Mutex<Option<String>>,
+    /// `FASTWAN_PROFILE=1` and the adapter has timestamp queries.
+    prof: Option<Mutex<Prof>>,
     pending: Mutex<Pending>,
     dummy: GBuf,
     pub allow_f16_weights: bool,
@@ -107,10 +122,16 @@ impl Wgpu {
             .await
             .map_err(|e| InitError(format!("no WebGPU adapter: {e}")))?;
         let limits = adapter.limits();
+        let profile = std::env::var("FASTWAN_PROFILE").is_ok_and(|v| v == "1")
+            && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("fastwan"),
-                required_features: wgpu::Features::empty(),
+                required_features: if profile {
+                    wgpu::Features::TIMESTAMP_QUERY
+                } else {
+                    wgpu::Features::empty()
+                },
                 required_limits: limits.clone(),
                 ..Default::default()
             })
@@ -130,6 +151,20 @@ impl Wgpu {
             })),
             len: 4,
         };
+        let prof = profile.then(|| {
+            let cap = 2048;
+            Mutex::new(Prof {
+                qs: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("profile"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 2 * cap,
+                }),
+                cap,
+                slots: Vec::new(),
+                totals: HashMap::new(),
+                period_ns: queue.get_timestamp_period() as f64,
+            })
+        });
         Ok(Self {
             info: adapter.get_info(),
             device,
@@ -137,6 +172,9 @@ impl Wgpu {
             attn_bk,
             flash_ok,
             pipelines: Mutex::new(HashMap::new()),
+            names: Mutex::new(HashMap::new()),
+            tag: Mutex::new(None),
+            prof,
             pending: Mutex::new(Pending { enc: None, n: 0 }),
             dummy,
             allow_f16_weights: true,
@@ -187,7 +225,42 @@ impl Wgpu {
                 }),
         );
         map.insert(key.to_string(), p.clone());
+        self.names
+            .lock()
+            .unwrap()
+            .insert(Arc::as_ptr(&p) as usize, key.to_string());
         p
+    }
+
+    /// Per-kernel GPU time since the last reset (`FASTWAN_PROFILE=1`).
+    pub fn profile_table(&self) -> Option<String> {
+        let prof = self.prof.as_ref()?;
+        self.flush();
+        let p = prof.lock().unwrap();
+        let total: f64 = p.totals.values().map(|v| v.0).sum();
+        let mut rows: Vec<_> = p.totals.iter().collect();
+        rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let mut out = format!(
+            "GPU time by kernel ({:.1} ms total, timestamp queries):\n",
+            total / 1e6
+        );
+        for (name, (ns, n)) in rows {
+            out += &format!(
+                "  {:>9.1} ms {:>5.1}%  {:>6} calls {:>9.3} ms/call  {name}\n",
+                ns / 1e6,
+                100.0 * ns / total.max(1.0),
+                n,
+                ns / 1e6 / *n as f64
+            );
+        }
+        Some(out)
+    }
+
+    pub fn profile_reset(&self) {
+        if let Some(prof) = &self.prof {
+            self.flush();
+            prof.lock().unwrap().totals.clear();
+        }
     }
 
     fn weight_src(src: &str, f16: bool) -> String {
@@ -210,6 +283,29 @@ impl Wgpu {
         bufs: &[&GBuf],
         groups: (u32, u32, u32),
     ) {
+        let tag = self.tag.lock().unwrap().take();
+        let slot = self.prof.as_ref().map(|prof| {
+            let full = {
+                let p = prof.lock().unwrap();
+                p.slots.len() as u32 >= p.cap
+            };
+            if full {
+                self.flush();
+            }
+            let mut p = prof.lock().unwrap();
+            let base = self
+                .names
+                .lock()
+                .unwrap()
+                .get(&(pipe as *const _ as usize))
+                .cloned()
+                .unwrap_or_else(|| "?".into());
+            p.slots.push(match tag {
+                Some(t) => format!("{base} {t}"),
+                None => base,
+            });
+            (p.slots.len() - 1) as u32
+        });
         let mut words = params.to_vec();
         while words.len() % 4 != 0 {
             words.push(0);
@@ -241,7 +337,19 @@ impl Wgpu {
             .enc
             .get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
         {
-            let mut pass = enc.begin_compute_pass(&Default::default());
+            let guard = self.prof.as_ref().map(|p| p.lock().unwrap());
+            let tw = match (&guard, slot) {
+                (Some(p), Some(i)) => Some(wgpu::ComputePassTimestampWrites {
+                    query_set: &p.qs,
+                    beginning_of_pass_write_index: Some(2 * i),
+                    end_of_pass_write_index: Some(2 * i + 1),
+                }),
+                _ => None,
+            };
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: tw,
+            });
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, groups.2);
@@ -257,10 +365,58 @@ impl Wgpu {
 
     fn flush(&self) {
         let mut pend = self.pending.lock().unwrap();
-        if let Some(enc) = pend.enc.take() {
-            pend.n = 0;
-            drop(pend);
+        let mut enc = pend.enc.take();
+        pend.n = 0;
+        drop(pend);
+        // Profiling: resolve this batch's timestamps and fold them into the totals.
+        let mut readback = None;
+        if let Some(prof) = &self.prof {
+            let p = prof.lock().unwrap();
+            let n = p.slots.len() as u32;
+            if n > 0 {
+                let bytes = (2 * n as u64) * 8;
+                let resolve = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: bytes,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let read = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: bytes,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let e = enc
+                    .get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
+                e.resolve_query_set(&p.qs, 0..2 * n, &resolve, 0);
+                e.copy_buffer_to_buffer(&resolve, 0, &read, 0, bytes);
+                readback = Some(read);
+            }
+        }
+        if let Some(enc) = enc {
             self.queue.submit([enc.finish()]);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(read), Some(prof)) = (readback, &self.prof) {
+            let slice = read.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            let _ = self.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            let ticks: Vec<u64> =
+                bytemuck::cast_slice::<u8, u64>(&slice.get_mapped_range().expect("timestamps"))
+                    .to_vec();
+            let mut p = prof.lock().unwrap();
+            let period = p.period_ns;
+            let slots = std::mem::take(&mut p.slots);
+            for (i, name) in slots.into_iter().enumerate() {
+                let ns = ticks[2 * i + 1].saturating_sub(ticks[2 * i]) as f64 * period;
+                let e = p.totals.entry(name).or_insert((0.0, 0));
+                e.0 += ns;
+                e.1 += 1;
+            }
         }
     }
 
@@ -579,6 +735,14 @@ impl Backend for Wgpu {
         y_row: usize,
     ) {
         let f16 = w.f16;
+        if self.prof.is_some() {
+            *self.tag.lock().unwrap() = Some(format!(
+                "{}x{}{}",
+                w.rows,
+                w.cols,
+                if act == Act::GeluTanh { " gelu" } else { "" }
+            ));
+        }
         let pipe = self.pipeline(if f16 { "linear_f16" } else { "linear_f32" }, || {
             Self::weight_src(LINEAR, f16)
         });
@@ -723,6 +887,13 @@ impl Backend for Wgpu {
         );
     }
 
+    fn profile_report(&self) -> Option<String> {
+        self.profile_table()
+    }
+    fn profile_reset(&self) {
+        Wgpu::profile_reset(self)
+    }
+
     fn vsa_supported(&self, head_dim: usize) -> bool {
         self.flash_ok && head_dim % 16 == 0 && head_dim <= 128
     }
@@ -848,6 +1019,9 @@ impl Backend for Wgpu {
     ) {
         assert_eq!((w.rows, w.cols), (s.cout, s.k_len()), "conv weight shape");
         let f16 = w.f16;
+        if self.prof.is_some() {
+            *self.tag.lock().unwrap() = Some(format!("{}->{} k{}", s.cin(), s.cout, s.k));
+        }
         let pipe = self.pipeline(if f16 { "conv_f16" } else { "conv_f32" }, || {
             Self::weight_src(CONV, f16)
         });
