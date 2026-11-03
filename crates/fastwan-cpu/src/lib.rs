@@ -12,7 +12,9 @@ pub struct CpuBuf(Arc<RwLock<Vec<f32>>>);
 
 impl CpuBuf {
     fn r(&self) -> RwLockReadGuard<'_, Vec<f32>> {
-        self.0.try_read().expect("buffer aliased with a written output")
+        self.0
+            .try_read()
+            .expect("buffer aliased with a written output")
     }
     fn w(&self) -> RwLockWriteGuard<'_, Vec<f32>> {
         self.0.try_write().expect("output buffer aliases an input")
@@ -102,7 +104,11 @@ impl Backend for Cpu {
     }
     fn weight(&self, data: &[f32], rows: usize, cols: usize) -> CpuWeight {
         assert_eq!(data.len(), rows * cols);
-        CpuWeight { data: data.to_vec(), rows, cols }
+        CpuWeight {
+            data: data.to_vec(),
+            rows,
+            cols,
+        }
     }
     fn sync(&self) {}
 
@@ -193,7 +199,15 @@ impl Backend for Cpu {
         });
     }
 
-    fn gate_residual(&self, h: &CpuBuf, a: &CpuBuf, rows: usize, dim: usize, mods: &CpuBuf, gate: usize) {
+    fn gate_residual(
+        &self,
+        h: &CpuBuf,
+        a: &CpuBuf,
+        rows: usize,
+        dim: usize,
+        mods: &CpuBuf,
+        gate: usize,
+    ) {
         let (a, m) = (a.r(), mods.r());
         let g = &m[gate * dim..][..dim];
         let mut h = h.w();
@@ -307,7 +321,16 @@ impl Backend for Cpu {
             });
     }
 
-    fn patchify(&self, latent: &CpuBuf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &CpuBuf) {
+    fn patchify(
+        &self,
+        latent: &CpuBuf,
+        c: usize,
+        t: usize,
+        h: usize,
+        w: usize,
+        p: usize,
+        out: &CpuBuf,
+    ) {
         let x = latent.r();
         let mut o = out.w();
         let (gh, gw, f) = (h / p, w / p, c * p * p);
@@ -328,7 +351,16 @@ impl Backend for Cpu {
         }
     }
 
-    fn unpatchify(&self, xs: &CpuBuf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &CpuBuf) {
+    fn unpatchify(
+        &self,
+        xs: &CpuBuf,
+        c: usize,
+        t: usize,
+        h: usize,
+        w: usize,
+        p: usize,
+        out: &CpuBuf,
+    ) {
         let x = xs.r();
         let mut o = out.w();
         let (gh, gw, f) = (h / p, w / p, c * p * p);

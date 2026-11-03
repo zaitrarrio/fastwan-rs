@@ -7,7 +7,11 @@
 //! streams gray haze instead of failing (strobe learned this with the
 //! Self-Forcing checkpoint remap).
 
-use crate::{config::{TaeConfig, WanConfig}, rng::Rng, Error, Result};
+use crate::{
+    Error, Result,
+    config::{TaeConfig, WanConfig},
+    rng::Rng,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -41,7 +45,10 @@ impl SafetensorsDir {
             vec![path.to_path_buf()]
         };
         if files.is_empty() {
-            return Err(Error::Weights(format!("no .safetensors in {}", path.display())));
+            return Err(Error::Weights(format!(
+                "no .safetensors in {}",
+                path.display()
+            )));
         }
         let mut maps = Vec::new();
         let mut index = HashMap::new();
@@ -106,7 +113,11 @@ impl WeightSource for SafetensorsDir {
                 .chunks_exact(2)
                 .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect(),
-            other => return Err(Error::Weights(format!("`{name}`: unsupported dtype {other:?}"))),
+            other => {
+                return Err(Error::Weights(format!(
+                    "`{name}`: unsupported dtype {other:?}"
+                )));
+            }
         })
     }
 }
@@ -148,18 +159,45 @@ impl WeightSource for Synthetic {
 pub fn wan_manifest(cfg: &WanConfig) -> Vec<(String, Vec<usize>)> {
     let d = cfg.dim();
     let mut v: Vec<(String, Vec<usize>)> = vec![
-        ("patch_embedding.weight".into(), vec![d, cfg.in_channels, 1, cfg.patch, cfg.patch]),
+        (
+            "patch_embedding.weight".into(),
+            vec![d, cfg.in_channels, 1, cfg.patch, cfg.patch],
+        ),
         ("patch_embedding.bias".into(), vec![d]),
-        ("condition_embedder.time_embedder.linear_1.weight".into(), vec![d, cfg.freq_dim]),
-        ("condition_embedder.time_embedder.linear_1.bias".into(), vec![d]),
-        ("condition_embedder.time_embedder.linear_2.weight".into(), vec![d, d]),
-        ("condition_embedder.time_embedder.linear_2.bias".into(), vec![d]),
+        (
+            "condition_embedder.time_embedder.linear_1.weight".into(),
+            vec![d, cfg.freq_dim],
+        ),
+        (
+            "condition_embedder.time_embedder.linear_1.bias".into(),
+            vec![d],
+        ),
+        (
+            "condition_embedder.time_embedder.linear_2.weight".into(),
+            vec![d, d],
+        ),
+        (
+            "condition_embedder.time_embedder.linear_2.bias".into(),
+            vec![d],
+        ),
         ("condition_embedder.time_proj.weight".into(), vec![6 * d, d]),
         ("condition_embedder.time_proj.bias".into(), vec![6 * d]),
-        ("condition_embedder.text_embedder.linear_1.weight".into(), vec![d, cfg.text_dim]),
-        ("condition_embedder.text_embedder.linear_1.bias".into(), vec![d]),
-        ("condition_embedder.text_embedder.linear_2.weight".into(), vec![d, d]),
-        ("condition_embedder.text_embedder.linear_2.bias".into(), vec![d]),
+        (
+            "condition_embedder.text_embedder.linear_1.weight".into(),
+            vec![d, cfg.text_dim],
+        ),
+        (
+            "condition_embedder.text_embedder.linear_1.bias".into(),
+            vec![d],
+        ),
+        (
+            "condition_embedder.text_embedder.linear_2.weight".into(),
+            vec![d, d],
+        ),
+        (
+            "condition_embedder.text_embedder.linear_2.bias".into(),
+            vec![d],
+        ),
         ("scale_shift_table".into(), vec![1, 2, d]),
         ("proj_out.weight".into(), vec![cfg.patch_features_out(), d]),
         ("proj_out.bias".into(), vec![cfg.patch_features_out()]),
@@ -190,7 +228,10 @@ pub fn wan_manifest(cfg: &WanConfig) -> Vec<(String, Vec<usize>)> {
 pub fn tae_manifest(cfg: &TaeConfig) -> Vec<(String, Vec<usize>)> {
     let nf = cfg.widths;
     let mut v = vec![
-        ("decoder.1.weight".to_string(), vec![nf[0], cfg.latent_channels, 3, 3]),
+        (
+            "decoder.1.weight".to_string(),
+            vec![nf[0], cfg.latent_channels, 3, 3],
+        ),
         ("decoder.1.bias".to_string(), vec![nf[0]]),
     ];
     for s in 0..3 {
@@ -204,10 +245,19 @@ pub fn tae_manifest(cfg: &TaeConfig) -> Vec<(String, Vec<usize>)> {
             v.push((format!("{p}.conv.4.weight"), vec![nf[s], nf[s], 3, 3]));
             v.push((format!("{p}.conv.4.bias"), vec![nf[s]]));
         }
-        v.push((format!("decoder.{}.conv.weight", base + 4), vec![nf[s] * cfg.tgrow[s], nf[s], 1, 1]));
-        v.push((format!("decoder.{}.weight", base + 5), vec![nf[s + 1], nf[s], 3, 3]));
+        v.push((
+            format!("decoder.{}.conv.weight", base + 4),
+            vec![nf[s] * cfg.tgrow[s], nf[s], 1, 1],
+        ));
+        v.push((
+            format!("decoder.{}.weight", base + 5),
+            vec![nf[s + 1], nf[s], 3, 3],
+        ));
     }
-    v.push(("decoder.22.weight".into(), vec![cfg.out_channels(), nf[3], 3, 3]));
+    v.push((
+        "decoder.22.weight".into(),
+        vec![cfg.out_channels(), nf[3], 3, 3],
+    ));
     v.push(("decoder.22.bias".into(), vec![cfg.out_channels()]));
     v
 }
@@ -238,16 +288,28 @@ mod tests {
     #[test]
     fn tae_manifest_has_the_positional_keys() {
         let m = tae_manifest(&TaeConfig::taew2_1());
-        assert!(m.iter().any(|(n, s)| n == "decoder.19.conv.weight" && s == &vec![128, 64, 1, 1]));
-        assert!(m.iter().any(|(n, s)| n == "decoder.7.conv.weight" && s == &vec![256, 256, 1, 1]));
+        assert!(
+            m.iter()
+                .any(|(n, s)| n == "decoder.19.conv.weight" && s == &vec![128, 64, 1, 1])
+        );
+        assert!(
+            m.iter()
+                .any(|(n, s)| n == "decoder.7.conv.weight" && s == &vec![256, 256, 1, 1])
+        );
         assert!(m.iter().any(|(n, _)| n == "decoder.17.conv.4.bias"));
     }
 
     #[test]
     fn synthetic_is_deterministic() {
         let s = Synthetic { seed: 1 };
-        assert_eq!(s.get("a.weight", &[4, 4]).unwrap(), s.get("a.weight", &[4, 4]).unwrap());
-        assert_ne!(s.get("a.weight", &[4, 4]).unwrap(), s.get("b.weight", &[4, 4]).unwrap());
+        assert_eq!(
+            s.get("a.weight", &[4, 4]).unwrap(),
+            s.get("a.weight", &[4, 4]).unwrap()
+        );
+        assert_ne!(
+            s.get("a.weight", &[4, 4]).unwrap(),
+            s.get("b.weight", &[4, 4]).unwrap()
+        );
     }
 
     #[test]
@@ -259,7 +321,9 @@ mod tests {
             .iter()
             .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
             .collect();
-        let view = safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![2, 2], &bytes).unwrap();
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![2, 2], &bytes)
+                .unwrap();
         safetensors::serialize_to_file([("w", view)], None, &dir.join("m.safetensors")).unwrap();
         let src = SafetensorsDir::open(&dir).unwrap();
         assert_eq!(src.get("w", &[2, 2]).unwrap(), vals);

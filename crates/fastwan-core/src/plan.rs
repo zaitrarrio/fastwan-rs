@@ -4,7 +4,10 @@
 //! are the targets, so the two knobs are the FFN token chunk — the only
 //! activation that scales with `ffn_dim` — and the TAEHV frame chunk.
 
-use crate::{config::{TaeConfig, WanConfig}, geometry::Geometry};
+use crate::{
+    config::{TaeConfig, WanConfig},
+    geometry::Geometry,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Device {
@@ -83,7 +86,10 @@ pub fn plan(cfg: &WanConfig, tae: &TaeConfig, g: &Geometry, dev: &Device) -> Pla
     }
     let dit_activations = dit_acts(cfg, s, latent, chunk, a);
     if chunk < s {
-        notes.push(format!("FFN runs in {} chunks of {chunk} tokens", s.div_ceil(chunk)));
+        notes.push(format!(
+            "FFN runs in {} chunks of {chunk} tokens",
+            s.div_ceil(chunk)
+        ));
     }
 
     // TAEHV: the last stage runs at 4 frames per latent frame, 8× spatial,
@@ -141,10 +147,25 @@ impl std::fmt::Display for Plan {
         writeln!(f, "tokens          {}", self.tokens)?;
         writeln!(f, "weights         {:>9.1} MiB", mib(self.weights))?;
         writeln!(f, "cross-attn K/V  {:>9.1} MiB", mib(self.cross_kv))?;
-        writeln!(f, "DiT activations {:>9.1} MiB (FFN chunk {})", mib(self.dit_activations), self.ffn_chunk)?;
-        writeln!(f, "decode peak     {:>9.1} MiB (TAEHV chunk {} latent frames)", mib(self.decode_peak), self.tae_chunk)?;
+        writeln!(
+            f,
+            "DiT activations {:>9.1} MiB (FFN chunk {})",
+            mib(self.dit_activations),
+            self.ffn_chunk
+        )?;
+        writeln!(
+            f,
+            "decode peak     {:>9.1} MiB (TAEHV chunk {} latent frames)",
+            mib(self.decode_peak),
+            self.tae_chunk
+        )?;
         writeln!(f, "largest buffer  {:>9.1} MiB", mib(self.largest_binding))?;
-        writeln!(f, "peak            {:>9.1} MiB  fits: {}", mib(self.peak), self.fits)?;
+        writeln!(
+            f,
+            "peak            {:>9.1} MiB  fits: {}",
+            mib(self.peak),
+            self.fits
+        )?;
         for n in &self.notes {
             writeln!(f, "note: {n}")?;
         }
@@ -172,7 +193,12 @@ mod tests {
     fn small_budget_chunks_the_ffn() {
         let mut dev = Device::gib(8.0, 2, 4);
         dev.max_binding_bytes = 1 << 30;
-        let p = plan(&WanConfig::fastwan_1_3b(), &TaeConfig::taew2_1(), &Geometry::FASTWAN_480P, &dev);
+        let p = plan(
+            &WanConfig::fastwan_1_3b(),
+            &TaeConfig::taew2_1(),
+            &Geometry::FASTWAN_480P,
+            &dev,
+        );
         assert!(p.ffn_chunk < p.tokens, "{p}");
         assert!(p.ffn_chunk as u64 * 8960 * 4 <= 1 << 30);
     }

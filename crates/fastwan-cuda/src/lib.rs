@@ -10,8 +10,11 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use cudarc::cublas::{sys as blas_sys, CudaBlas};
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
+use cudarc::cublas::{CudaBlas, sys as blas_sys};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
+    PushKernelArg,
+};
 use fastwan_core::backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind};
 use half::bf16;
 use std::sync::Arc;
@@ -111,7 +114,14 @@ impl Cuda {
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
         let name = format!("cuda {} (sm_{maj}{min})", ctx.name().unwrap_or_default());
-        Ok(Self { ctx, stream, blas, module, f, name })
+        Ok(Self {
+            ctx,
+            stream,
+            blas,
+            module,
+            f,
+            name,
+        })
     }
 
     fn ptr(&self, b: &CuBuf) -> u64 {
@@ -123,7 +133,13 @@ impl Cuda {
         b.map_or(0, |b| self.ptr(b))
     }
 
-    fn launch(&self, f: &CudaFunction, grid: (u32, u32, u32), block: (u32, u32, u32), args: &[Arg]) {
+    fn launch(
+        &self,
+        f: &CudaFunction,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[Arg],
+    ) {
         let mut lb = self.stream.launch_builder(f);
         for a in args {
             match a {
@@ -133,7 +149,11 @@ impl Cuda {
                 Arg::F(v) => lb.arg(v),
             };
         }
-        let cfg = LaunchConfig { grid_dim: grid, block_dim: block, shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: grid,
+            block_dim: block,
+            shared_mem_bytes: 0,
+        };
         // SAFETY: every kernel's parameter list is matched by the `args`
         // built next to its launch, and every pointer is a live allocation of
         // at least the extent the kernel indexes (lengths asserted by callers).
@@ -154,21 +174,40 @@ impl Backend for Cuda {
     }
 
     fn alloc(&self, len: usize) -> CuBuf {
-        CuBuf { s: Arc::new(self.stream.alloc_zeros::<u16>(len.max(1)).expect("cuda alloc")), len, f32: false }
+        CuBuf {
+            s: Arc::new(
+                self.stream
+                    .alloc_zeros::<u16>(len.max(1))
+                    .expect("cuda alloc"),
+            ),
+            len,
+            f32: false,
+        }
     }
 
     fn upload(&self, data: &[f32]) -> CuBuf {
         let h: Vec<u16> = data.iter().map(|&v| bf16::from_f32(v).to_bits()).collect();
         let h = if h.is_empty() { vec![0] } else { h };
-        CuBuf { s: Arc::new(self.stream.clone_htod(&h).expect("upload")), len: data.len(), f32: false }
+        CuBuf {
+            s: Arc::new(self.stream.clone_htod(&h).expect("upload")),
+            len: data.len(),
+            f32: false,
+        }
     }
 
     fn upload_table(&self, data: &[f32]) -> CuBuf {
-        let h: Vec<u16> = data.iter().flat_map(|v| {
-            let b = v.to_bits();
-            [(b & 0xffff) as u16, (b >> 16) as u16]
-        }).collect();
-        CuBuf { s: Arc::new(self.stream.clone_htod(&h).expect("upload")), len: data.len(), f32: true }
+        let h: Vec<u16> = data
+            .iter()
+            .flat_map(|v| {
+                let b = v.to_bits();
+                [(b & 0xffff) as u16, (b >> 16) as u16]
+            })
+            .collect();
+        CuBuf {
+            s: Arc::new(self.stream.clone_htod(&h).expect("upload")),
+            len: data.len(),
+            f32: true,
+        }
     }
 
     fn write(&self, buf: &CuBuf, data: &[f32]) {
@@ -178,7 +217,8 @@ impl Backend for Cuda {
         // destination holds at least that many; the copy is ordered on this
         // stream and `h` is kept alive until the stream is synchronised.
         unsafe {
-            cudarc::driver::result::memcpy_htod_async(self.ptr(buf), &h, self.stream.cu_stream()).expect("write");
+            cudarc::driver::result::memcpy_htod_async(self.ptr(buf), &h, self.stream.cu_stream())
+                .expect("write");
         }
         self.stream.synchronize().expect("sync");
     }
@@ -186,9 +226,14 @@ impl Backend for Cuda {
     fn download(&self, buf: &CuBuf) -> Vec<f32> {
         let h = self.stream.clone_dtoh(&*buf.s).expect("download");
         if buf.f32 {
-            h.chunks_exact(2).map(|p| f32::from_bits(p[0] as u32 | (p[1] as u32) << 16)).collect()
+            h.chunks_exact(2)
+                .map(|p| f32::from_bits(p[0] as u32 | (p[1] as u32) << 16))
+                .collect()
         } else {
-            h[..buf.len].iter().map(|&b| bf16::from_bits(b).to_f32()).collect()
+            h[..buf.len]
+                .iter()
+                .map(|&b| bf16::from_bits(b).to_f32())
+                .collect()
         }
     }
 
@@ -215,14 +260,28 @@ impl Backend for Cuda {
 
     fn weight(&self, data: &[f32], rows: usize, cols: usize) -> CuWeight {
         assert_eq!(data.len(), rows * cols);
-        CuWeight { buf: self.upload(data), rows, cols }
+        CuWeight {
+            buf: self.upload(data),
+            rows,
+            cols,
+        }
     }
 
     fn sync(&self) {
         self.stream.synchronize().expect("sync");
     }
 
-    fn linear(&self, x: &CuBuf, x_row: usize, rows: usize, w: &CuWeight, bias: Option<&CuBuf>, act: Act, y: &CuBuf, y_row: usize) {
+    fn linear(
+        &self,
+        x: &CuBuf,
+        x_row: usize,
+        rows: usize,
+        w: &CuWeight,
+        bias: Option<&CuBuf>,
+        act: Act,
+        y: &CuBuf,
+        y_row: usize,
+    ) {
         let (n, k) = (w.rows, w.cols);
         assert!((x_row + rows) * k <= x.len && (y_row + rows) * n <= y.len);
         let (alpha, beta) = (1.0f32, 0.0f32);
@@ -256,48 +315,153 @@ impl Backend for Cuda {
         }
         if bias.is_some() || act != Act::None {
             let total = rows * n;
-            self.launch(&self.f.bias_act, Self::elems(total), (256, 1, 1), &[
-                Arg::P(yp), Arg::P(self.opt(bias)), Arg::L(total as i64), Arg::I(n as i32),
-                Arg::I(bias.is_some() as i32), Arg::I((act == Act::GeluTanh) as i32),
-            ]);
+            self.launch(
+                &self.f.bias_act,
+                Self::elems(total),
+                (256, 1, 1),
+                &[
+                    Arg::P(yp),
+                    Arg::P(self.opt(bias)),
+                    Arg::L(total as i64),
+                    Arg::I(n as i32),
+                    Arg::I(bias.is_some() as i32),
+                    Arg::I((act == Act::GeluTanh) as i32),
+                ],
+            );
         }
     }
 
-    fn layer_norm(&self, x: &CuBuf, rows: usize, dim: usize, norm: NormKind<'_, CuBuf>, mods: &CuBuf, eps: f32, out: &CuBuf) {
+    fn layer_norm(
+        &self,
+        x: &CuBuf,
+        rows: usize,
+        dim: usize,
+        norm: NormKind<'_, CuBuf>,
+        mods: &CuBuf,
+        eps: f32,
+        out: &CuBuf,
+    ) {
         self.norm_impl(x, None, rows, dim, mods, None, norm, eps, out);
     }
 
-    fn residual_norm(&self, h: &CuBuf, a: &CuBuf, rows: usize, dim: usize, mods: &CuBuf, gate: Option<usize>, norm: NormKind<'_, CuBuf>, eps: f32, normed: &CuBuf) {
+    fn residual_norm(
+        &self,
+        h: &CuBuf,
+        a: &CuBuf,
+        rows: usize,
+        dim: usize,
+        mods: &CuBuf,
+        gate: Option<usize>,
+        norm: NormKind<'_, CuBuf>,
+        eps: f32,
+        normed: &CuBuf,
+    ) {
         self.norm_impl(h, Some(a), rows, dim, mods, gate, norm, eps, normed);
     }
 
-    fn gate_residual(&self, h: &CuBuf, a: &CuBuf, rows: usize, dim: usize, mods: &CuBuf, gate: usize) {
+    fn gate_residual(
+        &self,
+        h: &CuBuf,
+        a: &CuBuf,
+        rows: usize,
+        dim: usize,
+        mods: &CuBuf,
+        gate: usize,
+    ) {
         let n = rows * dim;
-        self.launch(&self.f.gate_residual, Self::elems(n), (256, 1, 1), &[
-            Arg::P(self.ptr(h)), Arg::P(self.ptr(a)), Arg::P(self.ptr(mods)), Arg::L(n as i64), Arg::I(dim as i32), Arg::I(gate as i32),
-        ]);
+        self.launch(
+            &self.f.gate_residual,
+            Self::elems(n),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(h)),
+                Arg::P(self.ptr(a)),
+                Arg::P(self.ptr(mods)),
+                Arg::L(n as i64),
+                Arg::I(dim as i32),
+                Arg::I(gate as i32),
+            ],
+        );
     }
 
-    fn head_split(&self, src: &CuBuf, rows: usize, stride: usize, col_off: usize, heads: usize, hd: usize, rms_w: Option<&CuBuf>, rope: Option<(&CuBuf, &CuBuf)>, eps: f32, out: &CuBuf) {
+    fn head_split(
+        &self,
+        src: &CuBuf,
+        rows: usize,
+        stride: usize,
+        col_off: usize,
+        heads: usize,
+        hd: usize,
+        rms_w: Option<&CuBuf>,
+        rope: Option<(&CuBuf, &CuBuf)>,
+        eps: f32,
+        out: &CuBuf,
+    ) {
         if let Some((c, s)) = rope {
             assert!(c.f32 && s.f32, "RoPE tables must come from upload_table");
         }
-        self.launch(&self.f.head_split, (rows as u32, 1, 1), (256, 1, 1), &[
-            Arg::P(self.ptr(src)), Arg::P(self.opt(rms_w)), Arg::P(self.opt(rope.map(|r| r.0))), Arg::P(self.opt(rope.map(|r| r.1))),
-            Arg::P(self.ptr(out)), Arg::I(rows as i32), Arg::I(stride as i32), Arg::I(col_off as i32), Arg::I(heads as i32),
-            Arg::I(hd as i32), Arg::I(rms_w.is_some() as i32), Arg::I(rope.is_some() as i32), Arg::F(eps),
-        ]);
+        self.launch(
+            &self.f.head_split,
+            (rows as u32, 1, 1),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(src)),
+                Arg::P(self.opt(rms_w)),
+                Arg::P(self.opt(rope.map(|r| r.0))),
+                Arg::P(self.opt(rope.map(|r| r.1))),
+                Arg::P(self.ptr(out)),
+                Arg::I(rows as i32),
+                Arg::I(stride as i32),
+                Arg::I(col_off as i32),
+                Arg::I(heads as i32),
+                Arg::I(hd as i32),
+                Arg::I(rms_w.is_some() as i32),
+                Arg::I(rope.is_some() as i32),
+                Arg::F(eps),
+            ],
+        );
     }
 
-    fn attention(&self, q: &CuBuf, k: &CuBuf, v: &CuBuf, heads: usize, sq: usize, sk: usize, d: usize, out: &CuBuf) {
+    fn attention(
+        &self,
+        q: &CuBuf,
+        k: &CuBuf,
+        v: &CuBuf,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+        d: usize,
+        out: &CuBuf,
+    ) {
         assert!(d <= 128);
-        self.launch(&self.f.attention, (sq.div_ceil(64) as u32, heads as u32, 1), (64, 1, 1), &[
-            Arg::P(self.ptr(q)), Arg::P(self.ptr(k)), Arg::P(self.ptr(v)), Arg::P(self.ptr(out)),
-            Arg::I(heads as i32), Arg::I(sq as i32), Arg::I(sk as i32), Arg::I(d as i32), Arg::F(1.0 / (d as f32).sqrt()),
-        ]);
+        self.launch(
+            &self.f.attention,
+            (sq.div_ceil(64) as u32, heads as u32, 1),
+            (64, 1, 1),
+            &[
+                Arg::P(self.ptr(q)),
+                Arg::P(self.ptr(k)),
+                Arg::P(self.ptr(v)),
+                Arg::P(self.ptr(out)),
+                Arg::I(heads as i32),
+                Arg::I(sq as i32),
+                Arg::I(sk as i32),
+                Arg::I(d as i32),
+                Arg::F(1.0 / (d as f32).sqrt()),
+            ],
+        );
     }
 
-    fn patchify(&self, latent: &CuBuf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &CuBuf) {
+    fn patchify(
+        &self,
+        latent: &CuBuf,
+        c: usize,
+        t: usize,
+        h: usize,
+        w: usize,
+        p: usize,
+        out: &CuBuf,
+    ) {
         self.patch_impl(out, latent, c, t, h, w, p, 0);
     }
 
@@ -306,13 +470,32 @@ impl Backend for Cuda {
     }
 
     fn dmd_step(&self, x: &CuBuf, v: &CuBuf, noise: Option<&CuBuf>, st: f32, sn: f32, n: usize) {
-        self.launch(&self.f.dmd_step, Self::elems(n), (256, 1, 1), &[
-            Arg::P(self.ptr(x)), Arg::P(self.ptr(v)), Arg::P(self.opt(noise)), Arg::L(n as i64),
-            Arg::I(noise.is_some() as i32), Arg::F(st), Arg::F(sn),
-        ]);
+        self.launch(
+            &self.f.dmd_step,
+            Self::elems(n),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(x)),
+                Arg::P(self.ptr(v)),
+                Arg::P(self.opt(noise)),
+                Arg::L(n as i64),
+                Arg::I(noise.is_some() as i32),
+                Arg::F(st),
+                Arg::F(sn),
+            ],
+        );
     }
 
-    fn conv2d(&self, a: &CuBuf, b: Option<&CuBuf>, s: &ConvShape, w: &CuWeight, bias: Option<&CuBuf>, ep: ConvEpilogue<'_, CuBuf>, out: &CuBuf) {
+    fn conv2d(
+        &self,
+        a: &CuBuf,
+        b: Option<&CuBuf>,
+        s: &ConvShape,
+        w: &CuWeight,
+        bias: Option<&CuBuf>,
+        ep: ConvEpilogue<'_, CuBuf>,
+        out: &CuBuf,
+    ) {
         assert_eq!((w.rows, w.cols), (s.cout, s.k_len()));
         let (epc, res) = match ep {
             ConvEpilogue::None => (0, None),
@@ -321,39 +504,116 @@ impl Backend for Cuda {
         };
         let (oh, ow) = s.out_hw();
         let mt = (s.frames * oh * ow).div_ceil(64) as u32;
-        let (gy, gz) = if mt <= 65535 { (mt, 1) } else { let z = mt.div_ceil(65535); (mt.div_ceil(z), z) };
-        self.launch(&self.f.conv2d, (s.cout.div_ceil(64) as u32, gy, gz), (16, 16, 1), &[
-            Arg::P(self.ptr(a)), Arg::P(self.opt(b)), Arg::P(self.ptr(&w.buf)), Arg::P(self.opt(bias)), Arg::P(self.opt(res)),
-            Arg::P(self.ptr(out)), Arg::I(s.frames as i32), Arg::I(s.cin_a as i32), Arg::I(s.cin_b as i32), Arg::I(s.cout as i32),
-            Arg::I(s.h as i32), Arg::I(s.w as i32), Arg::I(if s.upsample { 2 } else { 1 }), Arg::I(s.k as i32),
-            Arg::I(bias.is_some() as i32), Arg::I(epc),
-        ]);
+        let (gy, gz) = if mt <= 65535 {
+            (mt, 1)
+        } else {
+            let z = mt.div_ceil(65535);
+            (mt.div_ceil(z), z)
+        };
+        self.launch(
+            &self.f.conv2d,
+            (s.cout.div_ceil(64) as u32, gy, gz),
+            (16, 16, 1),
+            &[
+                Arg::P(self.ptr(a)),
+                Arg::P(self.opt(b)),
+                Arg::P(self.ptr(&w.buf)),
+                Arg::P(self.opt(bias)),
+                Arg::P(self.opt(res)),
+                Arg::P(self.ptr(out)),
+                Arg::I(s.frames as i32),
+                Arg::I(s.cin_a as i32),
+                Arg::I(s.cin_b as i32),
+                Arg::I(s.cout as i32),
+                Arg::I(s.h as i32),
+                Arg::I(s.w as i32),
+                Arg::I(if s.upsample { 2 } else { 1 }),
+                Arg::I(s.k as i32),
+                Arg::I(bias.is_some() as i32),
+                Arg::I(epc),
+            ],
+        );
     }
 
     fn tanh_clamp(&self, x: &CuBuf, n: usize, s: f32) {
-        self.launch(&self.f.tanh_clamp, Self::elems(n), (256, 1, 1), &[Arg::P(self.ptr(x)), Arg::L(n as i64), Arg::F(s)]);
+        self.launch(
+            &self.f.tanh_clamp,
+            Self::elems(n),
+            (256, 1, 1),
+            &[Arg::P(self.ptr(x)), Arg::L(n as i64), Arg::F(s)],
+        );
     }
 }
 
 impl Cuda {
-    fn norm_impl(&self, h: &CuBuf, a: Option<&CuBuf>, rows: usize, dim: usize, mods: &CuBuf, gate: Option<usize>, norm: NormKind<'_, CuBuf>, eps: f32, out: &CuBuf) {
+    fn norm_impl(
+        &self,
+        h: &CuBuf,
+        a: Option<&CuBuf>,
+        rows: usize,
+        dim: usize,
+        mods: &CuBuf,
+        gate: Option<usize>,
+        norm: NormKind<'_, CuBuf>,
+        eps: f32,
+        out: &CuBuf,
+    ) {
         let (affine, scale, shift, w, b) = match norm {
             NormKind::Affine { w, b } => (1, 0, 0, Some(w), Some(b)),
             NormKind::Mod { scale, shift } => (0, scale as i32, shift as i32, None, None),
         };
-        self.launch(&self.f.norm, (rows as u32, 1, 1), (256, 1, 1), &[
-            Arg::P(self.ptr(h)), Arg::P(self.opt(a)), Arg::P(self.ptr(mods)), Arg::P(self.opt(w)), Arg::P(self.opt(b)),
-            Arg::P(self.ptr(out)), Arg::I(rows as i32), Arg::I(dim as i32), Arg::I(a.is_some() as i32),
-            Arg::I(gate.unwrap_or(0) as i32), Arg::I(gate.is_some() as i32), Arg::I(affine), Arg::I(scale), Arg::I(shift), Arg::F(eps),
-        ]);
+        self.launch(
+            &self.f.norm,
+            (rows as u32, 1, 1),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(h)),
+                Arg::P(self.opt(a)),
+                Arg::P(self.ptr(mods)),
+                Arg::P(self.opt(w)),
+                Arg::P(self.opt(b)),
+                Arg::P(self.ptr(out)),
+                Arg::I(rows as i32),
+                Arg::I(dim as i32),
+                Arg::I(a.is_some() as i32),
+                Arg::I(gate.unwrap_or(0) as i32),
+                Arg::I(gate.is_some() as i32),
+                Arg::I(affine),
+                Arg::I(scale),
+                Arg::I(shift),
+                Arg::F(eps),
+            ],
+        );
     }
 
-    fn patch_impl(&self, dst: &CuBuf, src: &CuBuf, c: usize, t: usize, h: usize, w: usize, p: usize, dir: i32) {
+    fn patch_impl(
+        &self,
+        dst: &CuBuf,
+        src: &CuBuf,
+        c: usize,
+        t: usize,
+        h: usize,
+        w: usize,
+        p: usize,
+        dir: i32,
+    ) {
         let n = c * t * h * w;
-        self.launch(&self.f.patch, Self::elems(n), (256, 1, 1), &[
-            Arg::P(self.ptr(dst)), Arg::P(self.ptr(src)), Arg::L(n as i64), Arg::I(c as i32), Arg::I(t as i32),
-            Arg::I(h as i32), Arg::I(w as i32), Arg::I(p as i32), Arg::I(dir),
-        ]);
+        self.launch(
+            &self.f.patch,
+            Self::elems(n),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(dst)),
+                Arg::P(self.ptr(src)),
+                Arg::L(n as i64),
+                Arg::I(c as i32),
+                Arg::I(t as i32),
+                Arg::I(h as i32),
+                Arg::I(w as i32),
+                Arg::I(p as i32),
+                Arg::I(dir),
+            ],
+        );
     }
 }
 

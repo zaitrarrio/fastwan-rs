@@ -1,7 +1,7 @@
 //! Prompt embeddings → DMD denoise → TAEHV decode → RGB frames.
 
 use crate::{dit::WanDit, taehv::TaeHv};
-use fastwan_core::{backend::Backend, geometry::Geometry, rng::Rng, schedule::DmdSchedule, Result};
+use fastwan_core::{Result, backend::Backend, geometry::Geometry, rng::Rng, schedule::DmdSchedule};
 use std::time::Instant;
 
 pub struct Pipeline<B: Backend> {
@@ -43,7 +43,13 @@ pub struct Video {
 
 impl<B: Backend> Pipeline<B> {
     /// Denoised latent `[C, T, H, W]` on the host.
-    pub fn denoise(&self, be: &B, embeds: &[f32], opt: &Options, t: &mut Timings) -> Result<Vec<f32>> {
+    pub fn denoise(
+        &self,
+        be: &B,
+        embeds: &[f32],
+        opt: &Options,
+        t: &mut Timings,
+    ) -> Result<Vec<f32>> {
         let cfg = &self.dit.cfg;
         opt.geometry.validate(cfg)?;
         let n = opt.geometry.latent_len(cfg);
@@ -51,7 +57,12 @@ impl<B: Backend> Pipeline<B> {
 
         let t0 = Instant::now();
         let prompt = self.dit.prepare_prompt(be, embeds);
-        let mods: Vec<_> = self.schedule.timesteps.iter().map(|&ts| self.dit.step_mods(be, ts as f32)).collect();
+        let mods: Vec<_> = self
+            .schedule
+            .timesteps
+            .iter()
+            .map(|&ts| self.dit.step_mods(be, ts as f32))
+            .collect();
         let ws = self.dit.workspace(be, opt.geometry.latent(), opt.ffn_chunk);
         be.sync();
         t.prompt_s = t0.elapsed().as_secs_f64();
@@ -74,7 +85,14 @@ impl<B: Backend> Pipeline<B> {
     }
 
     /// TAEHV decode of a `[C, T, H, W]` latent.
-    pub fn decode(&self, be: &B, latent: &[f32], g: &Geometry, chunk: usize, t: &mut Timings) -> Video {
+    pub fn decode(
+        &self,
+        be: &B,
+        latent: &[f32],
+        g: &Geometry,
+        chunk: usize,
+        t: &mut Timings,
+    ) -> Video {
         let t0 = Instant::now();
         let (lt, lh, lw) = g.latent();
         let c = self.tae.cfg.latent_channels;
@@ -108,7 +126,12 @@ impl<B: Backend> Pipeline<B> {
             f0 += nfr;
         }
         t.decode_s = t0.elapsed().as_secs_f64();
-        Video { frames, width, height, rgb: out }
+        Video {
+            frames,
+            width,
+            height,
+            rgb: out,
+        }
     }
 
     pub fn generate(&self, be: &B, embeds: &[f32], opt: &Options) -> Result<(Video, Timings)> {

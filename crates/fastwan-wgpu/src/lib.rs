@@ -73,7 +73,8 @@ impl Wgpu {
     /// requested (the WebGPU defaults cap a binding at 128 MiB; the DiT's
     /// fused QKV buffer at 480p is ~600 MiB in f32).
     pub async fn new_async() -> Result<Self, InitError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -136,45 +137,67 @@ impl Wgpu {
             return p.clone();
         }
         let code = format!("{COMMON}\n{}", src());
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(key),
-            source: wgpu::ShaderSource::Wgsl(code.into()),
-        });
-        let p = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(key),
-            layout: None,
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        }));
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(key),
+                source: wgpu::ShaderSource::Wgsl(code.into()),
+            });
+        let p = Arc::new(
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(key),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                }),
+        );
         map.insert(key.to_string(), p.clone());
         p
     }
 
     fn weight_src(src: &str, f16: bool) -> String {
         if f16 {
-            src.replace("{W_TYPE}", "u32")
-                .replace("{W_LOAD}", "let v = unpack2x16float(w[i >> 1u]); return select(v.x, v.y, (i & 1u) == 1u);")
+            src.replace("{W_TYPE}", "u32").replace(
+                "{W_LOAD}",
+                "let v = unpack2x16float(w[i >> 1u]); return select(v.x, v.y, (i & 1u) == 1u);",
+            )
         } else {
-            src.replace("{W_TYPE}", "f32").replace("{W_LOAD}", "return w[i];")
+            src.replace("{W_TYPE}", "f32")
+                .replace("{W_LOAD}", "return w[i];")
         }
     }
 
     /// Record one dispatch. `params` is the uniform block as 32-bit words.
-    fn dispatch(&self, pipe: &wgpu::ComputePipeline, params: &[u32], bufs: &[&GBuf], groups: (u32, u32, u32)) {
+    fn dispatch(
+        &self,
+        pipe: &wgpu::ComputePipeline,
+        params: &[u32],
+        bufs: &[&GBuf],
+        groups: (u32, u32, u32),
+    ) {
         let mut words = params.to_vec();
         while words.len() % 4 != 0 {
             words.push(0);
         }
-        let ubuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck_cast(&words),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }];
+        let ubuf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck_cast(&words),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let mut entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: ubuf.as_entire_binding(),
+        }];
         for (i, b) in bufs.iter().enumerate() {
-            entries.push(wgpu::BindGroupEntry { binding: i as u32 + 1, resource: b.buf.as_entire_binding() });
+            entries.push(wgpu::BindGroupEntry {
+                binding: i as u32 + 1,
+                resource: b.buf.as_entire_binding(),
+            });
         }
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -220,21 +243,48 @@ impl Wgpu {
         }
     }
 
-    fn elementwise(&self, op: u32, x: &GBuf, y: Option<&GBuf>, aux: Option<&GBuf>, n: usize, extra: [u32; 8], s: [f32; 2]) {
+    fn elementwise(
+        &self,
+        op: u32,
+        x: &GBuf,
+        y: Option<&GBuf>,
+        aux: Option<&GBuf>,
+        n: usize,
+        extra: [u32; 8],
+        s: [f32; 2],
+    ) {
         let pipe = self.pipeline("elementwise", || ELEM.to_string());
         let mut p = vec![n as u32, op];
         p.extend_from_slice(&extra);
         p.push(s[0].to_bits());
         p.push(s[1].to_bits());
-        self.dispatch(&pipe, &p, &[x, y.unwrap_or(&self.dummy), aux.unwrap_or(&self.dummy)], Self::grid(n.div_ceil(256)));
+        self.dispatch(
+            &pipe,
+            &p,
+            &[x, y.unwrap_or(&self.dummy), aux.unwrap_or(&self.dummy)],
+            Self::grid(n.div_ceil(256)),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn norm(&self, h: &GBuf, a: Option<&GBuf>, rows: usize, dim: usize, mods: &GBuf, gate: Option<usize>, norm: NormKind<'_, GBuf>, eps: f32, out: &GBuf) {
+    fn norm(
+        &self,
+        h: &GBuf,
+        a: Option<&GBuf>,
+        rows: usize,
+        dim: usize,
+        mods: &GBuf,
+        gate: Option<usize>,
+        norm: NormKind<'_, GBuf>,
+        eps: f32,
+        out: &GBuf,
+    ) {
         let pipe = self.pipeline("norm", || NORM.to_string());
         let (affine, scale, shift, w, b) = match norm {
             NormKind::Affine { w, b } => (1, 0, 0, w, b),
-            NormKind::Mod { scale, shift } => (0, scale as u32, shift as u32, &self.dummy, &self.dummy),
+            NormKind::Mod { scale, shift } => {
+                (0, scale as u32, shift as u32, &self.dummy, &self.dummy)
+            }
         };
         let p = [
             rows as u32,
@@ -247,7 +297,12 @@ impl Wgpu {
             shift,
             eps.to_bits(),
         ];
-        self.dispatch(&pipe, &p, &[h, a.unwrap_or(&self.dummy), mods, w, b, out], Self::grid(rows));
+        self.dispatch(
+            &pipe,
+            &p,
+            &[h, a.unwrap_or(&self.dummy), mods, w, b, out],
+            Self::grid(rows),
+        );
     }
 }
 
@@ -260,7 +315,10 @@ impl Backend for Wgpu {
     type Weight = GWeight;
 
     fn name(&self) -> String {
-        format!("wgpu {:?}: {} ({})", self.info.backend, self.info.name, self.info.driver)
+        format!(
+            "wgpu {:?}: {} ({})",
+            self.info.backend, self.info.name, self.info.driver
+        )
     }
 
     fn alloc(&self, len: usize) -> GBuf {
@@ -268,7 +326,9 @@ impl Backend for Wgpu {
             buf: Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: (len.max(1) * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })),
             len,
@@ -284,18 +344,24 @@ impl Backend for Wgpu {
             bytemuck::cast_slice(data)
         };
         GBuf {
-            buf: Arc::new(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            })),
+            buf: Arc::new(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytes,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_SRC
+                            | wgpu::BufferUsages::COPY_DST,
+                    }),
+            ),
             len: data.len(),
         }
     }
 
     fn write(&self, buf: &GBuf, data: &[f32]) {
         self.flush();
-        self.queue.write_buffer(&buf.buf, 0, bytemuck::cast_slice(data));
+        self.queue
+            .write_buffer(&buf.buf, 0, bytemuck::cast_slice(data));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -321,7 +387,10 @@ impl Backend for Wgpu {
             let _ = tx.send(r);
         });
         self.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
             .expect("device lost while reading back");
         rx.recv().unwrap().expect("map failed");
         let data = slice.get_mapped_range().expect("mapped range");
@@ -348,7 +417,13 @@ impl Backend for Wgpu {
         let enc = pend
             .enc
             .get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
-        enc.copy_buffer_to_buffer(&src.buf, (so * 4) as u64, &dst.buf, (d * 4) as u64, (len * 4) as u64);
+        enc.copy_buffer_to_buffer(
+            &src.buf,
+            (so * 4) as u64,
+            &dst.buf,
+            (d * 4) as u64,
+            (len * 4) as u64,
+        );
     }
 
     fn weight(&self, data: &[f32], rows: usize, cols: usize) -> GWeight {
@@ -364,28 +439,56 @@ impl Backend for Wgpu {
                 })
                 .collect();
             let buf = GBuf {
-                buf: Arc::new(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(&packed),
-                    usage: wgpu::BufferUsages::STORAGE,
-                })),
+                buf: Arc::new(
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&packed),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        }),
+                ),
                 len: packed.len(),
             };
-            GWeight { buf, rows, cols, f16: true }
+            GWeight {
+                buf,
+                rows,
+                cols,
+                f16: true,
+            }
         } else {
-            GWeight { buf: self.upload(data), rows, cols, f16: false }
+            GWeight {
+                buf: self.upload(data),
+                rows,
+                cols,
+                f16: false,
+            }
         }
     }
 
     fn sync(&self) {
         self.flush();
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
     }
 
-    fn linear(&self, x: &GBuf, x_row: usize, rows: usize, w: &GWeight, bias: Option<&GBuf>, act: Act, y: &GBuf, y_row: usize) {
+    fn linear(
+        &self,
+        x: &GBuf,
+        x_row: usize,
+        rows: usize,
+        w: &GWeight,
+        bias: Option<&GBuf>,
+        act: Act,
+        y: &GBuf,
+        y_row: usize,
+    ) {
         let f16 = w.f16;
-        let pipe = self.pipeline(if f16 { "linear_f16" } else { "linear_f32" }, || Self::weight_src(LINEAR, f16));
+        let pipe = self.pipeline(if f16 { "linear_f16" } else { "linear_f32" }, || {
+            Self::weight_src(LINEAR, f16)
+        });
         let p = [
             rows as u32,
             w.rows as u32,
@@ -396,22 +499,67 @@ impl Backend for Wgpu {
             (act == Act::GeluTanh) as u32,
         ];
         let groups = (w.rows.div_ceil(64) as u32, rows.div_ceil(64) as u32, 1);
-        self.dispatch(&pipe, &p, &[x, &w.buf, bias.unwrap_or(&self.dummy), y], groups);
+        self.dispatch(
+            &pipe,
+            &p,
+            &[x, &w.buf, bias.unwrap_or(&self.dummy), y],
+            groups,
+        );
     }
 
-    fn layer_norm(&self, x: &GBuf, rows: usize, dim: usize, norm: NormKind<'_, GBuf>, mods: &GBuf, eps: f32, out: &GBuf) {
+    fn layer_norm(
+        &self,
+        x: &GBuf,
+        rows: usize,
+        dim: usize,
+        norm: NormKind<'_, GBuf>,
+        mods: &GBuf,
+        eps: f32,
+        out: &GBuf,
+    ) {
         self.norm(x, None, rows, dim, mods, None, norm, eps, out);
     }
 
-    fn residual_norm(&self, h: &GBuf, a: &GBuf, rows: usize, dim: usize, mods: &GBuf, gate: Option<usize>, norm: NormKind<'_, GBuf>, eps: f32, normed: &GBuf) {
+    fn residual_norm(
+        &self,
+        h: &GBuf,
+        a: &GBuf,
+        rows: usize,
+        dim: usize,
+        mods: &GBuf,
+        gate: Option<usize>,
+        norm: NormKind<'_, GBuf>,
+        eps: f32,
+        normed: &GBuf,
+    ) {
         self.norm(h, Some(a), rows, dim, mods, gate, norm, eps, normed);
     }
 
     fn gate_residual(&self, h: &GBuf, a: &GBuf, rows: usize, dim: usize, mods: &GBuf, gate: usize) {
-        self.elementwise(0, h, Some(a), Some(mods), rows * dim, [dim as u32, gate as u32, 0, 0, 0, 0, 0, 0], [0.0; 2]);
+        self.elementwise(
+            0,
+            h,
+            Some(a),
+            Some(mods),
+            rows * dim,
+            [dim as u32, gate as u32, 0, 0, 0, 0, 0, 0],
+            [0.0; 2],
+        );
     }
 
-    fn head_split(&self, src: &GBuf, rows: usize, stride: usize, col_off: usize, heads: usize, hd: usize, rms_w: Option<&GBuf>, rope: Option<(&GBuf, &GBuf)>, eps: f32, out: &GBuf) {
+    fn head_split(
+        &self,
+        src: &GBuf,
+        rows: usize,
+        stride: usize,
+        col_off: usize,
+        heads: usize,
+        hd: usize,
+        rms_w: Option<&GBuf>,
+        rope: Option<(&GBuf, &GBuf)>,
+        eps: f32,
+        out: &GBuf,
+    ) {
         let pipe = self.pipeline("head_split", || HEADS.to_string());
         let p = [
             rows as u32,
@@ -425,38 +573,109 @@ impl Backend for Wgpu {
             eps.to_bits(),
         ];
         let (c, s) = rope.unwrap_or((&self.dummy, &self.dummy));
-        self.dispatch(&pipe, &p, &[src, rms_w.unwrap_or(&self.dummy), c, s, out], Self::grid(rows));
+        self.dispatch(
+            &pipe,
+            &p,
+            &[src, rms_w.unwrap_or(&self.dummy), c, s, out],
+            Self::grid(rows),
+        );
     }
 
-    fn attention(&self, q: &GBuf, k: &GBuf, v: &GBuf, heads: usize, sq: usize, sk: usize, d: usize, out: &GBuf) {
+    fn attention(
+        &self,
+        q: &GBuf,
+        k: &GBuf,
+        v: &GBuf,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+        d: usize,
+        out: &GBuf,
+    ) {
         assert!(d <= 128, "attention kernel supports head_dim <= 128");
         let bk = self.attn_bk;
         let pipe = self.pipeline(&format!("attention_bk{bk}"), || {
-            ATTN.replace("{BK_D}", &(bk * 128).to_string()).replace("{BK}", &bk.to_string())
+            ATTN.replace("{BK_D}", &(bk * 128).to_string())
+                .replace("{BK}", &bk.to_string())
         });
-        let p = [heads as u32, sq as u32, sk as u32, d as u32, (1.0 / (d as f32).sqrt()).to_bits()];
+        let p = [
+            heads as u32,
+            sq as u32,
+            sk as u32,
+            d as u32,
+            (1.0 / (d as f32).sqrt()).to_bits(),
+        ];
         assert!(heads as u32 <= MAX_DIM);
-        self.dispatch(&pipe, &p, &[q, k, v, out], (sq.div_ceil(64) as u32, heads as u32, 1));
+        self.dispatch(
+            &pipe,
+            &p,
+            &[q, k, v, out],
+            (sq.div_ceil(64) as u32, heads as u32, 1),
+        );
     }
 
-    fn patchify(&self, latent: &GBuf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &GBuf) {
+    fn patchify(
+        &self,
+        latent: &GBuf,
+        c: usize,
+        t: usize,
+        h: usize,
+        w: usize,
+        p: usize,
+        out: &GBuf,
+    ) {
         let n = c * t * h * w;
-        self.elementwise(3, out, Some(latent), None, n, [0, 0, 0, c as u32, t as u32, h as u32, w as u32, p as u32], [0.0; 2]);
+        self.elementwise(
+            3,
+            out,
+            Some(latent),
+            None,
+            n,
+            [0, 0, 0, c as u32, t as u32, h as u32, w as u32, p as u32],
+            [0.0; 2],
+        );
     }
 
     fn unpatchify(&self, x: &GBuf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &GBuf) {
         let n = c * t * h * w;
-        self.elementwise(4, out, Some(x), None, n, [0, 0, 0, c as u32, t as u32, h as u32, w as u32, p as u32], [0.0; 2]);
+        self.elementwise(
+            4,
+            out,
+            Some(x),
+            None,
+            n,
+            [0, 0, 0, c as u32, t as u32, h as u32, w as u32, p as u32],
+            [0.0; 2],
+        );
     }
 
     fn dmd_step(&self, x: &GBuf, v: &GBuf, noise: Option<&GBuf>, st: f32, sn: f32, n: usize) {
-        self.elementwise(1, x, Some(v), noise, n, [0, 0, noise.is_some() as u32, 0, 0, 0, 0, 0], [st, sn]);
+        self.elementwise(
+            1,
+            x,
+            Some(v),
+            noise,
+            n,
+            [0, 0, noise.is_some() as u32, 0, 0, 0, 0, 0],
+            [st, sn],
+        );
     }
 
-    fn conv2d(&self, a: &GBuf, b: Option<&GBuf>, s: &ConvShape, w: &GWeight, bias: Option<&GBuf>, ep: ConvEpilogue<'_, GBuf>, out: &GBuf) {
+    fn conv2d(
+        &self,
+        a: &GBuf,
+        b: Option<&GBuf>,
+        s: &ConvShape,
+        w: &GWeight,
+        bias: Option<&GBuf>,
+        ep: ConvEpilogue<'_, GBuf>,
+        out: &GBuf,
+    ) {
         assert_eq!((w.rows, w.cols), (s.cout, s.k_len()), "conv weight shape");
         let f16 = w.f16;
-        let pipe = self.pipeline(if f16 { "conv_f16" } else { "conv_f32" }, || Self::weight_src(CONV, f16));
+        let pipe = self.pipeline(if f16 { "conv_f16" } else { "conv_f32" }, || {
+            Self::weight_src(CONV, f16)
+        });
         let (epc, res) = match ep {
             ConvEpilogue::None => (0, &self.dummy),
             ConvEpilogue::Relu => (1, &self.dummy),
@@ -477,9 +696,26 @@ impl Backend for Wgpu {
         ];
         let (oh, ow) = s.out_hw();
         let mt = (s.frames * oh * ow).div_ceil(64);
-        let (gy, gz) = if mt as u32 <= MAX_DIM { (mt as u32, 1) } else { let z = (mt as u32).div_ceil(MAX_DIM); ((mt as u32).div_ceil(z), z) };
+        let (gy, gz) = if mt as u32 <= MAX_DIM {
+            (mt as u32, 1)
+        } else {
+            let z = (mt as u32).div_ceil(MAX_DIM);
+            ((mt as u32).div_ceil(z), z)
+        };
         let groups = (s.cout.div_ceil(64) as u32, gy, gz);
-        self.dispatch(&pipe, &p, &[a, b.unwrap_or(&self.dummy), &w.buf, bias.unwrap_or(&self.dummy), res, out], groups);
+        self.dispatch(
+            &pipe,
+            &p,
+            &[
+                a,
+                b.unwrap_or(&self.dummy),
+                &w.buf,
+                bias.unwrap_or(&self.dummy),
+                res,
+                out,
+            ],
+            groups,
+        );
     }
 
     fn tanh_clamp(&self, x: &GBuf, n: usize, s: f32) {
@@ -506,9 +742,14 @@ impl Wgpu {
         }
         self.flush();
         let (tx, rx) = futures_oneshot();
-        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| tx.send(r));
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| tx.send(r));
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
         rx.await.expect("map failed");
         let data = staging.slice(..).get_mapped_range().expect("mapped range");
         let out = bytemuck::cast_slice::<u8, f32>(&data)[..buf.len].to_vec();

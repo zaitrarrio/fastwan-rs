@@ -1,20 +1,28 @@
 //! `fastwan`: plan, check, bench and generate FastWan on CPU, WebGPU or CUDA.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fastwan_core::{
+    Backend,
     config::{TaeConfig, WanConfig},
     geometry::Geometry,
-    plan::{plan, Device},
+    plan::{Device, plan},
     schedule::DmdSchedule,
-    weights::{missing, tae_manifest, wan_manifest, SafetensorsDir, Synthetic, WeightSource as _},
-    Backend,
+    weights::{SafetensorsDir, Synthetic, WeightSource as _, missing, tae_manifest, wan_manifest},
 };
-use fastwan_model::{dit::WanDit, pipeline::{Options, Pipeline}, taehv::TaeHv, Video};
+use fastwan_model::{
+    Video,
+    dit::WanDit,
+    pipeline::{Options, Pipeline},
+    taehv::TaeHv,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "fastwan", about = "FastWan text-to-video on CPU, WebGPU or CUDA")]
+#[command(
+    name = "fastwan",
+    about = "FastWan text-to-video on CPU, WebGPU or CUDA"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -41,7 +49,11 @@ struct Shape {
 
 impl Shape {
     fn geometry(&self) -> Result<Geometry> {
-        let g = Geometry { width: self.width, height: self.height, frames: self.frames };
+        let g = Geometry {
+            width: self.width,
+            height: self.height,
+            frames: self.frames,
+        };
         g.validate(&WanConfig::fastwan_1_3b())?;
         Ok(g)
     }
@@ -148,22 +160,62 @@ fn resolve(kind: BackendKind) -> BackendKind {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Plan { shape, vram_gib, max_binding_mib, backend } => {
+        Cmd::Plan {
+            shape,
+            vram_gib,
+            max_binding_mib,
+            backend,
+        } => {
             let act = if backend == BackendKind::Cuda { 2 } else { 4 };
             let mut dev = Device::gib(vram_gib, 2, act);
             if let Some(m) = max_binding_mib {
                 dev.max_binding_bytes = m << 20;
             }
-            let p = plan(&WanConfig::fastwan_1_3b(), &TaeConfig::taew2_1(), &shape.geometry()?, &dev);
+            let p = plan(
+                &WanConfig::fastwan_1_3b(),
+                &TaeConfig::taew2_1(),
+                &shape.geometry()?,
+                &dev,
+            );
             print!("{p}");
         }
         Cmd::Check { backend } => with_backend!(backend, |be| check(&be, resolve(backend))?),
-        Cmd::Bench { shape, backend, layers, decode } => {
-            with_backend!(backend, |be| bench(&be, &shape.geometry()?, layers, decode)?)
+        Cmd::Bench {
+            shape,
+            backend,
+            layers,
+            decode,
+        } => {
+            with_backend!(backend, |be| bench(
+                &be,
+                &shape.geometry()?,
+                layers,
+                decode
+            )?)
         }
-        Cmd::Generate { shape, backend, transformer, tae, embeds, seed, out, ffn_chunk, tae_chunk } => {
+        Cmd::Generate {
+            shape,
+            backend,
+            transformer,
+            tae,
+            embeds,
+            seed,
+            out,
+            ffn_chunk,
+            tae_chunk,
+        } => {
             let g = shape.geometry()?;
-            with_backend!(backend, |be| generate(&be, &g, &transformer, &tae, &embeds, seed, &out, ffn_chunk, tae_chunk)?)
+            with_backend!(backend, |be| generate(
+                &be,
+                &g,
+                &transformer,
+                &tae,
+                &embeds,
+                seed,
+                &out,
+                ffn_chunk,
+                tae_chunk
+            )?)
         }
     }
     Ok(())
@@ -172,11 +224,20 @@ fn main() -> Result<()> {
 fn check<B: Backend>(be: &B, kind: BackendKind) -> Result<()> {
     println!("{}", be.name());
     // bf16 activations on CUDA: ~3 significant digits per op.
-    let tol = if kind == BackendKind::Cuda { 3e-2 } else { 2e-3 };
+    let tol = if kind == BackendKind::Cuda {
+        3e-2
+    } else {
+        2e-3
+    };
     let res = fastwan_model::check::run_all(be, tol);
     let mut bad = 0;
     for r in &res {
-        println!("{:<48} rel {:.2e}  {}", r.name, r.rel_err, if r.ok { "ok" } else { "FAIL" });
+        println!(
+            "{:<48} rel {:.2e}  {}",
+            r.name,
+            r.rel_err,
+            if r.ok { "ok" } else { "FAIL" }
+        );
         bad += (!r.ok) as usize;
     }
     if bad > 0 {
@@ -187,8 +248,19 @@ fn check<B: Backend>(be: &B, kind: BackendKind) -> Result<()> {
 }
 
 fn bench<B: Backend>(be: &B, g: &Geometry, layers: usize, decode: bool) -> Result<()> {
-    let cfg = WanConfig { layers, ..WanConfig::fastwan_1_3b() };
-    println!("{}  |  {}x{}x{}  {} tokens  {} layers", be.name(), g.width, g.height, g.frames, g.tokens(&cfg), layers);
+    let cfg = WanConfig {
+        layers,
+        ..WanConfig::fastwan_1_3b()
+    };
+    println!(
+        "{}  |  {}x{}x{}  {} tokens  {} layers",
+        be.name(),
+        g.width,
+        g.height,
+        g.frames,
+        g.tokens(&cfg),
+        layers
+    );
     let src = Synthetic { seed: 1 };
     let t0 = std::time::Instant::now();
     let pipe = Pipeline {
@@ -198,24 +270,43 @@ fn bench<B: Backend>(be: &B, g: &Geometry, layers: usize, decode: bool) -> Resul
     };
     println!("load (synthetic) {:.2}s", t0.elapsed().as_secs_f64());
     let embeds = vec![0.0; cfg.text_len * cfg.text_dim];
-    let opt = Options { geometry: *g, seed: 7, ffn_chunk: usize::MAX, tae_chunk: 2 };
+    let opt = Options {
+        geometry: *g,
+        seed: 7,
+        ffn_chunk: usize::MAX,
+        tae_chunk: 2,
+    };
     let mut t = fastwan_model::Timings::default();
     let latent = pipe.denoise(be, &embeds, &opt, &mut t)?;
     println!("prompt prep {:.3}s", t.prompt_s);
     for (i, s) in t.steps_s.iter().enumerate() {
-        println!("step {i} {:.3}s  ({:.1} ms/layer)", s, s * 1e3 / layers as f64);
+        println!(
+            "step {i} {:.3}s  ({:.1} ms/layer)",
+            s,
+            s * 1e3 / layers as f64
+        );
     }
-    println!("denoise {:.3}s; scaled to 30 layers ≈ {:.2}s", t.denoise_s(), t.denoise_s() * 30.0 / layers as f64);
+    println!(
+        "denoise {:.3}s; scaled to 30 layers ≈ {:.2}s",
+        t.denoise_s(),
+        t.denoise_s() * 30.0 / layers as f64
+    );
     if decode {
         let v = pipe.decode(be, &latent, g, opt.tae_chunk, &mut t);
-        println!("decode (TAEHV) {:.3}s -> {} frames {}x{}", t.decode_s, v.frames, v.width, v.height);
+        println!(
+            "decode (TAEHV) {:.3}s -> {} frames {}x{}",
+            t.decode_s, v.frames, v.width, v.height
+        );
     }
     Ok(())
 }
 
 fn load_embeds(path: &Path, cfg: &WanConfig) -> Result<Vec<f32>> {
     let st = SafetensorsDir::open(path)?;
-    let name = st.names().find(|n| n.contains("embed")).map(str::to_string)
+    let name = st
+        .names()
+        .find(|n| n.contains("embed"))
+        .map(str::to_string)
         .context("no `prompt_embeds` tensor in the embeddings file")?;
     // Accept [L, D] or [1, L, D]; pad with zeros (or trim) to text_len.
     let total: Vec<f32> = (1..=cfg.text_len)
@@ -228,23 +319,48 @@ fn load_embeds(path: &Path, cfg: &WanConfig) -> Result<Vec<f32>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate<B: Backend>(be: &B, g: &Geometry, transformer: &Path, tae: &Path, embeds: &Path, seed: u64, out: &Path, ffn_chunk: Option<usize>, tae_chunk: usize) -> Result<()> {
+fn generate<B: Backend>(
+    be: &B,
+    g: &Geometry,
+    transformer: &Path,
+    tae: &Path,
+    embeds: &Path,
+    seed: u64,
+    out: &Path,
+    ffn_chunk: Option<usize>,
+    tae_chunk: usize,
+) -> Result<()> {
     let cfg = WanConfig::fastwan_1_3b();
     let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
     if tcfg.latent_channels != cfg.out_channels {
-        bail!("{} decodes {}-channel latents; FastWan 2.1 makes {} (use taew2_1)", tae.display(), tcfg.latent_channels, cfg.out_channels);
+        bail!(
+            "{} decodes {}-channel latents; FastWan 2.1 makes {} (use taew2_1)",
+            tae.display(),
+            tcfg.latent_channels,
+            cfg.out_channels
+        );
     }
     println!("{}", be.name());
     let t0 = std::time::Instant::now();
     let wsrc = SafetensorsDir::open(transformer)?;
     let miss = missing(&wsrc, &wan_manifest(&cfg));
     if !miss.is_empty() {
-        bail!("{} tensors missing from {}, e.g. {:?}", miss.len(), transformer.display(), &miss[..miss.len().min(3)]);
+        bail!(
+            "{} tensors missing from {}, e.g. {:?}",
+            miss.len(),
+            transformer.display(),
+            &miss[..miss.len().min(3)]
+        );
     }
     let tsrc = SafetensorsDir::open(tae)?;
     let miss = missing(&tsrc, &tae_manifest(&tcfg));
     if !miss.is_empty() {
-        bail!("{} tensors missing from {}, e.g. {:?}", miss.len(), tae.display(), &miss[..miss.len().min(3)]);
+        bail!(
+            "{} tensors missing from {}, e.g. {:?}",
+            miss.len(),
+            tae.display(),
+            &miss[..miss.len().min(3)]
+        );
     }
     let pipe = Pipeline {
         dit: WanDit::load(be, cfg.clone(), &wsrc)?,
@@ -254,12 +370,31 @@ fn generate<B: Backend>(be: &B, g: &Geometry, transformer: &Path, tae: &Path, em
     let e = load_embeds(embeds, &cfg)?;
     be.sync();
     println!("load {:.1}s", t0.elapsed().as_secs_f64());
-    let opt = Options { geometry: *g, seed, ffn_chunk: ffn_chunk.unwrap_or(usize::MAX), tae_chunk };
+    let opt = Options {
+        geometry: *g,
+        seed,
+        ffn_chunk: ffn_chunk.unwrap_or(usize::MAX),
+        tae_chunk,
+    };
     let (video, t) = pipe.generate(be, &e, &opt)?;
-    println!("prompt {:.2}s  denoise {:.2}s ({:?})  decode {:.2}s", t.prompt_s, t.denoise_s(),
-        t.steps_s.iter().map(|s| format!("{s:.2}")).collect::<Vec<_>>(), t.decode_s);
+    println!(
+        "prompt {:.2}s  denoise {:.2}s ({:?})  decode {:.2}s",
+        t.prompt_s,
+        t.denoise_s(),
+        t.steps_s
+            .iter()
+            .map(|s| format!("{s:.2}"))
+            .collect::<Vec<_>>(),
+        t.decode_s
+    );
     write_y4m(out, &video, 16)?;
-    println!("wrote {} ({} frames {}x{})", out.display(), video.frames, video.width, video.height);
+    println!(
+        "wrote {} ({} frames {}x{})",
+        out.display(),
+        video.frames,
+        video.width,
+        video.height
+    );
     Ok(())
 }
 
@@ -268,20 +403,33 @@ fn generate<B: Backend>(be: &B, g: &Geometry, transformer: &Path, tae: &Path, em
 fn write_y4m(path: &Path, v: &Video, fps: u32) -> Result<()> {
     use std::io::Write;
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    writeln!(f, "YUV4MPEG2 W{} H{} F{fps}:1 Ip A1:1 C444 XCOLORRANGE=FULL", v.width, v.height)?;
+    writeln!(
+        f,
+        "YUV4MPEG2 W{} H{} F{fps}:1 Ip A1:1 C444 XCOLORRANGE=FULL",
+        v.width, v.height
+    )?;
     let px = v.width * v.height;
     let mut planes = vec![0u8; 3 * px];
     for fr in 0..v.frames {
         let rgb = &v.rgb[fr * px * 3..(fr + 1) * px * 3];
         for i in 0..px {
-            let (r, g, b) = (rgb[3 * i] as f32, rgb[3 * i + 1] as f32, rgb[3 * i + 2] as f32);
-            planes[i] = (0.299 * r + 0.587 * g + 0.114 * b).round().clamp(0.0, 255.0) as u8;
-            planes[px + i] = (128.0 - 0.168_736 * r - 0.331_264 * g + 0.5 * b).round().clamp(0.0, 255.0) as u8;
-            planes[2 * px + i] = (128.0 + 0.5 * r - 0.418_688 * g - 0.081_312 * b).round().clamp(0.0, 255.0) as u8;
+            let (r, g, b) = (
+                rgb[3 * i] as f32,
+                rgb[3 * i + 1] as f32,
+                rgb[3 * i + 2] as f32,
+            );
+            planes[i] = (0.299 * r + 0.587 * g + 0.114 * b)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            planes[px + i] = (128.0 - 0.168_736 * r - 0.331_264 * g + 0.5 * b)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            planes[2 * px + i] = (128.0 + 0.5 * r - 0.418_688 * g - 0.081_312 * b)
+                .round()
+                .clamp(0.0, 255.0) as u8;
         }
         f.write_all(b"FRAME\n")?;
         f.write_all(&planes)?;
     }
     Ok(())
 }
-

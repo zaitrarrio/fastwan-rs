@@ -204,12 +204,30 @@ pub trait Backend {
     /// Latent `[c, t, h, w]` → tokens `[t·(h/p)·(w/p), c·p²]`, feature index
     /// `c·p² + kh·p + kw` (the Conv3d `(1, p, p)` weight flattened).
     #[allow(clippy::too_many_arguments)]
-    fn patchify(&self, latent: &Self::Buf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &Self::Buf);
+    fn patchify(
+        &self,
+        latent: &Self::Buf,
+        c: usize,
+        t: usize,
+        h: usize,
+        w: usize,
+        p: usize,
+        out: &Self::Buf,
+    );
 
     /// Tokens `[t·(h/p)·(w/p), p²·c]` (feature `(kh·p + kw)·c + c'`, Diffusers
     /// unpatchify) → latent `[c, t, h, w]`.
     #[allow(clippy::too_many_arguments)]
-    fn unpatchify(&self, x: &Self::Buf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &Self::Buf);
+    fn unpatchify(
+        &self,
+        x: &Self::Buf,
+        c: usize,
+        t: usize,
+        h: usize,
+        w: usize,
+        p: usize,
+        out: &Self::Buf,
+    );
 
     /// In place on `x` (`n` elements): `x0 = x − σ_t·v`, then
     /// `x = (1 − σ_n)·x0 + σ_n·noise` when `noise` is given.

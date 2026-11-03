@@ -1,6 +1,6 @@
 //! Pixel ↔ latent ↔ token shapes for a Wan 2.1 clip.
 
-use crate::{config::WanConfig, Error, Result};
+use crate::{Error, Result, config::WanConfig};
 
 /// Wan 2.1 VAE: 8× spatial, 4× temporal with a causal first frame.
 pub const VAE_SPATIAL: usize = 8;
