@@ -44,6 +44,8 @@ pub struct Cuda {
     module: Arc<CudaModule>,
     f: Kernels,
     name: String,
+    /// Compute capability major ≥ 8: bf16 mma.sync is available.
+    ampere: bool,
 }
 
 struct Kernels {
@@ -51,6 +53,7 @@ struct Kernels {
     norm: CudaFunction,
     head_split: CudaFunction,
     attention: CudaFunction,
+    attention_mma: CudaFunction,
     gate_residual: CudaFunction,
     dmd_step: CudaFunction,
     tanh_clamp: CudaFunction,
@@ -105,6 +108,7 @@ impl Cuda {
             norm: get("fw_norm")?,
             head_split: get("fw_head_split")?,
             attention: get("fw_attention")?,
+            attention_mma: get("fw_attention_mma")?,
             gate_residual: get("fw_gate_residual")?,
             dmd_step: get("fw_dmd_step")?,
             tanh_clamp: get("fw_tanh_clamp")?,
@@ -121,6 +125,7 @@ impl Cuda {
             module,
             f,
             name,
+            ampere: maj >= 8,
         })
     }
 
@@ -434,6 +439,25 @@ impl Backend for Cuda {
         out: &CuBuf,
     ) {
         assert!(d <= 128);
+        let scale = 1.0 / (d as f32).sqrt();
+        if d == 128 && self.ampere && std::env::var("FASTWAN_CUDA_SCALAR_ATTN").is_err() {
+            self.launch(
+                &self.f.attention_mma,
+                (sq.div_ceil(64) as u32, heads as u32, 1),
+                (128, 1, 1),
+                &[
+                    Arg::P(self.ptr(q)),
+                    Arg::P(self.ptr(k)),
+                    Arg::P(self.ptr(v)),
+                    Arg::P(self.ptr(out)),
+                    Arg::I(heads as i32),
+                    Arg::I(sq as i32),
+                    Arg::I(sk as i32),
+                    Arg::F(scale),
+                ],
+            );
+            return;
+        }
         self.launch(
             &self.f.attention,
             (sq.div_ceil(64) as u32, heads as u32, 1),
@@ -447,7 +471,7 @@ impl Backend for Cuda {
                 Arg::I(sq as i32),
                 Arg::I(sk as i32),
                 Arg::I(d as i32),
-                Arg::F(1.0 / (d as f32).sqrt()),
+                Arg::F(scale),
             ],
         );
     }

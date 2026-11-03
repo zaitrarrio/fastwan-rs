@@ -283,6 +283,8 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         (3, 70, 70, 64),
         (2, 100, 13, 128),
         (1, 33, 129, 128),
+        (12, 200, 200, 128),
+        (3, 130, 512, 128),
     ] {
         let q = rng.normal(heads * sq * d);
         let k = rng.normal(heads * sk * d);

@@ -264,3 +264,139 @@ extern "C" __global__ void fw_conv2d(u64 a_, u64 b_, u64 w_, u64 bias_, u64 res_
         }
     }
 }
+
+// Tensor-core flash attention for head_dim 128 (sm_80+): FlashAttention-2
+// structure on bf16 mma.sync.m16n8k16 with f32 accumulation. One block = 4
+// warps = 64 query rows of one head (16 per warp); K and Vᵀ tiles of 64 keys
+// in shared memory; online softmax in base 2. The S accumulator fragments
+// are reused directly as the A operand of P·V (the C and A layouts of
+// m16n8k16 line up), so P never touches shared memory.
+#define MMA_BK 64
+#define MMA_D 128
+#define KS_STRIDE (MMA_D + 8)
+#define VT_STRIDE (MMA_BK + 8)
+
+__device__ __forceinline__ void mma_bf16(float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ unsigned pack_bf16(float lo, float hi) {
+    return (unsigned)bf(lo) | ((unsigned)bf(hi) << 16);
+}
+
+extern "C" __global__ void __launch_bounds__(128) fw_attention_mma(u64 q_, u64 k_, u64 v_, u64 out_, int heads, int sq, int sk, float scale) {
+    __shared__ __align__(16) bf16_t ks[MMA_BK * KS_STRIDE];
+    __shared__ __align__(16) bf16_t vt[MMA_D * VT_STRIDE];
+    const bf16_t *q = (const bf16_t*)q_, *k = (const bf16_t*)k_, *v = (const bf16_t*)v_;
+    bf16_t* out = (bf16_t*)out_;
+    const int h = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int r0 = blockIdx.x * 64 + warp * 16 + g, r1 = r0 + 8;   // this thread's two query rows
+    const float sl2 = scale * 1.4426950408889634f;                    // fold log2(e) for exp2
+
+    // Q fragments for the 8 k-steps of d = 128.
+    unsigned qa[8][4];
+    const unsigned* q0 = (const unsigned*)(q + ((long)h * sq + r0) * MMA_D);
+    const unsigned* q1 = (const unsigned*)(q + ((long)h * sq + r1) * MMA_D);
+    #pragma unroll
+    for (int kk = 0; kk < 8; ++kk) {
+        const int c = (kk * 16 + t * 2) >> 1;
+        qa[kk][0] = r0 < sq ? q0[c] : 0u;
+        qa[kk][1] = r1 < sq ? q1[c] : 0u;
+        qa[kk][2] = r0 < sq ? q0[c + 4] : 0u;
+        qa[kk][3] = r1 < sq ? q1[c + 4] : 0u;
+    }
+    float o[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    float m0 = -1e30f, m1 = -1e30f, l0 = 0.0f, l1 = 0.0f;
+
+    for (int j0 = 0; j0 < sk; j0 += MMA_BK) {
+        __syncthreads();
+        // K tile row-major [key][dim]; V tile transposed [dim][key]. Zero past sk.
+        for (int e = threadIdx.x; e < MMA_BK * MMA_D / 2; e += 128) {
+            const int key = e / (MMA_D / 2), c2 = (e % (MMA_D / 2)) * 2;
+            unsigned kv = 0u, vv = 0u;
+            if (j0 + key < sk) {
+                const long gi = ((long)h * sk + j0 + key) * MMA_D + c2;
+                kv = *(const unsigned*)(k + gi);
+                vv = *(const unsigned*)(v + gi);
+            }
+            *(unsigned*)(ks + key * KS_STRIDE + c2) = kv;
+            vt[c2 * VT_STRIDE + key] = (bf16_t)(vv & 0xffffu);
+            vt[(c2 + 1) * VT_STRIDE + key] = (bf16_t)(vv >> 16);
+        }
+        __syncthreads();
+        // S = Q·Kᵀ for this warp's 16 rows × 64 keys: 8 n-tiles of 8 keys.
+        float s[8][4];
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
+            const bf16_t* kr = ks + (nt * 8 + g) * KS_STRIDE;
+            #pragma unroll
+            for (int kk = 0; kk < 8; ++kk) {
+                const unsigned b0 = *(const unsigned*)(kr + kk * 16 + t * 2);
+                const unsigned b1 = *(const unsigned*)(kr + kk * 16 + 8 + t * 2);
+                mma_bf16(s[nt], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b0, b1);
+            }
+        }
+        // Scale, mask keys past sk, row max over the quad.
+        float mx0 = m0, mx1 = m1;
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int key = j0 + nt * 8 + t * 2;
+            #pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                const bool ok = key + c < sk;
+                s[nt][c] = ok ? s[nt][c] * sl2 : -1e30f;
+                s[nt][2 + c] = ok ? s[nt][2 + c] * sl2 : -1e30f;
+                mx0 = fmaxf(mx0, s[nt][c]);
+                mx1 = fmaxf(mx1, s[nt][2 + c]);
+            }
+        }
+        #pragma unroll
+        for (int off = 1; off < 4; off <<= 1) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, off));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, off));
+        }
+        const float c0 = exp2f(m0 - mx0), c1 = exp2f(m1 - mx1);
+        m0 = mx0; m1 = mx1;
+        l0 *= c0; l1 *= c1;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) { o[i][0] *= c0; o[i][1] *= c0; o[i][2] *= c1; o[i][3] *= c1; }
+        // P = exp2(S − m) as bf16 A fragments; O += P·V over 4 k-steps of 16 keys.
+        #pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            float p[8];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                p[c] = exp2f(s[2 * kk][c] - (c < 2 ? m0 : m1));
+                p[4 + c] = exp2f(s[2 * kk + 1][c] - (c < 2 ? m0 : m1));
+            }
+            l0 += p[0] + p[1] + p[4] + p[5];
+            l1 += p[2] + p[3] + p[6] + p[7];
+            const unsigned a0 = pack_bf16(p[0], p[1]), a1 = pack_bf16(p[2], p[3]);
+            const unsigned a2 = pack_bf16(p[4], p[5]), a3 = pack_bf16(p[6], p[7]);
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                const bf16_t* vr = vt + (dt * 8 + g) * VT_STRIDE + kk * 16;
+                const unsigned b0 = *(const unsigned*)(vr + t * 2);
+                const unsigned b1 = *(const unsigned*)(vr + 8 + t * 2);
+                mma_bf16(o[dt], a0, a1, a2, a3, b0, b1);
+            }
+        }
+    }
+    #pragma unroll
+    for (int off = 1; off < 4; off <<= 1) {
+        l0 += __shfl_xor_sync(0xffffffffu, l0, off);
+        l1 += __shfl_xor_sync(0xffffffffu, l1, off);
+    }
+    const float i0 = 1.0f / l0, i1 = 1.0f / l1;
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        const int c = dt * 8 + t * 2;
+        if (r0 < sq) *(unsigned*)(out + ((long)r0 * heads + h) * MMA_D + c) = pack_bf16(o[dt][0] * i0, o[dt][1] * i0);
+        if (r1 < sq) *(unsigned*)(out + ((long)r1 * heads + h) * MMA_D + c) = pack_bf16(o[dt][2] * i1, o[dt][3] * i1);
+    }
+}
