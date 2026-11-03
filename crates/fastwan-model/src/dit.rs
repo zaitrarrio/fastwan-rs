@@ -23,7 +23,7 @@ use fastwan_core::{
     Result,
     backend::{Act, Backend, NormKind},
     config::WanConfig,
-    quant::{Q8, WeightQuant},
+    quant::{Q4, Q8, WeightQuant},
     rope::rope_table,
     timestep::{matvec, silu, sinusoid},
     weights::WeightSource,
@@ -67,6 +67,11 @@ fn load_linear<B: Backend>(
         w: match quant {
             WeightQuant::Native => be.weight(&w, rows, cols),
             WeightQuant::Int8 => be.weight_q8(&Q8::quantize(&w, rows, cols)),
+            WeightQuant::Int4Sim { group, hqq, .. } => be.weight(
+                &Q4::quantize(&w, rows, cols, group, hqq).dequantize(),
+                rows,
+                cols,
+            ),
         },
         b: be.upload(&b),
     })
@@ -180,7 +185,8 @@ impl<B: Backend> WanDit<B> {
             shapes.insert(format!("blocks.{l}.to_gate_compress.weight"), vec![d, d]);
         }
         let lin = |keys: &[&str]| load_linear(be, src, &shapes, keys, WeightQuant::Native);
-        let qlin = |keys: &[&str]| load_linear(be, src, &shapes, keys, quant);
+        let qlin = |keys: &[&str]| load_linear(be, src, &shapes, keys, quant.attn());
+        let flin = |keys: &[&str]| load_linear(be, src, &shapes, keys, quant);
         let vec = |k: &str, n: usize| -> Result<B::Buf> { Ok(be.upload(&src.get(k, &[n])?)) };
         let mut blocks = Vec::with_capacity(cfg.layers);
         for l in 0..cfg.layers {
@@ -197,8 +203,8 @@ impl<B: Backend> WanDit<B> {
                 out2: qlin(&[&p("attn2.to_out.0")])?,
                 norm2_w: vec(&p("norm2.weight"), d)?,
                 norm2_b: vec(&p("norm2.bias"), d)?,
-                ffn1: qlin(&[&p("ffn.net.0.proj")])?,
-                ffn2: qlin(&[&p("ffn.net.2")])?,
+                ffn1: flin(&[&p("ffn.net.0.proj")])?,
+                ffn2: flin(&[&p("ffn.net.2")])?,
                 gate: if src.contains(&p("to_gate_compress.weight")) {
                     Some(qlin(&[&p("to_gate_compress")])?)
                 } else {

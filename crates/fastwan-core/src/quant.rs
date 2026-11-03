@@ -18,6 +18,27 @@ pub enum WeightQuant {
     Native,
     /// [`Q8`]: half the bytes of bf16 / f16.
     Int8,
+    /// 4-bit [`Q4`] with `group` columns per scale/zero, rounded to nearest
+    /// or HQQ-refined. **Evaluation only:** the weights are quantized and
+    /// expanded back, then stored at native precision, so this measures the
+    /// output of 4-bit weights without saving memory (no int4 kernels yet).
+    /// With `ffn_only`, the attention and gate linears use [`Q8`] (real int8)
+    /// and only the FFN (≈63% of the block weights) is 4-bit.
+    Int4Sim {
+        group: usize,
+        hqq: bool,
+        ffn_only: bool,
+    },
+}
+
+impl WeightQuant {
+    /// The format of the non-FFN block linears.
+    pub fn attn(self) -> Self {
+        match self {
+            Self::Int4Sim { ffn_only: true, .. } => Self::Int8,
+            q => q,
+        }
+    }
 }
 
 impl std::str::FromStr for WeightQuant {
@@ -26,7 +47,32 @@ impl std::str::FromStr for WeightQuant {
         match s {
             "native" | "bf16" | "f16" => Ok(Self::Native),
             "int8" | "q8" => Ok(Self::Int8),
-            _ => Err(format!("unknown weight format `{s}` (native | int8)")),
+            _ => {
+                // int4-sim[-hqq][-g<N>][-ffn]
+                let (s, ffn_only) = match s.strip_suffix("-ffn") {
+                    Some(r) => (r, true),
+                    None => (s, false),
+                };
+                let rest = s.strip_prefix("int4-sim").ok_or_else(|| {
+                    format!(
+                        "unknown weight format `{s}` (native | int8 | int4-sim[-hqq][-gN][-ffn])"
+                    )
+                })?;
+                let (hqq, rest) = match rest.strip_prefix("-hqq") {
+                    Some(r) => (true, r),
+                    None => (false, rest),
+                };
+                let group = match rest.strip_prefix("-g") {
+                    Some(g) => g.parse().map_err(|_| format!("bad group in `{s}`"))?,
+                    None if rest.is_empty() => 64,
+                    None => return Err(format!("bad weight format `{s}`")),
+                };
+                Ok(Self::Int4Sim {
+                    group,
+                    hqq,
+                    ffn_only,
+                })
+            }
         }
     }
 }
@@ -45,7 +91,11 @@ pub struct Q8 {
 impl Q8 {
     pub fn quantize(data: &[f32], rows: usize, cols: usize) -> Self {
         assert_eq!(data.len(), rows * cols);
-        let group = if cols.is_multiple_of(Q8_GROUP) { Q8_GROUP } else { cols };
+        let group = if cols.is_multiple_of(Q8_GROUP) {
+            Q8_GROUP
+        } else {
+            cols
+        };
         let mut q = vec![0i8; data.len()];
         let mut scales = Vec::with_capacity(data.len() / group);
         for (src, dst) in data.chunks(group).zip(q.chunks_mut(group)) {
@@ -79,6 +129,119 @@ impl Q8 {
     }
 }
 
+/// A `[rows, cols]` matrix as unsigned 4-bit codes with an affine
+/// scale / zero per group of columns: `w ≈ (q − z) · s`, `q ∈ [0, 15]`.
+#[derive(Debug, Clone)]
+pub struct Q4 {
+    /// One code per byte (packing is a storage concern; see [`Q4::bytes`]).
+    pub q: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub zeros: Vec<f32>,
+    pub rows: usize,
+    pub cols: usize,
+    pub group: usize,
+}
+
+impl Q4 {
+    /// Min/max round-to-nearest; with `hqq`, then refine each group's zero
+    /// point with HQQ's half-quadratic proximal solver (Badri & Shaji 2023,
+    /// `optimize_weights_proximal`: lp-norm 0.7, β 10, κ 1.01, ≤ 20 iters),
+    /// which fits the zero to a sparse-error model instead of the extremes.
+    pub fn quantize(data: &[f32], rows: usize, cols: usize, group: usize, hqq: bool) -> Self {
+        assert_eq!(data.len(), rows * cols);
+        let group = if cols.is_multiple_of(group) {
+            group
+        } else {
+            cols
+        };
+        let n = data.len() / group;
+        let mut q = vec![0u8; data.len()];
+        let mut sz = vec![(0.0f32, 0.0f32); n];
+        // Groups are independent: split them across threads (HQQ is ~50 flops
+        // per weight per iteration; single-threaded it adds minutes to a load).
+        let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+        let per = n.div_ceil(threads).max(1);
+        std::thread::scope(|sc| {
+            for ((w, qc), szc) in data
+                .chunks(per * group)
+                .zip(q.chunks_mut(per * group))
+                .zip(sz.chunks_mut(per))
+            {
+                sc.spawn(move || {
+                    for ((w, qg), sz) in w.chunks(group).zip(qc.chunks_mut(group)).zip(szc) {
+                        let (lo, hi) = w
+                            .iter()
+                            .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                        // HQQ's convention: inverse scale `is`, codes = round(w·is + z).
+                        let is = if hi > lo { 15.0 / (hi - lo) } else { 1.0 };
+                        let mut z = -lo * is;
+                        let code = |v: f32, z: f32| (v * is + z).round().clamp(0.0, 15.0);
+                        if hqq {
+                            let (p, mut beta, kappa) = (0.7f32, 10.0f32, 1.01f32);
+                            let (mut best, mut best_z) = (f32::MAX, z);
+                            for _ in 0..20 {
+                                let mut err = 0.0;
+                                let mut zsum = 0.0;
+                                for &v in w {
+                                    let c = code(v, z);
+                                    let r = (c - z) / is;
+                                    let e = v - r;
+                                    err += e.abs();
+                                    // shrink: sign(e)·relu(|e| − |e|^(p−1) / β)
+                                    let a = e.abs();
+                                    let sh = if a > 0.0 {
+                                        e.signum() * (a - a.powf(p - 1.0) / beta).max(0.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    zsum += c - (v - sh) * is;
+                                }
+                                let err = err / w.len() as f32;
+                                if err >= best {
+                                    break;
+                                }
+                                (best, best_z) = (err, z);
+                                z = zsum / w.len() as f32;
+                                beta *= kappa;
+                            }
+                            z = best_z;
+                        }
+                        for (d, &v) in qg.iter_mut().zip(w) {
+                            *d = code(v, z) as u8;
+                        }
+                        *sz = (1.0 / is, z);
+                    }
+                });
+            }
+        });
+        let (scales, zeros) = sz.into_iter().unzip();
+        Self {
+            q,
+            scales,
+            zeros,
+            rows,
+            cols,
+            group,
+        }
+    }
+
+    pub fn dequantize(&self) -> Vec<f32> {
+        self.q
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                let g = i / self.group;
+                (c as f32 - self.zeros[g]) * self.scales[g]
+            })
+            .collect()
+    }
+
+    /// Bytes once packed: two codes per byte, f16 scale and zero per group.
+    pub fn bytes(&self) -> usize {
+        self.q.len().div_ceil(2) + 4 * self.scales.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +259,59 @@ mod tests {
         for (i, (a, b)) in w.iter().zip(&d).enumerate() {
             assert!((a - b).abs() <= q.scales[i / 128] * 0.5 + 1e-6);
         }
+    }
+
+    #[test]
+    fn int4_round_trip_and_hqq_does_not_hurt() {
+        let (rows, cols) = (16, 256);
+        // Heavy-tailed rows: mostly small values, a few outliers.
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                let u = (i * 7919 % 1009) as f32 / 1009.0 - 0.5;
+                if i % 97 == 0 { u * 8.0 } else { u * 0.3 }
+            })
+            .collect();
+        let err = |q: &Q4| -> f32 {
+            w.iter()
+                .zip(q.dequantize())
+                .map(|(a, b)| (a - b).powi(2))
+                .sum()
+        };
+        let rtn = Q4::quantize(&w, rows, cols, 64, false);
+        assert!(rtn.q.iter().all(|&c| c <= 15));
+        for (i, (a, b)) in w.iter().zip(rtn.dequantize()).enumerate() {
+            assert!((a - b).abs() <= rtn.scales[i / 64] * 0.5 + 1e-5);
+        }
+        let hqq = Q4::quantize(&w, rows, cols, 64, true);
+        assert!(hqq.q.iter().all(|&c| c <= 15));
+        assert!(
+            err(&hqq) <= err(&rtn) * 1.05,
+            "{} vs {}",
+            err(&hqq),
+            err(&rtn)
+        );
+        assert_eq!(
+            "int4-sim-hqq-g32".parse(),
+            Ok(WeightQuant::Int4Sim {
+                group: 32,
+                hqq: true,
+                ffn_only: false
+            })
+        );
+        assert_eq!(
+            "int4-sim".parse(),
+            Ok(WeightQuant::Int4Sim {
+                group: 64,
+                hqq: false,
+                ffn_only: false
+            })
+        );
+        assert_eq!(
+            "int4-sim-hqq-g64-ffn"
+                .parse::<WeightQuant>()
+                .map(|q| q.attn()),
+            Ok(WeightQuant::Int8)
+        );
     }
 
     #[test]
