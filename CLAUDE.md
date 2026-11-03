@@ -7,8 +7,10 @@ State and invariants only; the reasoning is in `docs/design.md`.
   `fastwan-model/src/check.rs`, all in the same change.
 - The CPU backend is ground truth. GPU code is trusted only after
   `fastwan check --backend <b>` passes on that hardware. Both pass on an RTX
-  4090 (`docs/runs/2026-11-03-vast-4090-vsa`): 480p step CUDA 1.35 s (VSA) /
-  2.48 s (dense), WebGPU ≈ 65 s (VSA) / 136 s (dense). Neither has run on AMD.
+  4090: 480p step CUDA 1.35 s (VSA) / 2.48 s (dense); WebGPU 12.9 s (VSA),
+  clip 42.7 s (`docs/runs/2026-11-03-vast-4090-webgpu-perf`). Neither has run
+  on AMD. WebGPU speed varies by host Vulkan driver (152 vs 83 s/step on
+  570.86 vs 595.99 with the old kernels): record the driver with every number.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does); `--attention dense` to compare. The VSA
   CPU path is fastvideo-rs's host oracle; keep GPU kernels checked against it.
@@ -21,6 +23,10 @@ State and invariants only; the reasoning is in `docs/design.md`.
   `kernels.cu`). Change both. `fw_` because `norm` collides with a CUDA builtin.
 - Shader change → `python3 web/build.py` (the test page inlines the shaders;
   `web_page_embeds_current_shaders` fails otherwise).
+- WGSL: write per-thread register blocks as named vec4 accumulators, never
+  arrays indexed in loops. NVIDIA's Vulkan compiler kept those arrays in local
+  memory: unrolling made the GEMM 5.75× and flash attention 7.8× faster.
+  `FASTWAN_PROFILE=1` gives per-kernel GPU time; check it after kernel work.
 - WGSL: zero loop-local accumulators explicitly. Dawn (Chrome) on SwiftShader
   carried a `var` declared in a loop body across iterations, which broke
   multi-chunk flash attention while naga/wgpu passed. Run the bench page in
