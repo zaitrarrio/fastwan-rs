@@ -33,6 +33,9 @@ pre { font: 0.82rem/1.55 var(--f-mono); background: var(--panel); border: 1px so
 ul { margin: 0; padding-left: 1.2em; display: grid; gap: 4px; max-width: 64ch; }
 code { font: 0.88em var(--f-mono); }
 footer { color: var(--muted); font-size: 0.85rem; }
+.clip { margin: 0; display: grid; gap: 8px; }
+.clip video { width: 100%; height: auto; max-width: 100%; border-radius: 6px; background: #000; aspect-ratio: 832 / 480; }
+.clip figcaption { color: var(--muted); font-size: 0.85rem; }
 </style>
 </head>
 <body>
@@ -42,6 +45,11 @@ footer { color: var(--muted); font-size: 0.85rem; }
     <h1>fastwan-rs</h1>
     <p class="lede">Text-to-video on your own desktop GPU, in Rust. One set of fused kernels runs through WebGPU (Vulkan, DX12, Metal: NVIDIA, AMD, Intel, Apple) or CUDA, and the TAEHV decoder turns latents into frames you can watch while the clip finishes.</p>
   </header>
+
+  <figure class="clip">
+    <video src="/media/fox-832x480.mp4" autoplay muted loop playsinline width="832" height="480"></video>
+    <figcaption>"A red fox trots through fresh snow in a birch forest at dawn…" · 832×480, 81 frames, seed 7 · generated in 10.8 s on an RTX 4090</figcaption>
+  </figure>
 
   <div class="pages">
     <a class="card" href="/demo/">
@@ -73,7 +81,7 @@ fastwan serve --model-dir fastwan --allow-origin <span id="origin">https://fastw
     <ul>
       <li>The Wan DiT matches Diffusers to 4·10⁻⁷ and the UMT5 text encoder matches transformers to 2·10⁻⁶, on random-weight test models.</li>
       <li>Every WebGPU kernel passes against a CPU reference in both wgpu and Chrome's WebGPU.</li>
-      <li>No clip from the real checkpoint and no real-GPU timing has been published yet. The bench page gives you your own GPU's numbers.</li>
+      <li>On an RTX 4090 with CUDA, a 5-second 832×480 clip takes 10.8 s: three denoising steps of 2.9 s with tensor-core attention, plus 1.9 s to decode. The WebGPU path is correct on the same card but still far too slow at this size; its attention kernel is next.</li>
     </ul>
   </section>
 

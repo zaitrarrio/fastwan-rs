@@ -57,13 +57,14 @@ checks cover them):
 |---|---|
 | Wan DiT = Diffusers `WanTransformer3DModel` | one forward on tiny random weights, rel 3.7e-7 (`fastwan-model/tests/hf_parity.rs`, diffusers 0.42) |
 | UMT5 encoder = transformers `UMT5EncoderModel` | tiny random weights, rel 1.5e-6, reference run padded + masked as WanPipeline does it, Rust run on the real tokens only (`fastwan-text/tests/hf_parity.rs`, transformers 5.22) |
-| a real FastWan clip looks right | **not run**: needs the 14 GB of weights and a GPU |
+| a real FastWan clip looks right | yes: coherent, on-prompt 480p clips from the real checkpoint (`docs/runs/2026-11-03-vast-4090/*.mp4`) |
 | WebGPU kernels = CPU reference | 25 checks in `fastwan-model::check`, worst rel. error 2.6e-4 (f16 weights), on wgpu/naga + lavapipe; 18 kernel checks in the test page on Chrome/Dawn + SwiftShader |
 | tiny DiT 3 DMD steps, WebGPU vs CPU | rel 1.6e-4 |
 | FFN chunking and TAEHV chunking change nothing | CPU tests, < 1e-6 |
 | CUDA kernels compile | NVRTC 12.9, compute_80/89/120, in `cargo test` when libnvrtc loads |
-| CUDA results | **unverified**: run `fastwan check --backend cuda` on the first GPU |
-| any speed number on a real GPU | **none yet** |
+| CUDA results | all 27 checks pass on an RTX 4090 (`docs/runs/2026-11-03-vast-4090`) |
+| WebGPU on a real GPU | all checks pass on the 4090 through NVIDIA Vulkan |
+| speed | RTX 4090, 832×480×81: 2.9 s per DMD step, 10.8 s per clip with TAEHV (CUDA, tensor-core attention). WebGPU: over 20 min per step |
 
 ## Cost model (480p, 81 frames, 32,760 tokens)
 
@@ -76,8 +77,9 @@ Per DiT forward:
 So a clip is ~850 TFLOP with dense attention, and 70% of that is
 self-attention. That drives the next steps:
 
-1. **Tensor-core attention on CUDA.** The current kernel is scalar FMA
-   (correctness first). It needs `mma.sync` bf16 (FlashAttention-2 style).
+1. ~~**Tensor-core attention on CUDA.**~~ Done (`fw_attention_mma`, bf16
+   `mma.sync` m16n8k16, FlashAttention-2 structure): 137 → 2.9 s per 480p step
+   on an RTX 4090.
 2. **Video sparse attention (VSA).** FastWan was trained with it
    (`to_gate_compress` weights load but are unused today). It cuts the 198
    TFLOP several-fold on every backend, and it is the only route to 480p

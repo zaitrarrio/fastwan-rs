@@ -6,8 +6,14 @@ State and invariants only; the reasoning is in `docs/design.md`.
   means: CPU reference, WGSL kernel, CUDA kernel, and a case in
   `fastwan-model/src/check.rs`, all in the same change.
 - The CPU backend is ground truth. GPU code is trusted only after
-  `fastwan check --backend <b>` passes on that hardware. CUDA has never run
-  on a GPU; WebGPU has only run on software rasterizers.
+  `fastwan check --backend <b>` passes on that hardware. Both pass on an RTX
+  4090 (2026-11-03, `docs/runs/2026-11-03-vast-4090`): CUDA 2.9 s per 480p
+  step, WebGPU > 20 min (scalar attention). Neither has run on AMD yet.
+- Rentals: `scripts/vast/` (no SSH; R2 command channel). Arm a destroy timer
+  at rent time, `timeout` every command, run the decisive work first.
+- WebGPU refuses software adapters for bench/generate/serve
+  (`FASTWAN_ALLOW_SOFTWARE=1` overrides): a missing driver dependency makes
+  wgpu fall back to llvmpipe silently.
 - WGSL kernels and their CUDA twins share structure (`fw_<op>` in
   `kernels.cu`). Change both. `fw_` because `norm` collides with a CUDA builtin.
 - Shader change → `python3 web/build.py` (the test page inlines the shaders;
