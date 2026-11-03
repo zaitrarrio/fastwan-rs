@@ -123,6 +123,13 @@ impl Wgpu {
         pollster::block_on(Self::new_async())
     }
 
+    /// A CPU rasterizer (llvmpipe / lavapipe / SwiftShader / WARP). Fine for
+    /// conformance checks, meaningless for timing: wgpu falls back to one
+    /// silently when the GPU's Vulkan driver fails to load.
+    pub fn is_software(&self) -> bool {
+        self.info.device_type == wgpu::DeviceType::Cpu
+    }
+
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.info
     }

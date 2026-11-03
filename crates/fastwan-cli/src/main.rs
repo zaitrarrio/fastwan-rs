@@ -134,8 +134,21 @@ enum Cmd {
         #[arg(long)]
         tae: PathBuf,
         /// safetensors holding `prompt_embeds` `[L, 4096]` (scripts/encode_prompt.py).
+        #[arg(long, required_unless_present = "prompt")]
+        embeds: Option<PathBuf>,
+        /// Encode this prompt with the native UMT5 (needs --text-encoder and --tokenizer).
+        #[arg(long, requires_all = ["text_encoder", "tokenizer"])]
+        prompt: Option<String>,
+        /// The checkpoint's `text_encoder/` directory.
         #[arg(long)]
-        embeds: PathBuf,
+        text_encoder: Option<PathBuf>,
+        /// `tokenizer/tokenizer.json`.
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        /// Generate this many times (same seed) and report each; the first run
+        /// includes shader / kernel compilation.
+        #[arg(long, default_value_t = 1)]
+        runs: usize,
         #[arg(long, default_value_t = 7)]
         seed: u64,
         #[arg(long, default_value = "out.y4m")]
@@ -159,6 +172,13 @@ macro_rules! with_backend {
             }
             BackendKind::Wgpu => {
                 let $be = fastwan_wgpu::Wgpu::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+                if $be.is_software() && !allow_software() {
+                    bail!(
+                        "WebGPU found only a software rasterizer ({}): the GPU's Vulkan/DX12/Metal driver did not load. \
+                         Fix the driver, or set FASTWAN_ALLOW_SOFTWARE=1 to run on the CPU rasterizer anyway",
+                        $be.adapter_info().name
+                    );
+                }
                 $body
             }
             BackendKind::Cuda => {
@@ -176,6 +196,14 @@ macro_rules! with_backend {
     }};
 }
 
+/// Software WebGPU adapters are refused unless asked for; `check` always
+/// allows them (it compares against the CPU reference, not a clock).
+fn allow_software() -> bool {
+    std::env::var("FASTWAN_ALLOW_SOFTWARE").is_ok_and(|v| v == "1")
+        || ALLOW_SW.load(std::sync::atomic::Ordering::Relaxed)
+}
+static ALLOW_SW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn resolve(kind: BackendKind) -> BackendKind {
     if kind != BackendKind::Auto {
         return kind;
@@ -189,6 +217,9 @@ fn resolve(kind: BackendKind) -> BackendKind {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.cmd, Cmd::Check { .. } | Cmd::Plan { .. }) {
+        ALLOW_SW.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     match cli.cmd {
         Cmd::Plan {
             shape,
@@ -263,22 +294,49 @@ fn main() -> Result<()> {
             transformer,
             tae,
             embeds,
+            prompt,
+            text_encoder,
+            tokenizer,
+            runs,
             seed,
             out,
             ffn_chunk,
             tae_chunk,
         } => {
             let g = shape.geometry()?;
+            let cfg = WanConfig::fastwan_1_3b();
+            let e = match (prompt, embeds) {
+                (Some(p), _) => {
+                    let t0 = std::time::Instant::now();
+                    let enc = fastwan_text::PromptEncoder::open(
+                        tokenizer.as_deref().expect("clap requires --tokenizer"),
+                        text_encoder
+                            .as_deref()
+                            .expect("clap requires --text-encoder"),
+                        fastwan_text::Umt5Config::xxl(),
+                    )?;
+                    let n = enc.tokenize(&p)?.len();
+                    let e = enc.encode(&p)?;
+                    println!(
+                        "umt5 (cpu) {n} tokens in {:.2}s",
+                        t0.elapsed().as_secs_f64()
+                    );
+                    e
+                }
+                (None, Some(path)) => load_embeds(&path, &cfg)?,
+                (None, None) => bail!("give --prompt or --embeds"),
+            };
             with_backend!(backend, |be| generate(
                 &be,
                 &g,
                 &transformer,
                 &tae,
-                &embeds,
+                &e,
                 seed,
                 &out,
                 ffn_chunk,
-                tae_chunk
+                tae_chunk,
+                runs
             )?)
         }
     }
@@ -388,11 +446,12 @@ fn generate<B: Backend>(
     g: &Geometry,
     transformer: &Path,
     tae: &Path,
-    embeds: &Path,
+    e: &[f32],
     seed: u64,
     out: &Path,
     ffn_chunk: Option<usize>,
     tae_chunk: usize,
+    runs: usize,
 ) -> Result<()> {
     let cfg = WanConfig::fastwan_1_3b();
     let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
@@ -431,7 +490,6 @@ fn generate<B: Backend>(
         tae: TaeHv::load(be, tcfg, &tsrc)?,
         schedule: DmdSchedule::fastwan_1_3b(),
     };
-    let e = load_embeds(embeds, &cfg)?;
     be.sync();
     println!("load {:.1}s", t0.elapsed().as_secs_f64());
     let opt = Options {
@@ -440,17 +498,24 @@ fn generate<B: Backend>(
         ffn_chunk: ffn_chunk.unwrap_or(usize::MAX),
         tae_chunk,
     };
-    let (video, t) = pipe.generate(be, &e, &opt)?;
-    println!(
-        "prompt {:.2}s  denoise {:.2}s ({:?})  decode {:.2}s",
-        t.prompt_s,
-        t.denoise_s(),
-        t.steps_s
-            .iter()
-            .map(|s| format!("{s:.2}"))
-            .collect::<Vec<_>>(),
-        t.decode_s
-    );
+    let mut last = None;
+    for run in 0..runs.max(1) {
+        let t0 = std::time::Instant::now();
+        let (video, t) = pipe.generate(be, e, &opt)?;
+        println!(
+            "run {run}: total {:.2}s  prompt {:.2}s  denoise {:.2}s ({:?})  decode {:.2}s",
+            t0.elapsed().as_secs_f64(),
+            t.prompt_s,
+            t.denoise_s(),
+            t.steps_s
+                .iter()
+                .map(|s| format!("{s:.2}"))
+                .collect::<Vec<_>>(),
+            t.decode_s
+        );
+        last = Some(video);
+    }
+    let video = last.expect("at least one run");
     write_y4m(out, &video, 16)?;
     println!(
         "wrote {} ({} frames {}x{})",
