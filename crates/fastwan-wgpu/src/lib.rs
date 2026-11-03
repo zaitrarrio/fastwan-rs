@@ -18,6 +18,8 @@ use wgpu::util::DeviceExt;
 
 const COMMON: &str = include_str!("shaders/common.wgsl");
 const LINEAR: &str = include_str!("shaders/linear.wgsl");
+const LINEAR2: &str = include_str!("shaders/linear2.wgsl");
+const LINEAR3: &str = include_str!("shaders/linear3.wgsl");
 const CONV: &str = include_str!("shaders/conv.wgsl");
 const ATTN: &str = include_str!("shaders/attention.wgsl");
 const NORM: &str = include_str!("shaders/norm.wgsl");
@@ -743,9 +745,28 @@ impl Backend for Wgpu {
                 if act == Act::GeluTanh { " gelu" } else { "" }
             ));
         }
-        let pipe = self.pipeline(if f16 { "linear_f16" } else { "linear_f32" }, || {
-            Self::weight_src(LINEAR, f16)
-        });
+        // 128×128 tiles for the big GEMMs (FASTWAN_WGPU_LINEAR=1 forces the
+        // 64×64 kernel, for A/B); small row counts keep the 64×64 kernel.
+        // FASTWAN_WGPU_LINEAR selects the GEMM kernel for A/B runs:
+        // 1 = 64×64 array accumulators (linear.wgsl, the default),
+        // 2 = 128×128 (linear2.wgsl: measured 38% slower on an RTX 4090),
+        // 3 = 64×64 with hand-unrolled vec4 accumulators (linear3.wgsl).
+        let variant = std::env::var("FASTWAN_WGPU_LINEAR")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        let variant = if variant == 2 && rows < 128 {
+            1
+        } else {
+            variant
+        };
+        let (src, tile, name) = match variant {
+            2 => (LINEAR2, 128, "linear2"),
+            3 => (LINEAR3, 64, "linear3"),
+            _ => (LINEAR, 64, "linear"),
+        };
+        let key = format!("{name}_{}", if f16 { "f16" } else { "f32" });
+        let pipe = self.pipeline(&key, || Self::weight_src(src, f16));
         let p = [
             rows as u32,
             w.rows as u32,
@@ -755,7 +776,7 @@ impl Backend for Wgpu {
             bias.is_some() as u32,
             (act == Act::GeluTanh) as u32,
         ];
-        let groups = (w.rows.div_ceil(64) as u32, rows.div_ceil(64) as u32, 1);
+        let groups = (w.rows.div_ceil(tile) as u32, rows.div_ceil(tile) as u32, 1);
         self.dispatch(
             &pipe,
             &p,
