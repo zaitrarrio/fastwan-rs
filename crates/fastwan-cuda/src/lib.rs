@@ -1,0 +1,377 @@
+//! CUDA backend: cudarc (driver loaded at run time, so this builds on a
+//! machine without CUDA), kernels compiled by NVRTC at start-up for the
+//! device's own SM, GEMMs on cuBLAS in bf16 with f32 accumulation (tensor
+//! cores on every RTX card since Turing… bf16 needs Ampere, sm_80+).
+//!
+//! Activations and weights are bf16; RoPE tables stay f32
+//! ([`Backend::upload_table`]). The non-GEMM kernels are line-for-line twins
+//! of the WGSL kernels that `fastwan-model::check` verifies on every CI run;
+//! run `fastwan check --backend cuda` on a GPU before trusting a number.
+
+#![allow(clippy::too_many_arguments)]
+
+use cudarc::cublas::{sys as blas_sys, CudaBlas};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
+use fastwan_core::backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind};
+use half::bf16;
+use std::sync::Arc;
+
+const KERNELS: &str = include_str!("kernels.cu");
+
+#[derive(Clone)]
+pub struct CuBuf {
+    s: Arc<CudaSlice<u16>>,
+    len: usize,
+    /// Stored as f32 (2 u16 words per element) — RoPE tables only.
+    f32: bool,
+}
+
+pub struct CuWeight {
+    buf: CuBuf,
+    rows: usize,
+    cols: usize,
+}
+
+pub struct Cuda {
+    #[allow(dead_code)]
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    blas: CudaBlas,
+    #[allow(dead_code)]
+    module: Arc<CudaModule>,
+    f: Kernels,
+    name: String,
+}
+
+struct Kernels {
+    bias_act: CudaFunction,
+    norm: CudaFunction,
+    head_split: CudaFunction,
+    attention: CudaFunction,
+    gate_residual: CudaFunction,
+    dmd_step: CudaFunction,
+    tanh_clamp: CudaFunction,
+    patch: CudaFunction,
+    conv2d: CudaFunction,
+}
+
+#[derive(Debug)]
+pub struct CudaError(pub String);
+impl std::fmt::Display for CudaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for CudaError {}
+
+fn err(e: impl std::fmt::Debug) -> CudaError {
+    CudaError(format!("{e:?}"))
+}
+
+/// Compile the kernels to PTX for `arch` (e.g. `compute_89`). Needs only
+/// libnvrtc, not a GPU — CI uses this to keep `kernels.cu` compiling.
+pub fn compile_kernels(arch: &'static str) -> Result<cudarc::nvrtc::Ptx, CudaError> {
+    cudarc::nvrtc::compile_ptx_with_opts(
+        KERNELS,
+        cudarc::nvrtc::CompileOptions {
+            arch: Some(arch),
+            options: vec!["--std=c++17".into()],
+            ..Default::default()
+        },
+    )
+    .map_err(err)
+}
+
+enum Arg {
+    P(u64),
+    I(i32),
+    L(i64),
+    F(f32),
+}
+
+impl Cuda {
+    pub fn new(ordinal: usize) -> Result<Self, CudaError> {
+        let ctx = CudaContext::new(ordinal).map_err(err)?;
+        let (maj, min) = ctx.compute_capability().map_err(err)?;
+        let arch: &'static str = Box::leak(format!("compute_{maj}{min}").into_boxed_str());
+        let ptx = compile_kernels(arch)?;
+        let module = ctx.load_module(ptx).map_err(err)?;
+        let get = |n: &str| module.load_function(n).map_err(err);
+        let f = Kernels {
+            bias_act: get("fw_bias_act")?,
+            norm: get("fw_norm")?,
+            head_split: get("fw_head_split")?,
+            attention: get("fw_attention")?,
+            gate_residual: get("fw_gate_residual")?,
+            dmd_step: get("fw_dmd_step")?,
+            tanh_clamp: get("fw_tanh_clamp")?,
+            patch: get("fw_patch")?,
+            conv2d: get("fw_conv2d")?,
+        };
+        let stream = ctx.default_stream();
+        let blas = CudaBlas::new(stream.clone()).map_err(err)?;
+        let name = format!("cuda {} (sm_{maj}{min})", ctx.name().unwrap_or_default());
+        Ok(Self { ctx, stream, blas, module, f, name })
+    }
+
+    fn ptr(&self, b: &CuBuf) -> u64 {
+        let (p, _sync) = b.s.device_ptr(&self.stream);
+        p
+    }
+
+    fn opt(&self, b: Option<&CuBuf>) -> u64 {
+        b.map_or(0, |b| self.ptr(b))
+    }
+
+    fn launch(&self, f: &CudaFunction, grid: (u32, u32, u32), block: (u32, u32, u32), args: &[Arg]) {
+        let mut lb = self.stream.launch_builder(f);
+        for a in args {
+            match a {
+                Arg::P(v) => lb.arg(v),
+                Arg::I(v) => lb.arg(v),
+                Arg::L(v) => lb.arg(v),
+                Arg::F(v) => lb.arg(v),
+            };
+        }
+        let cfg = LaunchConfig { grid_dim: grid, block_dim: block, shared_mem_bytes: 0 };
+        // SAFETY: every kernel's parameter list is matched by the `args`
+        // built next to its launch, and every pointer is a live allocation of
+        // at least the extent the kernel indexes (lengths asserted by callers).
+        unsafe { lb.launch(cfg) }.expect("kernel launch");
+    }
+
+    fn elems(n: usize) -> (u32, u32, u32) {
+        ((n.div_ceil(256)) as u32, 1, 1)
+    }
+}
+
+impl Backend for Cuda {
+    type Buf = CuBuf;
+    type Weight = CuWeight;
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn alloc(&self, len: usize) -> CuBuf {
+        CuBuf { s: Arc::new(self.stream.alloc_zeros::<u16>(len.max(1)).expect("cuda alloc")), len, f32: false }
+    }
+
+    fn upload(&self, data: &[f32]) -> CuBuf {
+        let h: Vec<u16> = data.iter().map(|&v| bf16::from_f32(v).to_bits()).collect();
+        let h = if h.is_empty() { vec![0] } else { h };
+        CuBuf { s: Arc::new(self.stream.clone_htod(&h).expect("upload")), len: data.len(), f32: false }
+    }
+
+    fn upload_table(&self, data: &[f32]) -> CuBuf {
+        let h: Vec<u16> = data.iter().flat_map(|v| {
+            let b = v.to_bits();
+            [(b & 0xffff) as u16, (b >> 16) as u16]
+        }).collect();
+        CuBuf { s: Arc::new(self.stream.clone_htod(&h).expect("upload")), len: data.len(), f32: true }
+    }
+
+    fn write(&self, buf: &CuBuf, data: &[f32]) {
+        assert!(!buf.f32 && data.len() <= buf.len);
+        let h: Vec<u16> = data.iter().map(|&v| bf16::from_f32(v).to_bits()).collect();
+        // SAFETY: `h` is a host slice of `data.len()` u16s and the
+        // destination holds at least that many; the copy is ordered on this
+        // stream and `h` is kept alive until the stream is synchronised.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(self.ptr(buf), &h, self.stream.cu_stream()).expect("write");
+        }
+        self.stream.synchronize().expect("sync");
+    }
+
+    fn download(&self, buf: &CuBuf) -> Vec<f32> {
+        let h = self.stream.clone_dtoh(&*buf.s).expect("download");
+        if buf.f32 {
+            h.chunks_exact(2).map(|p| f32::from_bits(p[0] as u32 | (p[1] as u32) << 16)).collect()
+        } else {
+            h[..buf.len].iter().map(|&b| bf16::from_bits(b).to_f32()).collect()
+        }
+    }
+
+    fn buf_len(&self, buf: &CuBuf) -> usize {
+        buf.len
+    }
+
+    fn copy(&self, src: &CuBuf, so: usize, dst: &CuBuf, d: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        assert!(!src.f32 && !dst.f32 && so + len <= src.len && d + len <= dst.len);
+        // SAFETY: both ranges are inside their allocations (asserted above).
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(
+                self.ptr(dst) + (d * 2) as u64,
+                self.ptr(src) + (so * 2) as u64,
+                len * 2,
+                self.stream.cu_stream(),
+            )
+            .expect("dtod");
+        }
+    }
+
+    fn weight(&self, data: &[f32], rows: usize, cols: usize) -> CuWeight {
+        assert_eq!(data.len(), rows * cols);
+        CuWeight { buf: self.upload(data), rows, cols }
+    }
+
+    fn sync(&self) {
+        self.stream.synchronize().expect("sync");
+    }
+
+    fn linear(&self, x: &CuBuf, x_row: usize, rows: usize, w: &CuWeight, bias: Option<&CuBuf>, act: Act, y: &CuBuf, y_row: usize) {
+        let (n, k) = (w.rows, w.cols);
+        assert!((x_row + rows) * k <= x.len && (y_row + rows) * n <= y.len);
+        let (alpha, beta) = (1.0f32, 0.0f32);
+        let yp = self.ptr(y) + (y_row * n * 2) as u64;
+        // Row-major y[m,n] = x[m,k]·W[n,k]ᵀ is column-major yᵀ = W·xᵀ:
+        // A = W (transposed), B = x, C = y, all with leading dims k, k, n.
+        // SAFETY: pointers and extents checked above; alpha/beta outlive the call.
+        unsafe {
+            cudarc::cublas::result::gemm_ex(
+                *self.blas.handle(),
+                blas_sys::cublasOperation_t::CUBLAS_OP_T,
+                blas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                rows as i32,
+                k as i32,
+                (&alpha) as *const f32 as *const _,
+                self.ptr(&w.buf) as *const _,
+                blas_sys::cudaDataType_t::CUDA_R_16BF,
+                k as i32,
+                (self.ptr(x) + (x_row * k * 2) as u64) as *const _,
+                blas_sys::cudaDataType_t::CUDA_R_16BF,
+                k as i32,
+                (&beta) as *const f32 as *const _,
+                yp as *mut _,
+                blas_sys::cudaDataType_t::CUDA_R_16BF,
+                n as i32,
+                blas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                blas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .expect("cublas gemm");
+        }
+        if bias.is_some() || act != Act::None {
+            let total = rows * n;
+            self.launch(&self.f.bias_act, Self::elems(total), (256, 1, 1), &[
+                Arg::P(yp), Arg::P(self.opt(bias)), Arg::L(total as i64), Arg::I(n as i32),
+                Arg::I(bias.is_some() as i32), Arg::I((act == Act::GeluTanh) as i32),
+            ]);
+        }
+    }
+
+    fn layer_norm(&self, x: &CuBuf, rows: usize, dim: usize, norm: NormKind<'_, CuBuf>, mods: &CuBuf, eps: f32, out: &CuBuf) {
+        self.norm_impl(x, None, rows, dim, mods, None, norm, eps, out);
+    }
+
+    fn residual_norm(&self, h: &CuBuf, a: &CuBuf, rows: usize, dim: usize, mods: &CuBuf, gate: Option<usize>, norm: NormKind<'_, CuBuf>, eps: f32, normed: &CuBuf) {
+        self.norm_impl(h, Some(a), rows, dim, mods, gate, norm, eps, normed);
+    }
+
+    fn gate_residual(&self, h: &CuBuf, a: &CuBuf, rows: usize, dim: usize, mods: &CuBuf, gate: usize) {
+        let n = rows * dim;
+        self.launch(&self.f.gate_residual, Self::elems(n), (256, 1, 1), &[
+            Arg::P(self.ptr(h)), Arg::P(self.ptr(a)), Arg::P(self.ptr(mods)), Arg::L(n as i64), Arg::I(dim as i32), Arg::I(gate as i32),
+        ]);
+    }
+
+    fn head_split(&self, src: &CuBuf, rows: usize, stride: usize, col_off: usize, heads: usize, hd: usize, rms_w: Option<&CuBuf>, rope: Option<(&CuBuf, &CuBuf)>, eps: f32, out: &CuBuf) {
+        if let Some((c, s)) = rope {
+            assert!(c.f32 && s.f32, "RoPE tables must come from upload_table");
+        }
+        self.launch(&self.f.head_split, (rows as u32, 1, 1), (256, 1, 1), &[
+            Arg::P(self.ptr(src)), Arg::P(self.opt(rms_w)), Arg::P(self.opt(rope.map(|r| r.0))), Arg::P(self.opt(rope.map(|r| r.1))),
+            Arg::P(self.ptr(out)), Arg::I(rows as i32), Arg::I(stride as i32), Arg::I(col_off as i32), Arg::I(heads as i32),
+            Arg::I(hd as i32), Arg::I(rms_w.is_some() as i32), Arg::I(rope.is_some() as i32), Arg::F(eps),
+        ]);
+    }
+
+    fn attention(&self, q: &CuBuf, k: &CuBuf, v: &CuBuf, heads: usize, sq: usize, sk: usize, d: usize, out: &CuBuf) {
+        assert!(d <= 128);
+        self.launch(&self.f.attention, (sq.div_ceil(64) as u32, heads as u32, 1), (64, 1, 1), &[
+            Arg::P(self.ptr(q)), Arg::P(self.ptr(k)), Arg::P(self.ptr(v)), Arg::P(self.ptr(out)),
+            Arg::I(heads as i32), Arg::I(sq as i32), Arg::I(sk as i32), Arg::I(d as i32), Arg::F(1.0 / (d as f32).sqrt()),
+        ]);
+    }
+
+    fn patchify(&self, latent: &CuBuf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &CuBuf) {
+        self.patch_impl(out, latent, c, t, h, w, p, 0);
+    }
+
+    fn unpatchify(&self, x: &CuBuf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &CuBuf) {
+        self.patch_impl(out, x, c, t, h, w, p, 1);
+    }
+
+    fn dmd_step(&self, x: &CuBuf, v: &CuBuf, noise: Option<&CuBuf>, st: f32, sn: f32, n: usize) {
+        self.launch(&self.f.dmd_step, Self::elems(n), (256, 1, 1), &[
+            Arg::P(self.ptr(x)), Arg::P(self.ptr(v)), Arg::P(self.opt(noise)), Arg::L(n as i64),
+            Arg::I(noise.is_some() as i32), Arg::F(st), Arg::F(sn),
+        ]);
+    }
+
+    fn conv2d(&self, a: &CuBuf, b: Option<&CuBuf>, s: &ConvShape, w: &CuWeight, bias: Option<&CuBuf>, ep: ConvEpilogue<'_, CuBuf>, out: &CuBuf) {
+        assert_eq!((w.rows, w.cols), (s.cout, s.k_len()));
+        let (epc, res) = match ep {
+            ConvEpilogue::None => (0, None),
+            ConvEpilogue::Relu => (1, None),
+            ConvEpilogue::AddRelu(r) => (2, Some(r)),
+        };
+        let (oh, ow) = s.out_hw();
+        let mt = (s.frames * oh * ow).div_ceil(64) as u32;
+        let (gy, gz) = if mt <= 65535 { (mt, 1) } else { let z = mt.div_ceil(65535); (mt.div_ceil(z), z) };
+        self.launch(&self.f.conv2d, (s.cout.div_ceil(64) as u32, gy, gz), (16, 16, 1), &[
+            Arg::P(self.ptr(a)), Arg::P(self.opt(b)), Arg::P(self.ptr(&w.buf)), Arg::P(self.opt(bias)), Arg::P(self.opt(res)),
+            Arg::P(self.ptr(out)), Arg::I(s.frames as i32), Arg::I(s.cin_a as i32), Arg::I(s.cin_b as i32), Arg::I(s.cout as i32),
+            Arg::I(s.h as i32), Arg::I(s.w as i32), Arg::I(if s.upsample { 2 } else { 1 }), Arg::I(s.k as i32),
+            Arg::I(bias.is_some() as i32), Arg::I(epc),
+        ]);
+    }
+
+    fn tanh_clamp(&self, x: &CuBuf, n: usize, s: f32) {
+        self.launch(&self.f.tanh_clamp, Self::elems(n), (256, 1, 1), &[Arg::P(self.ptr(x)), Arg::L(n as i64), Arg::F(s)]);
+    }
+}
+
+impl Cuda {
+    fn norm_impl(&self, h: &CuBuf, a: Option<&CuBuf>, rows: usize, dim: usize, mods: &CuBuf, gate: Option<usize>, norm: NormKind<'_, CuBuf>, eps: f32, out: &CuBuf) {
+        let (affine, scale, shift, w, b) = match norm {
+            NormKind::Affine { w, b } => (1, 0, 0, Some(w), Some(b)),
+            NormKind::Mod { scale, shift } => (0, scale as i32, shift as i32, None, None),
+        };
+        self.launch(&self.f.norm, (rows as u32, 1, 1), (256, 1, 1), &[
+            Arg::P(self.ptr(h)), Arg::P(self.opt(a)), Arg::P(self.ptr(mods)), Arg::P(self.opt(w)), Arg::P(self.opt(b)),
+            Arg::P(self.ptr(out)), Arg::I(rows as i32), Arg::I(dim as i32), Arg::I(a.is_some() as i32),
+            Arg::I(gate.unwrap_or(0) as i32), Arg::I(gate.is_some() as i32), Arg::I(affine), Arg::I(scale), Arg::I(shift), Arg::F(eps),
+        ]);
+    }
+
+    fn patch_impl(&self, dst: &CuBuf, src: &CuBuf, c: usize, t: usize, h: usize, w: usize, p: usize, dir: i32) {
+        let n = c * t * h * w;
+        self.launch(&self.f.patch, Self::elems(n), (256, 1, 1), &[
+            Arg::P(self.ptr(dst)), Arg::P(self.ptr(src)), Arg::L(n as i64), Arg::I(c as i32), Arg::I(t as i32),
+            Arg::I(h as i32), Arg::I(w as i32), Arg::I(p as i32), Arg::I(dir),
+        ]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Needs libnvrtc only (no GPU): `pip install nvidia-cuda-nvrtc-cu12` and
+    /// point `LD_LIBRARY_PATH` at it. Skipped when NVRTC cannot be loaded.
+    #[test]
+    fn kernels_compile_for_ampere_ada_and_blackwell() {
+        for arch in ["compute_80", "compute_89", "compute_120"] {
+            match std::panic::catch_unwind(|| super::compile_kernels(arch)) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("{arch}: {e}"),
+                Err(_) => {
+                    eprintln!("skipping: libnvrtc not loadable");
+                    return;
+                }
+            }
+        }
+    }
+}
