@@ -1,3 +1,4 @@
 /target
 *.y4m
 /web/dist
+/web/site

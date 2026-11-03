@@ -14,7 +14,8 @@
 //! ```
 //!
 //! It binds 127.0.0.1 by default and sends no CORS headers, so other web
-//! pages cannot queue jobs on your GPU.
+//! pages cannot queue jobs on your GPU. `--allow-origin <url>` opens the API
+//! to exactly one origin (the hosted demo page) and to nothing else.
 
 use anyhow::{Context, Result, anyhow};
 use fastwan_core::{
@@ -56,6 +57,10 @@ pub struct Settings {
     pub max_pixels: usize,
     pub max_frames: usize,
     pub tae_chunk: usize,
+    /// One web origin (e.g. `https://fastwan.pages.dev`) allowed to call the
+    /// API from the browser: CORS plus Chrome's private-network preflight,
+    /// for that origin only. `None` = same-origin only (the default).
+    pub allow_origin: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -325,13 +330,49 @@ pub fn engine<B: Backend>(
     Ok(())
 }
 
-fn respond_json(req: tiny_http::Request, code: u16, v: &Value) {
-    let h = tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap();
-    let _ = req.respond(
-        tiny_http::Response::from_string(v.to_string())
-            .with_status_code(code)
-            .with_header(h),
-    );
+fn hdr(k: &str, v: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(k, v).expect("valid header")
+}
+
+/// Send with the CORS headers for an allowed origin, if this request has one.
+fn send<R: std::io::Read>(
+    req: tiny_http::Request,
+    resp: tiny_http::Response<R>,
+    cors: &[tiny_http::Header],
+) {
+    let mut resp = resp;
+    for h in cors {
+        resp = resp.with_header(h.clone());
+    }
+    let _ = req.respond(resp);
+}
+
+fn respond_json(req: tiny_http::Request, code: u16, v: &Value, cors: &[tiny_http::Header]) {
+    let r = tiny_http::Response::from_string(v.to_string())
+        .with_status_code(code)
+        .with_header(hdr("Content-Type", "application/json"));
+    send(req, r, cors);
+}
+
+/// CORS headers when the request's `Origin` is the one allowed origin.
+fn cors_for(req: &tiny_http::Request, allow: Option<&str>) -> Vec<tiny_http::Header> {
+    let origin = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str().to_string());
+    match (origin, allow) {
+        (Some(o), Some(a)) if o.trim_end_matches('/') == a.trim_end_matches('/') => vec![
+            hdr("Access-Control-Allow-Origin", &o),
+            hdr("Vary", "Origin"),
+            hdr("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+            hdr("Access-Control-Allow-Headers", "Content-Type"),
+            // Chrome's Private Network Access: a public https page calling 127.0.0.1.
+            hdr("Access-Control-Allow-Private-Network", "true"),
+            hdr("Access-Control-Max-Age", "600"),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn parse_request(body: &str, s: &Settings) -> Result<(String, Geometry, u64), String> {
@@ -409,20 +450,55 @@ pub fn serve(
         let url = req.url().to_string();
         let (path, query) = url.split_once('?').unwrap_or((&url, ""));
         let method = req.method().clone();
+        let cors = cors_for(&req, s.allow_origin.as_deref());
         match (method, path) {
+            (tiny_http::Method::Options, _) => {
+                let code = if cors.is_empty() { 403 } else { 204 };
+                send(req, tiny_http::Response::empty(code), &cors);
+            }
             (tiny_http::Method::Get, "/") | (tiny_http::Method::Get, "/index.html") => {
                 let h = tiny_http::Header::from_bytes("Content-Type", "text/html; charset=utf-8")
                     .unwrap();
-                let _ = req.respond(tiny_http::Response::from_string(PAGE).with_header(h));
+                send(
+                    req,
+                    tiny_http::Response::from_string(PAGE).with_header(h),
+                    &cors,
+                );
             }
             (tiny_http::Method::Get, "/api/info") => {
                 let mut info = shared.info.lock().unwrap().clone();
                 let jobs = shared.jobs.lock().unwrap();
                 info["queued"] = json!(jobs.iter().filter(|j| j.stage == Stage::Queued).count());
                 drop(jobs);
-                respond_json(req, 200, &info);
+                respond_json(req, 200, &info, &cors);
             }
             (tiny_http::Method::Post, "/api/generate") => {
+                // CSRF guard: a cross-site form or `text/plain` fetch skips the
+                // CORS preflight, so check the origin and content type here.
+                let header = |k: &str| {
+                    req.headers()
+                        .iter()
+                        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(k))
+                        .map(|h| h.value.as_str().to_string())
+                };
+                let json_body =
+                    header("Content-Type").is_some_and(|c| c.starts_with("application/json"));
+                let origin_ok = match header("Origin") {
+                    None => true,
+                    Some(o) => {
+                        !cors.is_empty()
+                            || header("Host").is_some_and(|h| o == format!("http://{h}"))
+                    }
+                };
+                if !json_body || !origin_ok {
+                    respond_json(
+                        req,
+                        403,
+                        &json!({"error": "Requests must be JSON and come from this engine's page or its --allow-origin site."}),
+                        &cors,
+                    );
+                    continue;
+                }
                 let mut body = String::new();
                 if req
                     .as_reader()
@@ -430,7 +506,7 @@ pub fn serve(
                     .read_to_string(&mut body)
                     .is_err()
                 {
-                    respond_json(req, 400, &json!({"error": "unreadable body"}));
+                    respond_json(req, 400, &json!({"error": "unreadable body"}), &cors);
                     continue;
                 }
                 let info = shared.info.lock().unwrap().clone();
@@ -441,11 +517,11 @@ pub fn serve(
                         .unwrap_or_else(|| {
                             "The engine is still loading the model. Try again in a moment.".into()
                         });
-                    respond_json(req, 503, &json!({"error": msg}));
+                    respond_json(req, 503, &json!({"error": msg}), &cors);
                     continue;
                 }
                 match parse_request(&body, &s) {
-                    Err(e) => respond_json(req, 400, &json!({"error": e})),
+                    Err(e) => respond_json(req, 400, &json!({"error": e}), &cors),
                     Ok((prompt, geometry, seed)) => {
                         let mut jobs = shared.jobs.lock().unwrap();
                         if jobs
@@ -459,6 +535,7 @@ pub fn serve(
                                 req,
                                 429,
                                 &json!({"error": "Three clips are already waiting. Try again when one finishes."}),
+                                &cors,
                             );
                             continue;
                         }
@@ -501,7 +578,7 @@ pub fn serve(
                         }
                         drop(jobs);
                         let _ = tx.send(id);
-                        respond_json(req, 200, &json!({"id": id, "seed": seed}));
+                        respond_json(req, 200, &json!({"id": id, "seed": seed}), &cors);
                     }
                 }
             }
@@ -512,7 +589,7 @@ pub fn serve(
                     None => (rest, false),
                 };
                 let Ok(id) = id_s.parse::<u64>() else {
-                    respond_json(req, 404, &json!({"error": "no such job"}));
+                    respond_json(req, 404, &json!({"error": "no such job"}), &cors);
                     continue;
                 };
                 if frames {
@@ -539,18 +616,18 @@ pub fn serve(
                                 "application/octet-stream",
                             )
                             .unwrap();
-                            let _ = req.respond(tiny_http::Response::from_data(b).with_header(h));
+                            send(req, tiny_http::Response::from_data(b).with_header(h), &cors);
                         }
-                        None => respond_json(req, 404, &json!({"error": "no such job"})),
+                        None => respond_json(req, 404, &json!({"error": "no such job"}), &cors),
                     }
                 } else {
                     match shared.with(id, |j| j.status()) {
-                        Some(v) => respond_json(req, 200, &v),
-                        None => respond_json(req, 404, &json!({"error": "no such job"})),
+                        Some(v) => respond_json(req, 200, &v, &cors),
+                        None => respond_json(req, 404, &json!({"error": "no such job"}), &cors),
                     }
                 }
             }
-            _ => respond_json(req, 404, &json!({"error": "not found"})),
+            _ => respond_json(req, 404, &json!({"error": "not found"}), &cors),
         }
     }
     Ok(())

@@ -55,6 +55,8 @@ button.ghost { background: transparent; color: var(--accent); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 button:focus-visible, .chip:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 .hint { color: var(--muted); font-size: 0.82rem; margin: 0; }
+.connect { display: grid; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid var(--rule); }
+.cmd { font: 0.8rem/1.5 var(--f-mono); background: var(--bg); border: 1px solid var(--rule); border-radius: 4px; padding: 8px 10px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg { font: 0.88rem/1.45 var(--f-mono); padding: 10px 12px; border-radius: 4px; white-space: pre-wrap; margin: 0; }
 .msg.bad { background: var(--bad-soft); color: var(--bad); }
 .msg.note { background: var(--accent-soft); color: var(--ink); font-family: var(--f-body); }
@@ -92,6 +94,16 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
 
   <div class="grid">
     <form class="panel" id="form" autocomplete="off">
+      <div class="connect" id="connect" hidden>
+        <h2>Connect your engine</h2>
+        <p class="hint">This page runs the model on your own GPU through the <code>fastwan</code> engine. Start it on this computer, allowing this site:</p>
+        <pre class="cmd" id="start-cmd"></pre>
+        <div class="row">
+          <label class="field"><span class="label">Engine address</span><input id="engine-url" type="url"></label>
+          <button type="button" class="ghost" id="engine-go" style="flex:0 0 auto">Connect</button>
+        </div>
+        <p class="hint">Chrome and Edge may ask to let this site reach devices on your local network: allow it. Safari blocks pages on https from reaching 127.0.0.1, so use Chrome, Edge or Firefox.</p>
+      </div>
       <h2>Prompt</h2>
       <label class="field"><span class="label">Describe the clip</span>
         <textarea id="prompt" maxlength="2000">A red fox trots through fresh snow in a birch forest at dawn, its breath steaming, low golden sunlight, shallow depth of field.</textarea></label>
@@ -105,7 +117,7 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
         <button type="button" class="ghost" id="dice" style="flex:0 0 auto">New seed</button>
       </div>
       <button type="submit" class="primary" id="go" disabled>Generate clip</button>
-      <p class="hint">3 denoising steps, 16 fps. Ctrl/⌘ + Enter generates. Clips stay on this machine: the engine runs on your GPU at 127.0.0.1.</p>
+      <p class="hint">3 denoising steps, 16 fps. Ctrl/⌘ + Enter generates. Clips stay on your machine: the engine runs on your GPU, and this page only talks to it.</p>
       <p class="msg bad" id="err" hidden></p>
       <p class="msg note" id="synthetic" hidden>The engine is running the tiny synthetic model (<code>--synthetic</code>), so clips are coloured noise. Start it with <code>--model-dir</code> for real video.</p>
     </form>
@@ -138,6 +150,13 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
 <script>
 const $ = (id) => document.getElementById(id);
 const FPS = 16;
+// Served by the engine itself → same origin. Hosted (Cloudflare Pages) → the
+// engine on this machine, which must be started with --allow-origin <this site>.
+const SAME = location.protocol === "http:" && ["127.0.0.1", "localhost"].includes(location.hostname);
+let ENGINE = SAME ? "" : (store("fastwan.engine") || "http://127.0.0.1:7860");
+const api = (path) => ENGINE + path;
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { return null; } }
+const START = `fastwan serve --model-dir fastwan --allow-origin ${location.origin}`;
 const EXAMPLES = [
   ["Fox in snow", "A red fox trots through fresh snow in a birch forest at dawn, its breath steaming, low golden sunlight, shallow depth of field."],
   ["Night market", "A crowded night market in the rain, neon signs reflected in puddles, steam rising from food stalls, handheld camera moving through the crowd."],
@@ -154,17 +173,22 @@ let frame = 0, playing = true, lastTick = 0, recording = false;
 const ctx = $("canvas").getContext("2d");
 
 // ---- engine status ------------------------------------------------------------
+let infoTimer = 0;
+function schedule(ms) { clearTimeout(infoTimer); infoTimer = setTimeout(refreshInfo, ms); }
 async function refreshInfo() {
+  clearTimeout(infoTimer);
   try {
-    const r = await fetch("/api/info", { cache: "no-store" });
+    const r = await fetch(api("/api/info"), { cache: "no-store" });
     info = await r.json();
   } catch {
-    setEngine("bad", "Can't reach the engine. Start it with: fastwan serve --model-dir <FastWan2.1-T2V-1.3B-Diffusers>");
-    $("go").disabled = true; setTimeout(refreshInfo, 3000); return;
+    setEngine("bad", SAME ? "Can't reach the engine. Restart fastwan serve." : `No engine at ${ENGINE}. Start one on this machine (see below).`);
+    if (!SAME) $("connect").hidden = false;
+    $("go").disabled = true; schedule(3000); return;
   }
   if (info.error) { setEngine("bad", "Engine failed to start: " + info.error); $("go").disabled = true; return; }
-  if (!info.ready) { setEngine("wait", "Loading the model…"); $("go").disabled = true; setTimeout(refreshInfo, 1500); return; }
+  if (!info.ready) { setEngine("wait", "Loading the model…"); $("go").disabled = true; schedule(1500); return; }
   setEngine("ok", `${info.model} · ${info.backend}`);
+  if (!SAME) $("connect").hidden = true;
   $("synthetic").hidden = !info.synthetic;
   fillOptions();
   $("go").disabled = !!job;
@@ -216,7 +240,7 @@ async function generate(e) {
   if ($("seed").value !== "") body.seed = Math.max(0, Math.floor(+$("seed").value));
   $("go").disabled = true; $("go").textContent = "Generating…";
   try {
-    const r = await fetch("/api/generate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const r = await fetch(api("/api/generate"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const v = await r.json();
     if (!r.ok) throw new Error(v.error || `The engine answered ${r.status}.`);
     job = { id: v.id, prompt: body.prompt, seed: v.seed };
@@ -242,7 +266,7 @@ function startClip(id, w, h, total) {
 }
 
 async function fetchFrames(id) {
-  const r = await fetch(`/api/jobs/${id}/frames?from=${clip.frames.length}`, { cache: "no-store" });
+  const r = await fetch(api(`/api/jobs/${id}/frames?from=${clip.frames.length}`), { cache: "no-store" });
   if (!r.ok) return;
   const buf = await r.arrayBuffer();
   const head = new Uint32Array(buf, 0, 4);
@@ -262,7 +286,7 @@ async function fetchFrames(id) {
 async function pollJob() {
   if (!job) return;
   let s;
-  try { s = await (await fetch(`/api/jobs/${job.id}`, { cache: "no-store" })).json(); }
+  try { s = await (await fetch(api(`/api/jobs/${job.id}`), { cache: "no-store" })).json(); }
   catch { poll = setTimeout(pollJob, 1000); return; }
   if (s.error && s.stage !== "failed") { showError(s.error); resetButton(); return; }
   renderStages(s);
@@ -346,7 +370,7 @@ function addHistory(s) {
 }
 async function reopen(s) {
   if (job) return;
-  const r = await fetch(`/api/jobs/${s.id}`, { cache: "no-store" });
+  const r = await fetch(api(`/api/jobs/${s.id}`), { cache: "no-store" });
   if (!r.ok) { showError("The engine no longer holds that clip (it keeps the last eight)."); return; }
   const cur = await r.json();
   startClip(s.id, cur.width, cur.height, cur.frames);
@@ -361,6 +385,9 @@ $("examples").onclick = (e) => { const i = e.target.dataset?.i; if (i != null) {
 $("dice").onclick = () => { $("seed").value = Math.floor(Math.random() * 1e9); };
 $("form").addEventListener("submit", generate);
 $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) generate(e); });
+$("start-cmd").textContent = START;
+$("engine-url").value = ENGINE || location.origin;
+$("engine-go").onclick = () => { ENGINE = $("engine-url").value.replace(/\/+$/, ""); store("fastwan.engine", ENGINE); setEngine("wait", "Connecting…"); refreshInfo(); };
 renderStages(null);
 refreshInfo();
 requestAnimationFrame(tick);

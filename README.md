@@ -49,6 +49,21 @@ three steps and the decode land, with frames playing as they arrive. Save as
 WebM or PNG from the page. `--synthetic` runs a tiny random model, for trying
 the engine and page without downloading anything (the clips are noise).
 
+### Hosted pages
+
+<https://fastwan.pages.dev> (Cloudflare Pages; `scripts/deploy-pages.sh`)
+serves the same studio plus the WebGPU bench. The hosted studio drives the
+engine on the visitor's own machine, so start it with that site allowed:
+
+```bash
+./target/release/fastwan serve --model-dir fastwan --allow-origin https://fastwan.pages.dev
+```
+
+`--allow-origin` answers CORS and Chrome's private-network preflight for that
+one origin only. Generation requests must be JSON and come from the engine's
+own page or that origin, so another website cannot queue clips on your GPU.
+Safari blocks https pages from calling 127.0.0.1; use Chrome, Edge or Firefox.
+
 ### One clip from the command line
 
 Prompt embeddings come from `scripts/encode_prompt.py`:

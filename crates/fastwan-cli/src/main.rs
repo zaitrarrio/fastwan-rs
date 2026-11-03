@@ -116,6 +116,10 @@ enum Cmd {
         max_frames: usize,
         #[arg(long, default_value_t = 2)]
         tae_chunk: usize,
+        /// Let one web origin call this engine from the browser, e.g.
+        /// https://fastwan.pages.dev for the hosted demo page.
+        #[arg(long)]
+        allow_origin: Option<String>,
     },
     /// Generate a clip from precomputed UMT5 prompt embeddings.
     Generate {
@@ -228,6 +232,7 @@ fn main() -> Result<()> {
             max_pixels,
             max_frames,
             tae_chunk,
+            allow_origin,
         } => {
             let weights = if synthetic {
                 serve::Weights::Synthetic
@@ -246,6 +251,7 @@ fn main() -> Result<()> {
                 max_pixels,
                 max_frames,
                 tae_chunk,
+                allow_origin,
             };
             serve::serve(settings, move |s, shared, rx| {
                 with_backend!(backend, |be| serve::engine(be, s, shared, rx))

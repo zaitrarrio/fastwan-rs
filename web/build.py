@@ -19,3 +19,15 @@ page = (root / "test-page.template.html").read_text().replace("/*SHADERS*/{}", j
     '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
     '</head>\n<body>\n' + page + '\n</body>\n</html>\n')
 print("wrote", root / "fastwan-webgpu-bench.html")
+
+# Static site for Cloudflare Pages: web/site/{index, bench/, demo/}.
+import shutil
+site = root / "site"
+shutil.rmtree(site, ignore_errors=True)
+(site / "bench").mkdir(parents=True)
+(site / "demo").mkdir()
+shutil.copy(root / "landing.html", site / "index.html")
+shutil.copy(root / "fastwan-webgpu-bench.html", site / "bench/index.html")
+shutil.copy(root / "demo.html", site / "demo/index.html")
+(site / "_headers").write_text("/*\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: strict-origin-when-cross-origin\n")
+print("wrote", site)
