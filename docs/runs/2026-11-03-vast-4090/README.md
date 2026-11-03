@@ -35,9 +35,21 @@ Clips: `fox-832x480.mp4`, `market-832x480.mp4`, `fox-480x272.mp4` (x264 crf 18).
 Both 480p clips are coherent and on-prompt. The market prompt's "handheld
 camera" was rendered as a camera in someone's hand.
 
-For scale, fastvideo-rs's gold run of the same checkpoint (RTX PRO 6000
-Blackwell, VSA on, `lab/gold/fastwan21-1.3b.toml`) denoises in 1.92 s. Dense
-attention on a 4090 at 8.7 s is in that neighbourhood.
+Comparison with fastvideo-rs (same checkpoint, same 3 DMD steps, both bf16;
+its numbers from `docs/ports/wan.md`, RTX PRO 6000 Blackwell):
+
+| | GPU | attention | denoise | per step |
+|---|---|---|---|---|
+| fastvideo-rs default | RTX PRO 6000 | VSA 0.8 (sparse) | 1.96 s | 0.65 s |
+| fastvideo-rs dense | RTX PRO 6000 | dense | 2.64 s | 0.88 s |
+| fastwan-rs | RTX 4090 | dense | 8.74 s | 2.91 s |
+
+Not like-for-like: different GPUs, and fastvideo-rs's default runs VSA (its
+own dense arm is 1.35x slower). Ours sustains ~98 TFLOP/s (≈283 TFLOP per
+forward); theirs, dense, ~320 TFLOP/s on the larger card. How much of the 3.3x
+is hardware and how much is kernels (tuned flash_mma_fwd2 / cuDNN attention,
+fused bf16 DiT kernels vs our first-pass mma attention and unfused bias/GELU)
+is unmeasured: it needs both on one GPU and a per-op profile.
 
 ## What it says
 
