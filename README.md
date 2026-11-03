@@ -16,6 +16,10 @@ model and written for consumer hardware instead of a datacenter.
 | `cuda` | NVIDIA sm_80+ | bf16, cuBLAS GEMMs, tensor-core attention + VSA | conformance passes on an RTX 4090; **832×480×81 clip in 6.9 s** (1.35 s per DMD step with VSA + TAEHV) |
 | `cpu` | anywhere | f32 | the reference every backend is checked against |
 
+**VRAM** (measured on an RTX 4090, `docs/runs/2026-11-03-vast-4090-vram`):
+CUDA 5.0 GB peak for 832×480×81 (3.6 GB at 480×272×33); WebGPU 7.2 GB
+(4.4 GB). The text encoder runs on the CPU (11–22 GB of RAM).
+
 `--backend auto` picks CUDA when it is built in and a device answers, and
 WebGPU otherwise.
 
