@@ -387,8 +387,12 @@ fn main() -> Result<()> {
 fn check<B: Backend>(be: &B, kind: BackendKind) -> Result<()> {
     println!("{}", be.name());
     // bf16 activations on CUDA: ~3 significant digits per op.
+    // f16 math on WebGPU: ~3 significant digits in the 16-term partial sums.
+    let wgpu_f16 = kind == BackendKind::Wgpu && be.name().ends_with("+f16");
     let tol = if kind == BackendKind::Cuda {
         3e-2
+    } else if wgpu_f16 {
+        1e-2
     } else {
         2e-3
     };

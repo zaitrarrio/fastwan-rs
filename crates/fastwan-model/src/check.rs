@@ -79,6 +79,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         (65, 256, 64, Act::None),
         (300, 96, 260, Act::GeluTanh),
         (129, 1536, 130, Act::None),
+        (1100, 1536, 200, Act::GeluTanh),
     ] {
         let x = rng.normal((m + 3) * k);
         let w = rng.uniform(n * k, 0.2);

@@ -20,6 +20,11 @@ const COMMON: &str = include_str!("shaders/common.wgsl");
 const LINEAR: &str = include_str!("shaders/linear.wgsl");
 const LINEAR2: &str = include_str!("shaders/linear2.wgsl");
 const LINEAR3: &str = include_str!("shaders/linear3.wgsl");
+const LINEAR3H: &str = include_str!("shaders/linear3h.wgsl");
+const FLASH_H: &str = include_str!("shaders/flash_h.wgsl");
+/// Token-sized GEMMs only take the f16 path: the 512-row text projections
+/// carry encoder activations that can exceed f16's ±65504.
+const F16_MIN_ROWS: usize = 1024;
 const CONV: &str = include_str!("shaders/conv.wgsl");
 const ATTN: &str = include_str!("shaders/attention.wgsl");
 const NORM: &str = include_str!("shaders/norm.wgsl");
@@ -66,6 +71,22 @@ struct Prof {
     period_ns: f64,
 }
 
+/// Construction options; [`WgpuOptions::from_env`] reads them from the environment.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WgpuOptions {
+    /// Use the f16 math kernels where the adapter has `shader-f16`
+    /// (`FASTWAN_WGPU_F16=1`).
+    pub f16: bool,
+}
+
+impl WgpuOptions {
+    pub fn from_env() -> Self {
+        Self {
+            f16: std::env::var("FASTWAN_WGPU_F16").is_ok_and(|v| v == "1"),
+        }
+    }
+}
+
 pub struct GWeight {
     buf: GBuf,
     rows: usize,
@@ -85,6 +106,8 @@ pub struct Wgpu {
     attn_bk: usize,
     /// The register-tiled flash kernel fits this adapter's shared memory.
     flash_ok: bool,
+    /// f16 math kernels (adapter has `shader-f16` and f16 mode is on).
+    f16: bool,
     pipelines: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
     /// Pipeline name by address, for the profiler.
     names: Mutex<HashMap<usize, String>>,
@@ -112,6 +135,10 @@ impl Wgpu {
     /// requested (the WebGPU defaults cap a binding at 128 MiB; the DiT's
     /// fused QKV buffer at 480p is ~600 MiB in f32).
     pub async fn new_async() -> Result<Self, InitError> {
+        Self::with_options_async(WgpuOptions::from_env()).await
+    }
+
+    pub async fn with_options_async(opts: WgpuOptions) -> Result<Self, InitError> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = instance
@@ -126,14 +153,18 @@ impl Wgpu {
         let limits = adapter.limits();
         let profile = std::env::var("FASTWAN_PROFILE").is_ok_and(|v| v == "1")
             && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let f16 = opts.f16 && adapter.features().contains(wgpu::Features::SHADER_F16);
+        let mut features = wgpu::Features::empty();
+        if profile {
+            features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        if f16 {
+            features |= wgpu::Features::SHADER_F16;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("fastwan"),
-                required_features: if profile {
-                    wgpu::Features::TIMESTAMP_QUERY
-                } else {
-                    wgpu::Features::empty()
-                },
+                required_features: features,
                 required_limits: limits.clone(),
                 ..Default::default()
             })
@@ -173,6 +204,7 @@ impl Wgpu {
             queue,
             attn_bk,
             flash_ok,
+            f16,
             pipelines: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             tag: Mutex::new(None),
@@ -186,6 +218,16 @@ impl Wgpu {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self, InitError> {
         pollster::block_on(Self::new_async())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_options(opts: WgpuOptions) -> Result<Self, InitError> {
+        pollster::block_on(Self::with_options_async(opts))
+    }
+
+    /// Whether the f16 math kernels are in use.
+    pub fn f16(&self) -> bool {
+        self.f16
     }
 
     /// A CPU rasterizer (llvmpipe / lavapipe / SwiftShader / WARP). Fine for
@@ -208,7 +250,13 @@ impl Wgpu {
         if let Some(p) = map.get(key) {
             return p.clone();
         }
-        let code = format!("{COMMON}\n{}", src());
+        // `enable f16;` must open the module, before the shared helpers.
+        let body = src();
+        let code = if body.contains("vec4<f16>") {
+            format!("enable f16;\n{COMMON}\n{body}")
+        } else {
+            format!("{COMMON}\n{body}")
+        };
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -534,7 +582,11 @@ impl Wgpu {
         scale: f32,
         vsa: Option<(&GVsa, &GBuf)>,
     ) {
-        let pipe = self.pipeline("flash", || FLASH.to_string());
+        let pipe = if self.f16 {
+            self.pipeline("flash_h", || FLASH_H.to_string())
+        } else {
+            self.pipeline("flash", || FLASH.to_string())
+        };
         let (nb, topk) = vsa.map_or((0, 0), |(s, _)| (s.nb, s.topk));
         let p = [
             heads as u32,
@@ -567,8 +619,16 @@ impl Backend for Wgpu {
 
     fn name(&self) -> String {
         format!(
-            "wgpu {:?}: {} ({})",
-            self.info.backend, self.info.name, self.info.driver
+            "wgpu {:?}: {} ({}{}){}",
+            self.info.backend,
+            self.info.name,
+            self.info.driver,
+            if self.info.driver_info.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", self.info.driver_info)
+            },
+            if self.f16 { " +f16" } else { "" }
         )
     }
 
@@ -767,8 +827,13 @@ impl Backend for Wgpu {
             1 => (LINEAR, 64, "linear"),
             _ => (LINEAR3, 64, "linear3"),
         };
-        let key = format!("{name}_{}", if f16 { "f16" } else { "f32" });
-        let pipe = self.pipeline(&key, || Self::weight_src(src, f16));
+        let half = self.f16 && f16 && variant == 3 && rows >= F16_MIN_ROWS;
+        let pipe = if half {
+            self.pipeline("linear3h", || LINEAR3H.to_string())
+        } else {
+            let key = format!("{name}_{}", if f16 { "f16" } else { "f32" });
+            self.pipeline(&key, || Self::weight_src(src, f16))
+        };
         let p = [
             rows as u32,
             w.rows as u32,
