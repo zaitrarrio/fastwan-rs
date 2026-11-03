@@ -45,7 +45,7 @@ pub struct Q8 {
 impl Q8 {
     pub fn quantize(data: &[f32], rows: usize, cols: usize) -> Self {
         assert_eq!(data.len(), rows * cols);
-        let group = if cols % Q8_GROUP == 0 { Q8_GROUP } else { cols };
+        let group = if cols.is_multiple_of(Q8_GROUP) { Q8_GROUP } else { cols };
         let mut q = vec![0i8; data.len()];
         let mut scales = Vec::with_capacity(data.len() / group);
         for (src, dst) in data.chunks(group).zip(q.chunks_mut(group)) {
