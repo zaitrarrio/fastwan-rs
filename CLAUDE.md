@@ -31,6 +31,12 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (PSNR 43.8 dB vs f32 on a real clip) but 8.5% slower on an RTX 4090, where
   f16 runs at the f32 rate (`docs/runs/2026-11-03-vast-4090-f16`). Unmeasured
   on AMD / Intel / Apple, where it should pay; measure before defaulting it on.
+- `--weights int8` (`fastwan_core::quant::Q8`: symmetric int8, one f32 scale
+  per 128 input columns) applies to the block linears only. The CPU backend
+  dequantizes and is the reference the kernels are checked against. On an RTX
+  4090 it cuts peak VRAM by 1.3 GB (CUDA) / 1.5 GB (WebGPU) at equal speed,
+  and moves the clip less than switching backends does: 34.6 dB vs a 33.5 dB
+  bf16-vs-f32 baseline (`docs/runs/2026-11-03-vast-4090-int8`). Off by default.
 - WGSL: zero loop-local accumulators explicitly. Dawn (Chrome) on SwiftShader
   carried a `var` declared in a loop body across iterations, which broke
   multi-chunk flash attention while naga/wgpu passed. Run the bench page in

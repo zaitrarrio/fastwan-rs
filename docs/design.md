@@ -111,6 +111,26 @@ self-attention. That drives the next steps:
   full VAE at 2.91 s vs TAEHV 0.26 s on an RTX PRO 6000, with lower quality
   for TAEHV.
 
+## Weight quantization
+
+`--weights int8` stores the block linears (97% of the DiT) as symmetric int8
+with an f32 scale per 128 input columns. It is weight-only: activations keep
+the backend's precision, and every backend computes `Σ x·(q·s)` with `q·s`
+formed in f32, so the CPU's dequantized weights are an exact reference. WebGPU
+unpacks codes inside the GEMM's tile load; CUDA expands one weight at a time
+into a bf16 scratch and keeps cuBLAS. Measured on a 4090: −1.3 / −1.5 GB of
+VRAM, no speed change (the GEMMs are compute bound at 32k tokens), and a
+smaller output change than the bf16-vs-f32 backend gap.
+
+Pruna was considered and not adopted: it transforms PyTorch modules at run
+time, its distillers cover text-to-image and text-to-text only, and its
+step caches (FasterCache, PAB) target 30–50-step samplers, not 3 DMD steps.
+Its HQQ quantizer remains the candidate for an offline int4 export if int8
+is not small enough.
+
+Next: an int8 safetensors export so the download shrinks too (the weights
+are quantized at load today, which also adds ~5–7 s to it).
+
 ## The demo engine (`fastwan serve`)
 
 One engine thread owns the backend and the resident models and runs jobs one

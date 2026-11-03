@@ -23,6 +23,10 @@ CUDA 5.0 GB peak for 832×480×81 (3.6 GB at 480×272×33); WebGPU 7.2 GB
 On AMD, Intel or Apple GPUs try `FASTWAN_WGPU_F16=1` (f16 math kernels:
 same output to 43.8 dB PSNR; no gain on NVIDIA GeForce, unmeasured elsewhere).
 
+Short on VRAM? `--weights int8` (on `generate`, `bench` and `serve`) stores
+the DiT's block weights as int8: peak 3.7 GB on CUDA / 5.6 GB on WebGPU for
+832×480×81, same speed, output within the gap between the two backends.
+
 `--backend auto` picks CUDA when it is built in and a device answers, and
 WebGPU otherwise.
 
