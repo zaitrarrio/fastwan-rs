@@ -128,13 +128,17 @@ step caches (FasterCache, PAB) target 30–50-step samplers, not 3 DMD steps.
 Its HQQ quantizer remains the candidate for an offline int4 export if int8
 is not small enough.
 
-4-bit was evaluated (HQQ ported, groups 32–128, FFN-only): weight SNR
-20–22.5 dB vs int8's 43.6, and every variant changes the sample a seed
-produces, without visible artifacts. It saves only ~0.4–0.7 GB beyond int8,
-so no int4 kernels were written (`docs/runs/2026-11-03-vast-4090-int4`).
+4-bit (HQQ ported, groups 32–128, FFN-only) gives weight SNR 20–22.5 dB vs
+int8's 43.6, and every variant changes the sample a seed produces, without
+visible artifacts (`docs/runs/2026-11-03-vast-4090-int4`). It is kept for the
+browser download: `fastwan quantize` writes one safetensors file with packed
+codes plus f16 scales / zeros (format in `export.rs`), loaded as is by every
+backend (real int4 GEMMs: WebGPU unpacks nibbles in the tile load, CUDA
+dequantizes into the bf16 scratch). int4-hqq-g64-ffn is 1.18 GB; measured in
+`docs/runs/2026-11-03-vast-4090-q4-store`.
 
-Next: an int8 safetensors export so the download shrinks too (the weights
-are quantized at load today, which also adds ~5–7 s to it).
+Next for the browser: a wasm build that reads this file, and a text-encoder
+plan (UMT5-XXL is 11 GB).
 
 ## The demo engine (`fastwan serve`)
 

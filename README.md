@@ -27,6 +27,12 @@ Short on VRAM? `--weights int8` (on `generate`, `bench` and `serve`) stores
 the DiT's block weights as int8: peak 3.7 GB on CUDA / 5.6 GB on WebGPU for
 832×480×81, same speed, output within the gap between the two backends.
 
+Smaller download: `fastwan quantize --transformer <dir>/transformer --weights
+int4-hqq-g64-ffn --out fastwan-int4.safetensors` writes a 1.18 GB checkpoint
+(0.88 GB with `int4-hqq-g64`) that `--transformer` loads directly. 4-bit
+gives a different sample per seed rather than a worse one; peak VRAM 3.4 GB
+(CUDA) / 5.4 GB (WebGPU).
+
 `--backend auto` picks CUDA when it is built in and a device answers, and
 WebGPU otherwise.
 

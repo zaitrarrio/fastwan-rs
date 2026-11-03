@@ -37,12 +37,16 @@ State and invariants only; the reasoning is in `docs/design.md`.
   4090 it cuts peak VRAM by 1.3 GB (CUDA) / 1.5 GB (WebGPU) at equal speed,
   and moves the clip less than switching backends does: 34.6 dB vs a 33.5 dB
   bf16-vs-f32 baseline (`docs/runs/2026-11-03-vast-4090-int8`). Off by default.
-- 4-bit (`--weights int4-sim[-hqq][-gN][-ffn]`, `quant::Q4`) is simulated
-  (dequantized at load, no memory saving) and evaluation-only: every variant
-  changes the sample for a seed (fox 19.7–23.1 dB, market 17.4–18.7 vs int8's
-  34.6 / 27.1) without visible artifacts, for ~0.4–0.7 GB more saving
-  (`docs/runs/2026-11-03-vast-4090-int4`). No int4 kernels unless download
-  size becomes the goal.
+- 4-bit (`--weights int4[-hqq][-gN][-ffn]`, `quant::Q4`): real kernels on all
+  three backends. Every variant changes the sample for a seed (fox 21–23 dB vs
+  int8's 34.6) without visible artifacts. Quantized checkpoints
+  (`fastwan quantize`, format in `export.rs`, stored in R2 under
+  `fv-weights/weights/fastwan21-1.3b-quant/`): int4-hqq-g64-ffn 1.18 GB,
+  int4-hqq-g64 0.88 GB vs ~2.9 GB f16; CUDA peak 3.4 / 3.1 GB, WebGPU 5.4 /
+  5.1 GB (`docs/runs/2026-11-03-vast-4090-q4-store`). A stored file decides
+  its own format. `WeightQuant::for_key` is the one rule for which linears get
+  which format; check gate / weight presence with `has_linear`, never
+  `contains("….weight")` (a quantized file stores `.weight.q4`).
 - WGSL: zero loop-local accumulators explicitly. Dawn (Chrome) on SwiftShader
   carried a `var` declared in a loop body across iterations, which broke
   multi-chunk flash attention while naga/wgpu passed. Run the bench page in
