@@ -25,7 +25,7 @@ fn wan_dit_matches_diffusers() {
     let dit = WanDit::load(&be, cfg.clone(), &src).unwrap();
     let prompt = dit.prepare_prompt(&be, &ctx);
     let mods = dit.step_mods(&be, ts);
-    let ws = dit.workspace(&be, (t, h, w), usize::MAX);
+    let ws = dit.workspace(&be, (t, h, w), usize::MAX, None);
     let xb = be.upload(&x);
     let out = be.alloc(x.len());
     dit.forward(&be, &ws, &xb, &mods, &prompt, &out);

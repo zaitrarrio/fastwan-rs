@@ -65,6 +65,7 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     let mut rng = Rng::new(42);
     ops(&mut p, &mut rng);
     model(&mut p);
+    model_vsa(&mut p);
     p.out
 }
 
@@ -307,6 +308,50 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         p.record(format!("attention h{heads} {sq}x{sk} d{d}"), g, c);
     }
 
+    // VSA: partial tiles in every axis, two head dims, two sparsities.
+    for &(grid, heads, d, sparsity) in &[
+        ((5, 6, 9), 2, 128, 0.75),
+        ((4, 8, 8), 3, 16, 0.5),
+        ((9, 5, 7), 1, 64, 0.8),
+    ] {
+        let spec = fastwan_core::vsa::VsaSpec::new(grid, heads, d, sparsity);
+        let s = spec.plan.seq;
+        let (q, k, v, g) = (
+            rng.normal(heads * s * d),
+            rng.normal(heads * s * d),
+            rng.normal(heads * s * d),
+            rng.normal(heads * s * d),
+        );
+        let (gq, gk, gv, gg, go) = (
+            be.upload(&q),
+            be.upload(&k),
+            be.upload(&v),
+            be.upload(&g),
+            be.alloc(s * heads * d),
+        );
+        let st = be.vsa_prepare(&spec);
+        be.vsa_attention(&gq, &gk, &gv, &gg, &st, &go);
+        let (cq, ck, cv, cg, co) = (
+            cpu.upload(&q),
+            cpu.upload(&k),
+            cpu.upload(&v),
+            cpu.upload(&g),
+            cpu.alloc(s * heads * d),
+        );
+        let cs = cpu.vsa_prepare(&spec);
+        cpu.vsa_attention(&cq, &ck, &cv, &cg, &cs, &co);
+        let (gout, cout) = (be.download(&go), cpu.download(&co));
+        p.record(
+            format!(
+                "vsa {grid:?} h{heads} d{d} topk {}/{}",
+                spec.topk,
+                spec.plan.num_tiles()
+            ),
+            gout,
+            cout,
+        );
+    }
+
     // patchify / unpatchify / dmd_step / tanh_clamp.
     let (c, t, hh, ww, pp) = (3, 2, 6, 10, 2);
     let lat = rng.normal(c * t * hh * ww);
@@ -450,6 +495,7 @@ fn model<B: Backend>(p: &mut Pair<'_, B>) {
         seed: 11,
         ffn_chunk: 7,
         tae_chunk: 2,
+        attention: Some(crate::dit::Attention::Dense),
     };
     let gp = Pipeline {
         dit: WanDit::load(be, cfg.clone(), &src).unwrap(),
@@ -485,6 +531,42 @@ fn model<B: Backend>(p: &mut Pair<'_, B>) {
         .decode_chunk(cpu, &mut cp.tae.state(), &z, lt, lh, lw)
         .data;
     p.record("tiny TAEHV decode (frames)", gf, cf);
+}
+
+/// The VSA path end to end: a tiny head_dim-32 DiT, 3 DMD steps, 4 tiles at
+/// sparsity 0.5, on both backends.
+fn model_vsa<B: Backend>(p: &mut Pair<'_, B>) {
+    let (be, cpu) = (p.be, &Cpu);
+    let cfg = WanConfig::tiny_vsa();
+    let src = Synthetic { seed: 6 };
+    let g = Geometry {
+        width: 128,
+        height: 64,
+        frames: 17,
+    };
+    let embeds = Rng::new(8).normal(cfg.text_len * cfg.text_dim);
+    let opt = Options {
+        geometry: g,
+        seed: 12,
+        ffn_chunk: usize::MAX,
+        tae_chunk: 2,
+        attention: Some(crate::dit::Attention::Vsa { sparsity: 0.5 }),
+    };
+    let mk = |_: &WanConfig| DmdSchedule::fastwan_1_3b();
+    let gp = Pipeline {
+        dit: WanDit::load(be, cfg.clone(), &src).unwrap(),
+        tae: TaeHv::load(be, TaeConfig::tiny(), &src).unwrap(),
+        schedule: mk(&cfg),
+    };
+    let cp = Pipeline {
+        dit: WanDit::load(cpu, cfg.clone(), &src).unwrap(),
+        tae: TaeHv::load(cpu, TaeConfig::tiny(), &src).unwrap(),
+        schedule: mk(&cfg),
+    };
+    let (mut t1, mut t2) = (Timings::default(), Timings::default());
+    let gl = gp.denoise(be, &embeds, &opt, &mut t1).unwrap();
+    let cl = cp.denoise(cpu, &embeds, &opt, &mut t2).unwrap();
+    p.record("tiny DiT, VSA 4 tiles, 3 DMD steps (latent)", gl, cl);
 }
 
 #[cfg(test)]
@@ -532,7 +614,7 @@ mod tests {
         let lat = (2, 4, 6);
         let x = cpu.upload(&Rng::new(3).normal(cfg.in_channels * 2 * 4 * 6));
         let run = |chunk| {
-            let ws = dit.workspace(&cpu, lat, chunk);
+            let ws = dit.workspace(&cpu, lat, chunk, None);
             let out = cpu.alloc(cfg.in_channels * 2 * 4 * 6);
             dit.forward(&cpu, &ws, &x, &mods, &prompt, &out);
             cpu.download(&out)

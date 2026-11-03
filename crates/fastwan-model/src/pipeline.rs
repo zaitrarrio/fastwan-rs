@@ -18,6 +18,8 @@ pub struct Options {
     pub ffn_chunk: usize,
     /// Latent frames per TAEHV chunk.
     pub tae_chunk: usize,
+    /// `None`: VSA on a VSA checkpoint, dense otherwise.
+    pub attention: Option<crate::dit::Attention>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -95,7 +97,9 @@ impl<B: Backend> Pipeline<B> {
             .iter()
             .map(|&ts| self.dit.step_mods(be, ts as f32))
             .collect();
-        let ws = self.dit.workspace(be, opt.geometry.latent(), opt.ffn_chunk);
+        let ws = self
+            .dit
+            .workspace(be, opt.geometry.latent(), opt.ffn_chunk, opt.attention);
         be.sync();
         t.prompt_s = t0.elapsed().as_secs_f64();
         on(Event::Prepared { secs: t.prompt_s });

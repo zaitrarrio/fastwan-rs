@@ -77,6 +77,15 @@ impl WanConfig {
         }
     }
 
+    /// [`WanConfig::tiny`] with head_dim 32: the smallest graph the GPU
+    /// VSA / flash kernels take (head_dim a multiple of 16).
+    pub fn tiny_vsa() -> Self {
+        Self {
+            head_dim: 32,
+            ..Self::tiny()
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "fastwan-1.3b" | "fastwan21-1.3b" | "FastVideo/FastWan2.1-T2V-1.3B-Diffusers" => {

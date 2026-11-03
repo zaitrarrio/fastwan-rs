@@ -39,6 +39,35 @@ enum BackendKind {
     Cuda,
 }
 
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum AttnKind {
+    /// VSA on a checkpoint that carries to_gate_compress (FastWan), dense otherwise.
+    Auto,
+    Dense,
+    Vsa,
+}
+
+#[derive(clap::Args, Clone, Copy)]
+struct AttnArgs {
+    #[arg(long, value_enum, default_value_t = AttnKind::Auto)]
+    attention: AttnKind,
+    /// Fraction of key tiles VSA skips (FastVideo's default 0.8).
+    #[arg(long, default_value_t = fastwan_core::vsa::DEFAULT_SPARSITY)]
+    vsa_sparsity: f64,
+}
+
+impl AttnArgs {
+    fn get(&self) -> Option<fastwan_model::Attention> {
+        match self.attention {
+            AttnKind::Auto => None,
+            AttnKind::Dense => Some(fastwan_model::Attention::Dense),
+            AttnKind::Vsa => Some(fastwan_model::Attention::Vsa {
+                sparsity: self.vsa_sparsity,
+            }),
+        }
+    }
+}
+
 #[derive(clap::Args, Clone)]
 struct Shape {
     #[arg(long, default_value_t = 832)]
@@ -85,6 +114,8 @@ enum Cmd {
     Bench {
         #[command(flatten)]
         shape: Shape,
+        #[command(flatten)]
+        attn: AttnArgs,
         #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
         backend: BackendKind,
         /// DiT layers to build (30 for the real model; fewer for a quick look).
@@ -99,6 +130,8 @@ enum Cmd {
         addr: String,
         #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
         backend: BackendKind,
+        #[command(flatten)]
+        attn: AttnArgs,
         /// A FastVideo/FastWan2.1-T2V-1.3B-Diffusers download (transformer/,
         /// text_encoder/, tokenizer/); TAEHV is read from <dir>/taew2_1.safetensors
         /// unless --tae says otherwise.
@@ -125,6 +158,8 @@ enum Cmd {
     Generate {
         #[command(flatten)]
         shape: Shape,
+        #[command(flatten)]
+        attn: AttnArgs,
         #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
         backend: BackendKind,
         /// The checkpoint's `transformer/` directory (Diffusers safetensors).
@@ -242,6 +277,7 @@ fn main() -> Result<()> {
         }
         Cmd::Check { backend } => with_backend!(backend, |be| check(&be, resolve(backend))?),
         Cmd::Bench {
+            attn,
             shape,
             backend,
             layers,
@@ -251,10 +287,12 @@ fn main() -> Result<()> {
                 &be,
                 &shape.geometry()?,
                 layers,
-                decode
+                decode,
+                attn.get()
             )?)
         }
         Cmd::Serve {
+            attn,
             addr,
             backend,
             model_dir,
@@ -283,12 +321,14 @@ fn main() -> Result<()> {
                 max_frames,
                 tae_chunk,
                 allow_origin,
+                attention: attn.get(),
             };
             serve::serve(settings, move |s, shared, rx| {
                 with_backend!(backend, |be| serve::engine(be, s, shared, rx))
             })?;
         }
         Cmd::Generate {
+            attn,
             shape,
             backend,
             transformer,
@@ -336,7 +376,8 @@ fn main() -> Result<()> {
                 &out,
                 ffn_chunk,
                 tae_chunk,
-                runs
+                runs,
+                attn.get()
             )?)
         }
     }
@@ -369,7 +410,13 @@ fn check<B: Backend>(be: &B, kind: BackendKind) -> Result<()> {
     Ok(())
 }
 
-fn bench<B: Backend>(be: &B, g: &Geometry, layers: usize, decode: bool) -> Result<()> {
+fn bench<B: Backend>(
+    be: &B,
+    g: &Geometry,
+    layers: usize,
+    decode: bool,
+    attention: Option<fastwan_model::Attention>,
+) -> Result<()> {
     let cfg = WanConfig {
         layers,
         ..WanConfig::fastwan_1_3b()
@@ -397,6 +444,7 @@ fn bench<B: Backend>(be: &B, g: &Geometry, layers: usize, decode: bool) -> Resul
         seed: 7,
         ffn_chunk: usize::MAX,
         tae_chunk: 2,
+        attention,
     };
     let mut t = fastwan_model::Timings::default();
     let latent = pipe.denoise(be, &embeds, &opt, &mut t)?;
@@ -452,6 +500,7 @@ fn generate<B: Backend>(
     ffn_chunk: Option<usize>,
     tae_chunk: usize,
     runs: usize,
+    attention: Option<fastwan_model::Attention>,
 ) -> Result<()> {
     let cfg = WanConfig::fastwan_1_3b();
     let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
@@ -497,6 +546,7 @@ fn generate<B: Backend>(
         seed,
         ffn_chunk: ffn_chunk.unwrap_or(usize::MAX),
         tae_chunk,
+        attention,
     };
     let mut last = None;
     for run in 0..runs.max(1) {

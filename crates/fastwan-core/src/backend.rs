@@ -80,6 +80,9 @@ impl ConvShape {
 pub trait Backend {
     /// A flat device buffer of activations.
     type Buf;
+    /// Device state of [`Backend::vsa_attention`] for one token grid: tile
+    /// tables and the coarse-stage scratch.
+    type Vsa;
     /// A `[rows, cols]` row-major matrix (`nn.Linear` layout: `[out, in]`) in
     /// the backend's storage precision.
     type Weight;
@@ -198,6 +201,23 @@ pub trait Backend {
         sq: usize,
         sk: usize,
         head_dim: usize,
+        out: &Self::Buf,
+    );
+
+    /// Build the VSA state for one token grid ([`crate::vsa::VsaSpec`]).
+    fn vsa_prepare(&self, spec: &crate::vsa::VsaSpec) -> Self::Vsa;
+
+    /// Video sparse attention ([`crate::vsa`]). `q`, `k`, `v`, `gate` are
+    /// `[heads, seq, d]`; `out` is `[seq, heads·d]`, as from
+    /// [`Backend::attention`].
+    #[allow(clippy::too_many_arguments)]
+    fn vsa_attention(
+        &self,
+        q: &Self::Buf,
+        k: &Self::Buf,
+        v: &Self::Buf,
+        gate: &Self::Buf,
+        vsa: &Self::Vsa,
         out: &Self::Buf,
     );
 

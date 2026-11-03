@@ -81,6 +81,8 @@ struct Block<B: Backend> {
     norm2_b: B::Buf,
     ffn1: Linear<B>,
     ffn2: Linear<B>,
+    /// `to_gate_compress`: present on VSA-distilled checkpoints (FastWan).
+    gate: Option<Linear<B>>,
     /// `[6·dim]`, host: added to `timestep_proj` once per step.
     table: Vec<f32>,
 }
@@ -119,7 +121,21 @@ pub struct Prompt<B: Backend> {
 }
 
 /// Activation buffers for one token count, reused by every block and step.
+/// Self-attention algorithm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Attention {
+    Dense,
+    /// Video sparse attention keeping `1 − sparsity` of the key tiles.
+    Vsa {
+        sparsity: f64,
+    },
+}
+
 pub struct Workspace<B: Backend> {
+    pub attention: Attention,
+    vsa: Option<B::Vsa>,
+    /// The VSA gate, `[heads, S, d]`.
+    g: B::Buf,
     pub tokens: usize,
     pub grid: (usize, usize, usize),
     pub ffn_chunk: usize,
@@ -140,9 +156,12 @@ pub struct Workspace<B: Backend> {
 impl<B: Backend> WanDit<B> {
     pub fn load(be: &B, cfg: WanConfig, src: &dyn WeightSource) -> Result<Self> {
         let d = cfg.dim();
-        let shapes: Shapes = fastwan_core::weights::wan_manifest(&cfg)
+        let mut shapes: Shapes = fastwan_core::weights::wan_manifest(&cfg)
             .into_iter()
             .collect();
+        for l in 0..cfg.layers {
+            shapes.insert(format!("blocks.{l}.to_gate_compress.weight"), vec![d, d]);
+        }
         let lin = |keys: &[&str]| load_linear(be, src, &shapes, keys);
         let vec = |k: &str, n: usize| -> Result<B::Buf> { Ok(be.upload(&src.get(k, &[n])?)) };
         let mut blocks = Vec::with_capacity(cfg.layers);
@@ -162,6 +181,11 @@ impl<B: Backend> WanDit<B> {
                 norm2_b: vec(&p("norm2.bias"), d)?,
                 ffn1: lin(&[&p("ffn.net.0.proj")])?,
                 ffn2: lin(&[&p("ffn.net.2")])?,
+                gate: if src.contains(&p("to_gate_compress.weight")) {
+                    Some(lin(&[&p("to_gate_compress")])?)
+                } else {
+                    None
+                },
                 table: src.get(&p("scale_shift_table"), &[1, 6, d])?,
             });
         }
@@ -271,11 +295,19 @@ impl<B: Backend> WanDit<B> {
         Prompt { kv }
     }
 
+    /// Whether every block carries `to_gate_compress` (a VSA checkpoint).
+    pub fn has_vsa_gates(&self) -> bool {
+        self.blocks.iter().all(|b| b.gate.is_some())
+    }
+
+    /// `attention: None` picks VSA at the default sparsity on a VSA checkpoint
+    /// (what it was distilled with) and dense attention otherwise.
     pub fn workspace(
         &self,
         be: &B,
         latent: (usize, usize, usize),
         ffn_chunk: usize,
+        attention: Option<Attention>,
     ) -> Workspace<B> {
         let c = &self.cfg;
         let grid = (latent.0, latent.1 / c.patch, latent.2 / c.patch);
@@ -283,7 +315,29 @@ impl<B: Backend> WanDit<B> {
         let d = c.dim();
         let chunk = ffn_chunk.clamp(1, s);
         let rope = rope_table(c, grid, 0);
+        let attention = attention.unwrap_or(if self.has_vsa_gates() {
+            Attention::Vsa {
+                sparsity: fastwan_core::vsa::DEFAULT_SPARSITY,
+            }
+        } else {
+            Attention::Dense
+        });
+        let vsa = match attention {
+            Attention::Vsa { sparsity } => {
+                assert!(
+                    self.has_vsa_gates(),
+                    "VSA needs a checkpoint with to_gate_compress in every block"
+                );
+                Some(be.vsa_prepare(&fastwan_core::vsa::VsaSpec::new(
+                    grid, c.heads, c.head_dim, sparsity,
+                )))
+            }
+            Attention::Dense => None,
+        };
         Workspace {
+            attention,
+            vsa,
+            g: be.alloc(s * d),
             tokens: s,
             grid,
             ffn_chunk: chunk,
@@ -376,7 +430,25 @@ impl<B: Backend> WanDit<B> {
                 &ws.k,
             );
             be.head_split(&ws.qkv, s, 3 * d, 2 * d, nh, hd, None, None, eps, &ws.v);
-            be.attention(&ws.q, &ws.k, &ws.v, nh, s, s, hd, &ws.attn);
+            match (&ws.vsa, &bl.gate) {
+                (Some(vsa), Some(gate)) => {
+                    // The gate is to_gate_compress of the same normed input,
+                    // split into heads with no norm and no RoPE.
+                    be.linear(
+                        &ws.normed,
+                        0,
+                        s,
+                        &gate.w,
+                        Some(&gate.b),
+                        Act::None,
+                        &ws.tmp,
+                        0,
+                    );
+                    be.head_split(&ws.tmp, s, d, 0, nh, hd, None, None, eps, &ws.g);
+                    be.vsa_attention(&ws.q, &ws.k, &ws.v, &ws.g, vsa, &ws.attn);
+                }
+                _ => be.attention(&ws.q, &ws.k, &ws.v, nh, s, s, hd, &ws.attn),
+            }
             be.linear(
                 &ws.attn,
                 0,

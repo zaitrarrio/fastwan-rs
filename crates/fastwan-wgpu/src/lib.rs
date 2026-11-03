@@ -23,6 +23,11 @@ const ATTN: &str = include_str!("shaders/attention.wgsl");
 const NORM: &str = include_str!("shaders/norm.wgsl");
 const HEADS: &str = include_str!("shaders/head_split.wgsl");
 const ELEM: &str = include_str!("shaders/elementwise.wgsl");
+const FLASH: &str = include_str!("shaders/flash.wgsl");
+const VSA_POOL: &str = include_str!("shaders/vsa_pool.wgsl");
+const VSA_COARSE: &str = include_str!("shaders/vsa_coarse.wgsl");
+/// Shared memory the flash kernel declares (Q|K panel, S tile, row state).
+const FLASH_SHARED: u32 = 2048 * 4 + 4160 * 4 + 5 * 64 * 4;
 
 /// Submit after this many recorded dispatches.
 const BATCH: usize = 64;
@@ -33,6 +38,21 @@ const MAX_DIM: u32 = 65535;
 pub struct GBuf {
     buf: Arc<wgpu::Buffer>,
     len: usize,
+}
+
+/// VSA state for one token grid.
+pub struct GVsa {
+    slot: GBuf,
+    bsz: GBuf,
+    pooled: GBuf,
+    coarse: GBuf,
+    sel: GBuf,
+    nb: usize,
+    topk: usize,
+    heads: usize,
+    d: usize,
+    seq: usize,
+    scale: f32,
 }
 
 pub struct GWeight {
@@ -52,6 +72,8 @@ pub struct Wgpu {
     queue: wgpu::Queue,
     info: wgpu::AdapterInfo,
     attn_bk: usize,
+    /// The register-tiled flash kernel fits this adapter's shared memory.
+    flash_ok: bool,
     pipelines: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
     pending: Mutex<Pending>,
     dummy: GBuf,
@@ -97,6 +119,8 @@ impl Wgpu {
         // K and V tiles of BK keys × 128 dims, f32, must fit shared memory.
         let wgs = device.limits().max_compute_workgroup_storage_size as usize;
         let attn_bk = if wgs >= 2 * 32 * 128 * 4 { 32 } else { 16 };
+        let flash_ok = wgs >= FLASH_SHARED as usize
+            && std::env::var("FASTWAN_WGPU_FLASH").map_or(true, |v| v != "0");
         let dummy = GBuf {
             buf: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("dummy"),
@@ -111,6 +135,7 @@ impl Wgpu {
             device,
             queue,
             attn_bk,
+            flash_ok,
             pipelines: Mutex::new(HashMap::new()),
             pending: Mutex::new(Pending { enc: None, n: 0 }),
             dummy,
@@ -317,8 +342,69 @@ fn bytemuck_cast(w: &[u32]) -> &[u8] {
     bytemuck::cast_slice(w)
 }
 
+impl Wgpu {
+    fn upload_u32(&self, data: &[u32]) -> GBuf {
+        let data = if data.is_empty() { &[0u32][..] } else { data };
+        GBuf {
+            buf: Arc::new(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(data),
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_SRC
+                            | wgpu::BufferUsages::COPY_DST,
+                    }),
+            ),
+            len: data.len(),
+        }
+    }
+
+    /// Flash kernel dispatch: mode 0 dense, mode 1 VSA fine stage.
+    #[allow(clippy::too_many_arguments)]
+    fn flash(
+        &self,
+        mode: u32,
+        q: &GBuf,
+        k: &GBuf,
+        v: &GBuf,
+        out: &GBuf,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+        d: usize,
+        scale: f32,
+        vsa: Option<(&GVsa, &GBuf)>,
+    ) {
+        let pipe = self.pipeline("flash", || FLASH.to_string());
+        let (nb, topk) = vsa.map_or((0, 0), |(s, _)| (s.nb, s.topk));
+        let p = [
+            heads as u32,
+            sq as u32,
+            sk as u32,
+            d as u32,
+            (scale * std::f32::consts::LOG2_E).to_bits(),
+            mode,
+            nb as u32,
+            topk as u32,
+        ];
+        let blocks = if mode == 0 { sq.div_ceil(64) } else { nb };
+        let (slot, sel, coarse, gate) = match vsa {
+            Some((s, g)) => (&s.slot, &s.sel, &s.coarse, g),
+            None => (&self.dummy, &self.dummy, &self.dummy, &self.dummy),
+        };
+        self.dispatch(
+            &pipe,
+            &p,
+            &[q, k, v, out, slot, sel, coarse, gate],
+            (blocks as u32, heads as u32, 1),
+        );
+    }
+}
+
 impl Backend for Wgpu {
     type Buf = GBuf;
+    type Vsa = GVsa;
     type Weight = GWeight;
 
     fn name(&self) -> String {
@@ -600,6 +686,22 @@ impl Backend for Wgpu {
         out: &GBuf,
     ) {
         assert!(d <= 128, "attention kernel supports head_dim <= 128");
+        if self.flash_ok && d % 16 == 0 {
+            self.flash(
+                0,
+                q,
+                k,
+                v,
+                out,
+                heads,
+                sq,
+                sk,
+                d,
+                1.0 / (d as f32).sqrt(),
+                None,
+            );
+            return;
+        }
         let bk = self.attn_bk;
         let pipe = self.pipeline(&format!("attention_bk{bk}"), || {
             ATTN.replace("{BK_D}", &(bk * 128).to_string())
@@ -618,6 +720,68 @@ impl Backend for Wgpu {
             &p,
             &[q, k, v, out],
             (sq.div_ceil(64) as u32, heads as u32, 1),
+        );
+    }
+
+    fn vsa_prepare(&self, spec: &fastwan_core::vsa::VsaSpec) -> GVsa {
+        let (nb, h, d) = (spec.plan.num_tiles(), spec.heads, spec.head_dim);
+        assert!(
+            nb <= 2048,
+            "VSA coarse stage holds at most 2048 tiles per workgroup"
+        );
+        GVsa {
+            slot: self.upload_u32(&spec.plan.slot_src),
+            bsz: self.upload_u32(&spec.plan.block_sizes),
+            pooled: self.alloc(3 * h * nb * d),
+            coarse: self.alloc(h * nb * d),
+            sel: self.upload_u32(&vec![0u32; h * nb * spec.topk]),
+            nb,
+            topk: spec.topk,
+            heads: h,
+            d,
+            seq: spec.plan.seq,
+            scale: spec.scale,
+        }
+    }
+
+    fn vsa_attention(&self, q: &GBuf, k: &GBuf, v: &GBuf, gate: &GBuf, s: &GVsa, out: &GBuf) {
+        assert!(
+            self.flash_ok && s.d % 16 == 0 && s.d <= 128,
+            "VSA needs the flash kernel (head_dim multiple of 16, <= 128)"
+        );
+        let pool = self.pipeline("vsa_pool", || VSA_POOL.to_string());
+        self.dispatch(
+            &pool,
+            &[s.heads as u32, s.seq as u32, s.d as u32, s.nb as u32],
+            &[q, k, v, &s.slot, &s.bsz, &s.pooled],
+            (s.nb as u32, s.heads as u32, 1),
+        );
+        let coarse = self.pipeline("vsa_coarse", || VSA_COARSE.to_string());
+        let p = [
+            s.heads as u32,
+            s.d as u32,
+            s.nb as u32,
+            s.topk as u32,
+            s.scale.to_bits(),
+        ];
+        self.dispatch(
+            &coarse,
+            &p,
+            &[&s.pooled, &s.coarse, &s.sel],
+            (s.nb as u32, s.heads as u32, 1),
+        );
+        self.flash(
+            1,
+            q,
+            k,
+            v,
+            out,
+            s.heads,
+            s.seq,
+            s.seq,
+            s.d,
+            s.scale,
+            Some((s, gate)),
         );
     }
 

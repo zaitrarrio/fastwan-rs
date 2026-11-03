@@ -61,6 +61,7 @@ pub struct Settings {
     /// API from the browser: CORS plus Chrome's private-network preflight,
     /// for that origin only. `None` = same-origin only (the default).
     pub allow_origin: Option<String>,
+    pub attention: Option<fastwan_model::Attention>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -277,6 +278,7 @@ pub fn engine<B: Backend>(
                 seed,
                 ffn_chunk: usize::MAX,
                 tae_chunk: s.tae_chunk,
+                attention: s.attention,
             };
             pipe.generate_with(&be, &embeds, &opt, &mut |ev| match ev {
                 Event::Prepared { secs } => {

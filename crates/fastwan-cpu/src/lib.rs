@@ -4,6 +4,7 @@
 //! unit tests and a short low-resolution clip end to end.
 
 use fastwan_core::backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind};
+use fastwan_core::vsa::{TILE_ELEMS, VsaSpec};
 use rayon::prelude::*;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -72,8 +73,125 @@ fn with_norm<R>(norm: NormKind<'_, CpuBuf>, f: impl FnOnce(NormKind<'_, Vec<f32>
     }
 }
 
+/// VSA reference (fastvideo-rs `vsa_attention_host`): coarse stage in f64,
+/// top-k by score then lower tile index, fine stage with an online softmax.
+pub fn vsa_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    gate: &[f32],
+    spec: &VsaSpec,
+    out: &mut [f32],
+) {
+    let (plan, heads, d) = (&spec.plan, spec.heads, spec.head_dim);
+    let (seq, nb, topk) = (
+        plan.seq,
+        plan.num_tiles(),
+        spec.topk.clamp(1, plan.num_tiles()),
+    );
+    let scale = spec.scale as f64;
+    let per_head: Vec<Vec<(usize, Vec<f32>)>> = (0..heads)
+        .into_par_iter()
+        .map(|h| {
+            let row =
+                |b: &[f32], tok: usize| -> Vec<f32> { b[(h * seq + tok) * d..][..d].to_vec() };
+            // 1. Tile means over real tokens.
+            let mut mean = vec![vec![0f64; nb * d]; 3];
+            for t in 0..nb {
+                let n = plan.block_sizes[t] as f64;
+                for s in 0..plan.block_sizes[t] as usize {
+                    let tok = plan.slot_src[t * TILE_ELEMS + s] as usize;
+                    for (m, src) in mean.iter_mut().zip([q, k, v]) {
+                        for (c, x) in row(src, tok).iter().enumerate() {
+                            m[t * d + c] += *x as f64;
+                        }
+                    }
+                }
+                for m in mean.iter_mut() {
+                    for c in 0..d {
+                        m[t * d + c] /= n;
+                    }
+                }
+            }
+            let (qc, kc, vc) = (&mean[0], &mean[1], &mean[2]);
+            // 2. Coarse attention + 3. top-k from the same scores.
+            let mut coarse = vec![0f32; nb * d];
+            let mut sel = vec![0usize; nb * topk];
+            for qt in 0..nb {
+                let s: Vec<f32> = (0..nb)
+                    .map(|kt| {
+                        ((0..d)
+                            .map(|c| {
+                                (qc[qt * d + c] as f32 as f64) * (kc[kt * d + c] as f32 as f64)
+                            })
+                            .sum::<f64>()
+                            * scale) as f32
+                    })
+                    .collect();
+                let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let e: Vec<f64> = s.iter().map(|x| ((x - m) as f64).exp()).collect();
+                let z: f64 = e.iter().sum();
+                for (kt, w) in e.iter().enumerate() {
+                    for c in 0..d {
+                        coarse[qt * d + c] += (w / z * (vc[kt * d + c] as f32 as f64)) as f32;
+                    }
+                }
+                let mut order: Vec<usize> = (0..nb).collect();
+                order.sort_by(|&a, &b| s[b].total_cmp(&s[a]).then(a.cmp(&b)));
+                sel[qt * topk..(qt + 1) * topk].copy_from_slice(&order[..topk]);
+            }
+            // 4. Fine attention inside the selected tiles, 5. combine.
+            let mut rows = Vec::with_capacity(seq);
+            for qt in 0..nb {
+                for qs in 0..plan.block_sizes[qt] as usize {
+                    let qtok = plan.slot_src[qt * TILE_ELEMS + qs] as usize;
+                    let qr = row(q, qtok);
+                    let (mut m, mut z) = (f32::NEG_INFINITY, 0f64);
+                    let mut acc = vec![0f64; d];
+                    for &kt in &sel[qt * topk..(qt + 1) * topk] {
+                        for ks in 0..plan.block_sizes[kt] as usize {
+                            let ktok = plan.slot_src[kt * TILE_ELEMS + ks] as usize;
+                            let kr = &k[(h * seq + ktok) * d..][..d];
+                            let s = ((0..d).map(|c| qr[c] as f64 * kr[c] as f64).sum::<f64>()
+                                * scale) as f32;
+                            if s > m {
+                                let shrink = if m.is_finite() {
+                                    ((m - s) as f64).exp()
+                                } else {
+                                    0.0
+                                };
+                                z *= shrink;
+                                acc.iter_mut().for_each(|a| *a *= shrink);
+                                m = s;
+                            }
+                            let e = ((s - m) as f64).exp();
+                            z += e;
+                            let vr = &v[(h * seq + ktok) * d..][..d];
+                            for c in 0..d {
+                                acc[c] += e * vr[c] as f64;
+                            }
+                        }
+                    }
+                    let g = row(gate, qtok);
+                    let o: Vec<f32> = (0..d)
+                        .map(|c| coarse[qt * d + c] * g[c] + (acc[c] / z) as f32)
+                        .collect();
+                    rows.push((qtok, o));
+                }
+            }
+            rows
+        })
+        .collect();
+    for (h, rows) in per_head.into_iter().enumerate() {
+        for (tok, o) in rows {
+            out[(tok * heads + h) * d..][..d].copy_from_slice(&o);
+        }
+    }
+}
+
 impl Backend for Cpu {
     type Buf = CpuBuf;
+    type Vsa = VsaSpec;
     type Weight = CpuWeight;
 
     fn name(&self) -> String {
@@ -321,6 +439,23 @@ impl Backend for Cpu {
             });
     }
 
+    fn vsa_prepare(&self, spec: &VsaSpec) -> VsaSpec {
+        spec.clone()
+    }
+
+    fn vsa_attention(
+        &self,
+        q: &CpuBuf,
+        k: &CpuBuf,
+        v: &CpuBuf,
+        gate: &CpuBuf,
+        spec: &VsaSpec,
+        out: &CpuBuf,
+    ) {
+        let (q, k, v, g) = (q.r(), k.r(), v.r(), gate.r());
+        vsa_reference(&q, &k, &v, &g, spec, &mut out.w());
+    }
+
     fn patchify(
         &self,
         latent: &CpuBuf,
@@ -465,5 +600,39 @@ impl Backend for Cpu {
         for v in x.w()[..n].iter_mut() {
             *v = (*v / s).tanh() * s;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastwan_core::rng::Rng;
+
+    /// All tiles selected and a zero gate: VSA is dense attention.
+    #[test]
+    fn vsa_with_every_tile_is_dense_attention() {
+        let (grid, heads, d) = ((5, 6, 9), 2, 16);
+        let spec = VsaSpec::new(grid, heads, d, 0.0);
+        assert_eq!(spec.topk, spec.plan.num_tiles());
+        let s = spec.plan.seq;
+        let mut r = Rng::new(1);
+        let (q, k, v) = (
+            r.normal(heads * s * d),
+            r.normal(heads * s * d),
+            r.normal(heads * s * d),
+        );
+        let be = Cpu;
+        let (gq, gk, gv) = (be.upload(&q), be.upload(&k), be.upload(&v));
+        let dense = be.alloc(s * heads * d);
+        be.attention(&gq, &gk, &gv, heads, s, s, d, &dense);
+        let sparse = be.alloc(s * heads * d);
+        let st = be.vsa_prepare(&spec);
+        be.vsa_attention(&gq, &gk, &gv, &be.alloc(heads * s * d), &st, &sparse);
+        let (a, b) = (be.download(&dense), be.download(&sparse));
+        let err = a
+            .iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(err < 1e-5, "{err}");
     }
 }

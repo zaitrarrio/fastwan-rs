@@ -12,6 +12,7 @@ pub mod rng;
 pub mod rope;
 pub mod schedule;
 pub mod timestep;
+pub mod vsa;
 pub mod weights;
 
 pub use backend::{Act, Backend, ConvEpilogue, NormKind};

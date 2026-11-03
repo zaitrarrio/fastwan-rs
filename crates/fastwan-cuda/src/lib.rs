@@ -29,6 +29,21 @@ pub struct CuBuf {
     f32: bool,
 }
 
+/// VSA state: tile tables (u32), f32 pooled means / coarse output, u32 picks.
+pub struct CuVsa {
+    slot: CuBuf,
+    bsz: CuBuf,
+    pooled: CuBuf,
+    coarse: CuBuf,
+    sel: CuBuf,
+    nb: usize,
+    topk: usize,
+    heads: usize,
+    d: usize,
+    seq: usize,
+    scale: f32,
+}
+
 pub struct CuWeight {
     buf: CuBuf,
     rows: usize,
@@ -54,6 +69,10 @@ struct Kernels {
     head_split: CudaFunction,
     attention: CudaFunction,
     attention_mma: CudaFunction,
+    vsa_pool: CudaFunction,
+    vsa_coarse: CudaFunction,
+    vsa_fine: CudaFunction,
+    vsa_fine_mma: CudaFunction,
     gate_residual: CudaFunction,
     dmd_step: CudaFunction,
     tanh_clamp: CudaFunction,
@@ -109,6 +128,10 @@ impl Cuda {
             head_split: get("fw_head_split")?,
             attention: get("fw_attention")?,
             attention_mma: get("fw_attention_mma")?,
+            vsa_pool: get("fw_vsa_pool")?,
+            vsa_coarse: get("fw_vsa_coarse")?,
+            vsa_fine: get("fw_vsa_fine")?,
+            vsa_fine_mma: get("fw_vsa_fine_mma")?,
             gate_residual: get("fw_gate_residual")?,
             dmd_step: get("fw_dmd_step")?,
             tanh_clamp: get("fw_tanh_clamp")?,
@@ -170,8 +193,17 @@ impl Cuda {
     }
 }
 
+impl Cuda {
+    /// 32-bit words (u32 tables or f32 scratch), via the f32 table path.
+    fn words(&self, bits: &[u32]) -> CuBuf {
+        let v: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
+        Backend::upload_table(self, if v.is_empty() { &[0.0][..] } else { &v })
+    }
+}
+
 impl Backend for Cuda {
     type Buf = CuBuf;
+    type Vsa = CuVsa;
     type Weight = CuWeight;
 
     fn name(&self) -> String {
@@ -474,6 +506,94 @@ impl Backend for Cuda {
                 Arg::F(scale),
             ],
         );
+    }
+
+    fn vsa_prepare(&self, spec: &fastwan_core::vsa::VsaSpec) -> CuVsa {
+        let (nb, h, d) = (spec.plan.num_tiles(), spec.heads, spec.head_dim);
+        assert!(
+            nb <= 2048,
+            "VSA coarse stage holds at most 2048 tiles per block"
+        );
+        CuVsa {
+            slot: self.words(&spec.plan.slot_src),
+            bsz: self.words(&spec.plan.block_sizes),
+            pooled: self.words(&vec![0; 3 * h * nb * d]),
+            coarse: self.words(&vec![0; h * nb * d]),
+            sel: self.words(&vec![0; h * nb * spec.topk]),
+            nb,
+            topk: spec.topk,
+            heads: h,
+            d,
+            seq: spec.plan.seq,
+            scale: spec.scale,
+        }
+    }
+
+    fn vsa_attention(&self, q: &CuBuf, k: &CuBuf, v: &CuBuf, gate: &CuBuf, s: &CuVsa, out: &CuBuf) {
+        let grid = (s.nb as u32, s.heads as u32, 1);
+        self.launch(
+            &self.f.vsa_pool,
+            grid,
+            (128, 1, 1),
+            &[
+                Arg::P(self.ptr(q)),
+                Arg::P(self.ptr(k)),
+                Arg::P(self.ptr(v)),
+                Arg::P(self.ptr(&s.slot)),
+                Arg::P(self.ptr(&s.bsz)),
+                Arg::P(self.ptr(&s.pooled)),
+                Arg::I(s.heads as i32),
+                Arg::I(s.seq as i32),
+                Arg::I(s.d as i32),
+                Arg::I(s.nb as i32),
+            ],
+        );
+        self.launch(
+            &self.f.vsa_coarse,
+            grid,
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(&s.pooled)),
+                Arg::P(self.ptr(&s.coarse)),
+                Arg::P(self.ptr(&s.sel)),
+                Arg::I(s.heads as i32),
+                Arg::I(s.d as i32),
+                Arg::I(s.nb as i32),
+                Arg::I(s.topk as i32),
+                Arg::F(s.scale),
+            ],
+        );
+        let tail = [
+            Arg::P(self.ptr(&s.slot)),
+            Arg::P(self.ptr(&s.sel)),
+            Arg::P(self.ptr(&s.coarse)),
+            Arg::P(self.ptr(gate)),
+            Arg::I(s.nb as i32),
+            Arg::I(s.topk as i32),
+        ];
+        let head = [
+            Arg::P(self.ptr(q)),
+            Arg::P(self.ptr(k)),
+            Arg::P(self.ptr(v)),
+            Arg::P(self.ptr(out)),
+            Arg::I(s.heads as i32),
+            Arg::I(s.seq as i32),
+        ];
+        if s.d == 128 && self.ampere && std::env::var("FASTWAN_CUDA_SCALAR_ATTN").is_err() {
+            let args: Vec<Arg> = head
+                .into_iter()
+                .chain([Arg::F(s.scale)])
+                .chain(tail)
+                .collect();
+            self.launch(&self.f.vsa_fine_mma, grid, (128, 1, 1), &args);
+        } else {
+            let args: Vec<Arg> = head
+                .into_iter()
+                .chain([Arg::I(s.d as i32), Arg::F(s.scale)])
+                .chain(tail)
+                .collect();
+            self.launch(&self.f.vsa_fine, grid, (64, 1, 1), &args);
+        }
     }
 
     fn patchify(

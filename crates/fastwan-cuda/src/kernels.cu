@@ -285,41 +285,61 @@ __device__ __forceinline__ unsigned pack_bf16(float lo, float hi) {
     return (unsigned)bf(lo) | ((unsigned)bf(hi) << 16);
 }
 
-extern "C" __global__ void __launch_bounds__(128) fw_attention_mma(u64 q_, u64 k_, u64 v_, u64 out_, int heads, int sq, int sk, float scale) {
-    __shared__ __align__(16) bf16_t ks[MMA_BK * KS_STRIDE];
-    __shared__ __align__(16) bf16_t vt[MMA_D * VT_STRIDE];
-    const bf16_t *q = (const bf16_t*)q_, *k = (const bf16_t*)k_, *v = (const bf16_t*)v_;
-    bf16_t* out = (bf16_t*)out_;
+// Body shared by dense attention (mode 0) and the VSA fine stage (mode 1).
+// Mode 1: the block is query tile blockIdx.x (rows via `slot`), key chunk c is
+// selected tile sel[h][qt][c], and the epilogue adds coarse[h][qt] · gate.
+__device__ __forceinline__ void attn_mma_body(int mode, const bf16_t* q, const bf16_t* k, const bf16_t* v, bf16_t* out,
+        int heads, int sq, int sk, float scale, const unsigned* slot, const unsigned* sel,
+        const float* coarse, const bf16_t* gate, int nb, int topk,
+        bf16_t* ks, bf16_t* vt, unsigned char* kvalid) {
     const int h = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
-    const int r0 = blockIdx.x * 64 + warp * 16 + g, r1 = r0 + 8;   // this thread's two query rows
-    const float sl2 = scale * 1.4426950408889634f;                    // fold log2(e) for exp2
+    const int qt = blockIdx.x;
+    const int lr0 = warp * 16 + g, lr1 = lr0 + 8;                   // rows within the 64-row block
+    int tok0, tok1;
+    if (mode == 0) {
+        tok0 = qt * 64 + lr0 < sq ? qt * 64 + lr0 : -1;
+        tok1 = qt * 64 + lr1 < sq ? qt * 64 + lr1 : -1;
+    } else {
+        const unsigned a = slot[qt * 64 + lr0], b = slot[qt * 64 + lr1];
+        tok0 = a == 0xffffffffu ? -1 : (int)a;
+        tok1 = b == 0xffffffffu ? -1 : (int)b;
+    }
+    const float sl2 = scale * 1.4426950408889634f;
 
-    // Q fragments for the 8 k-steps of d = 128.
     unsigned qa[8][4];
-    const unsigned* q0 = (const unsigned*)(q + ((long)h * sq + r0) * MMA_D);
-    const unsigned* q1 = (const unsigned*)(q + ((long)h * sq + r1) * MMA_D);
+    const unsigned* q0 = (const unsigned*)(q + ((long)h * sq + (tok0 < 0 ? 0 : tok0)) * MMA_D);
+    const unsigned* q1 = (const unsigned*)(q + ((long)h * sq + (tok1 < 0 ? 0 : tok1)) * MMA_D);
     #pragma unroll
     for (int kk = 0; kk < 8; ++kk) {
         const int c = (kk * 16 + t * 2) >> 1;
-        qa[kk][0] = r0 < sq ? q0[c] : 0u;
-        qa[kk][1] = r1 < sq ? q1[c] : 0u;
-        qa[kk][2] = r0 < sq ? q0[c + 4] : 0u;
-        qa[kk][3] = r1 < sq ? q1[c + 4] : 0u;
+        qa[kk][0] = tok0 >= 0 ? q0[c] : 0u;
+        qa[kk][1] = tok1 >= 0 ? q1[c] : 0u;
+        qa[kk][2] = tok0 >= 0 ? q0[c + 4] : 0u;
+        qa[kk][3] = tok1 >= 0 ? q1[c + 4] : 0u;
     }
     float o[16][4];
     #pragma unroll
     for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
     float m0 = -1e30f, m1 = -1e30f, l0 = 0.0f, l1 = 0.0f;
 
-    for (int j0 = 0; j0 < sk; j0 += MMA_BK) {
+    const int nchunks = mode == 0 ? (sk + MMA_BK - 1) / MMA_BK : topk;
+    for (int c = 0; c < nchunks; ++c) {
         __syncthreads();
-        // K tile row-major [key][dim]; V tile transposed [dim][key]. Zero past sk.
+        const unsigned* tslot = mode == 1 ? slot + (long)sel[((long)h * nb + qt) * topk + c] * 64 : 0;
+        if (threadIdx.x < MMA_BK) {
+            const int key = threadIdx.x;
+            kvalid[key] = mode == 0 ? (c * MMA_BK + key < sk) : (tslot[key] != 0xffffffffu);
+        }
+        // K tile row-major [key][dim]; V tile transposed [dim][key]. Zero for invalid keys.
         for (int e = threadIdx.x; e < MMA_BK * MMA_D / 2; e += 128) {
             const int key = e / (MMA_D / 2), c2 = (e % (MMA_D / 2)) * 2;
+            int ktok;
+            if (mode == 0) ktok = c * MMA_BK + key < sk ? c * MMA_BK + key : -1;
+            else { const unsigned s = tslot[key]; ktok = s == 0xffffffffu ? -1 : (int)s; }
             unsigned kv = 0u, vv = 0u;
-            if (j0 + key < sk) {
-                const long gi = ((long)h * sk + j0 + key) * MMA_D + c2;
+            if (ktok >= 0) {
+                const long gi = ((long)h * sk + ktok) * MMA_D + c2;
                 kv = *(const unsigned*)(k + gi);
                 vv = *(const unsigned*)(v + gi);
             }
@@ -328,7 +348,6 @@ extern "C" __global__ void __launch_bounds__(128) fw_attention_mma(u64 q_, u64 k
             vt[(c2 + 1) * VT_STRIDE + key] = (bf16_t)(vv >> 16);
         }
         __syncthreads();
-        // S = Q·Kᵀ for this warp's 16 rows × 64 keys: 8 n-tiles of 8 keys.
         float s[8][4];
         #pragma unroll
         for (int nt = 0; nt < 8; ++nt) {
@@ -341,18 +360,16 @@ extern "C" __global__ void __launch_bounds__(128) fw_attention_mma(u64 q_, u64 k
                 mma_bf16(s[nt], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b0, b1);
             }
         }
-        // Scale, mask keys past sk, row max over the quad.
         float mx0 = m0, mx1 = m1;
         #pragma unroll
         for (int nt = 0; nt < 8; ++nt) {
-            const int key = j0 + nt * 8 + t * 2;
             #pragma unroll
-            for (int c = 0; c < 2; ++c) {
-                const bool ok = key + c < sk;
-                s[nt][c] = ok ? s[nt][c] * sl2 : -1e30f;
-                s[nt][2 + c] = ok ? s[nt][2 + c] * sl2 : -1e30f;
-                mx0 = fmaxf(mx0, s[nt][c]);
-                mx1 = fmaxf(mx1, s[nt][2 + c]);
+            for (int cc = 0; cc < 2; ++cc) {
+                const bool ok = kvalid[nt * 8 + t * 2 + cc];
+                s[nt][cc] = ok ? s[nt][cc] * sl2 : -1e30f;
+                s[nt][2 + cc] = ok ? s[nt][2 + cc] * sl2 : -1e30f;
+                mx0 = fmaxf(mx0, s[nt][cc]);
+                mx1 = fmaxf(mx1, s[nt][2 + cc]);
             }
         }
         #pragma unroll
@@ -365,14 +382,13 @@ extern "C" __global__ void __launch_bounds__(128) fw_attention_mma(u64 q_, u64 k
         l0 *= c0; l1 *= c1;
         #pragma unroll
         for (int i = 0; i < 16; ++i) { o[i][0] *= c0; o[i][1] *= c0; o[i][2] *= c1; o[i][3] *= c1; }
-        // P = exp2(S − m) as bf16 A fragments; O += P·V over 4 k-steps of 16 keys.
         #pragma unroll
         for (int kk = 0; kk < 4; ++kk) {
             float p[8];
             #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                p[c] = exp2f(s[2 * kk][c] - (c < 2 ? m0 : m1));
-                p[4 + c] = exp2f(s[2 * kk + 1][c] - (c < 2 ? m0 : m1));
+            for (int cc = 0; cc < 4; ++cc) {
+                p[cc] = exp2f(s[2 * kk][cc] - (cc < 2 ? m0 : m1));
+                p[4 + cc] = exp2f(s[2 * kk + 1][cc] - (cc < 2 ? m0 : m1));
             }
             l0 += p[0] + p[1] + p[4] + p[5];
             l1 += p[2] + p[3] + p[6] + p[7];
@@ -396,7 +412,156 @@ extern "C" __global__ void __launch_bounds__(128) fw_attention_mma(u64 q_, u64 k
     #pragma unroll
     for (int dt = 0; dt < 16; ++dt) {
         const int c = dt * 8 + t * 2;
-        if (r0 < sq) *(unsigned*)(out + ((long)r0 * heads + h) * MMA_D + c) = pack_bf16(o[dt][0] * i0, o[dt][1] * i0);
-        if (r1 < sq) *(unsigned*)(out + ((long)r1 * heads + h) * MMA_D + c) = pack_bf16(o[dt][2] * i1, o[dt][3] * i1);
+        float a0 = o[dt][0] * i0, a1 = o[dt][1] * i0, b0 = o[dt][2] * i1, b1 = o[dt][3] * i1;
+        if (mode == 1) {
+            const float* cr = coarse + ((long)h * nb + qt) * MMA_D + c;
+            if (tok0 >= 0) { const bf16_t* gr = gate + ((long)h * sq + tok0) * MMA_D + c; a0 += cr[0] * ld(gr, 0); a1 += cr[1] * ld(gr, 1); }
+            if (tok1 >= 0) { const bf16_t* gr = gate + ((long)h * sq + tok1) * MMA_D + c; b0 += cr[0] * ld(gr, 0); b1 += cr[1] * ld(gr, 1); }
+        }
+        if (tok0 >= 0) *(unsigned*)(out + ((long)tok0 * heads + h) * MMA_D + c) = pack_bf16(a0, a1);
+        if (tok1 >= 0) *(unsigned*)(out + ((long)tok1 * heads + h) * MMA_D + c) = pack_bf16(b0, b1);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) fw_attention_mma(u64 q_, u64 k_, u64 v_, u64 out_, int heads, int sq, int sk, float scale) {
+    __shared__ __align__(16) bf16_t ks[MMA_BK * KS_STRIDE];
+    __shared__ __align__(16) bf16_t vt[MMA_D * VT_STRIDE];
+    __shared__ unsigned char kvalid[MMA_BK];
+    attn_mma_body(0, (const bf16_t*)q_, (const bf16_t*)k_, (const bf16_t*)v_, (bf16_t*)out_, heads, sq, sk, scale,
+                  0, 0, 0, 0, 0, 0, ks, vt, kvalid);
+}
+
+extern "C" __global__ void __launch_bounds__(128) fw_vsa_fine_mma(u64 q_, u64 k_, u64 v_, u64 out_, int heads, int seq, float scale,
+        u64 slot_, u64 sel_, u64 coarse_, u64 gate_, int nb, int topk) {
+    __shared__ __align__(16) bf16_t ks[MMA_BK * KS_STRIDE];
+    __shared__ __align__(16) bf16_t vt[MMA_D * VT_STRIDE];
+    __shared__ unsigned char kvalid[MMA_BK];
+    attn_mma_body(1, (const bf16_t*)q_, (const bf16_t*)k_, (const bf16_t*)v_, (bf16_t*)out_, heads, seq, seq, scale,
+                  (const unsigned*)slot_, (const unsigned*)sel_, (const float*)coarse_, (const bf16_t*)gate_, nb, topk, ks, vt, kvalid);
+}
+
+// VSA tile means (f32 out): block (tile, head), thread c < d.
+extern "C" __global__ void fw_vsa_pool(u64 q_, u64 k_, u64 v_, u64 slot_, u64 bsz_, u64 pooled_, int heads, int seq, int d, int nb) {
+    const bf16_t *q = (const bf16_t*)q_, *k = (const bf16_t*)k_, *v = (const bf16_t*)v_;
+    const unsigned *slot = (const unsigned*)slot_, *bsz = (const unsigned*)bsz_;
+    float* pooled = (float*)pooled_;
+    const int t = blockIdx.x, h = blockIdx.y, c = threadIdx.x;
+    if (c >= d) return;
+    const unsigned n = bsz[t];
+    float sq = 0.f, sk = 0.f, sv = 0.f;
+    for (unsigned i = 0; i < n; ++i) {
+        const long idx = ((long)h * seq + slot[t * 64 + i]) * d + c;
+        sq += ld(q, idx); sk += ld(k, idx); sv += ld(v, idx);
+    }
+    const float inv = 1.0f / (float)(n ? n : 1);
+    const long o = ((long)h * nb + t) * d + c, plane = (long)heads * nb * d;
+    pooled[o] = sq * inv; pooled[plane + o] = sk * inv; pooled[2 * plane + o] = sv * inv;
+}
+
+__device__ __forceinline__ unsigned okey(float x) {
+    const unsigned b = __float_as_uint(x);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// VSA coarse stage: block (query tile, head), 256 threads; nb <= 2048.
+extern "C" __global__ void fw_vsa_coarse(u64 pooled_, u64 coarse_, u64 sel_, int heads, int d, int nb, int topk, float scale) {
+    __shared__ float sc[2048];
+    __shared__ float red[9];
+    __shared__ unsigned cnt;
+    const float* pooled = (const float*)pooled_;
+    float* coarse = (float*)coarse_;
+    unsigned* sel = (unsigned*)sel_;
+    const int qt = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    const long plane = (long)heads * nb * d, qb = ((long)h * nb + qt) * d;
+    float mx = -3.0e38f;
+    for (int kt = tid; kt < nb; kt += 256) {
+        const float* kr = pooled + plane + ((long)h * nb + kt) * d;
+        float dot = 0.f;
+        for (int c = 0; c < d; ++c) dot = fmaf(pooled[qb + c], kr[c], dot);
+        sc[kt] = dot * scale;
+        mx = fmaxf(mx, sc[kt]);
+    }
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((tid & 31) == 0) red[tid >> 5] = mx;
+    __syncthreads();
+    float m = red[0];
+    for (int i = 1; i < 8; ++i) m = fmaxf(m, red[i]);
+    __syncthreads();
+    float z = 0.f;
+    for (int kt = tid; kt < nb; kt += 256) z += __expf(sc[kt] - m);
+    const float zt = block_sum256(z, red);
+    if (tid < d) {
+        float o = 0.f;
+        for (int kt = 0; kt < nb; ++kt) o = fmaf(__expf(sc[kt] - m), pooled[2 * plane + ((long)h * nb + kt) * d + tid], o);
+        coarse[qb + tid] = o / zt;
+    }
+    unsigned t = 0u;
+    for (int bit = 31; bit >= 0; --bit) {
+        const unsigned cand = t | (1u << bit);
+        if (tid == 0) cnt = 0u;
+        __syncthreads();
+        unsigned local = 0u;
+        for (int kt = tid; kt < nb; kt += 256) local += okey(sc[kt]) >= cand;
+        atomicAdd(&cnt, local);
+        __syncthreads();
+        if (cnt >= (unsigned)topk) t = cand;
+        __syncthreads();
+    }
+    if (tid == 0) {
+        unsigned* o = sel + ((long)h * nb + qt) * topk;
+        int n = 0;
+        for (int kt = 0; kt < nb; ++kt) if (okey(sc[kt]) > t) o[n++] = kt;
+        for (int kt = 0; kt < nb && n < topk; ++kt) if (okey(sc[kt]) == t) o[n++] = kt;
+    }
+}
+
+// Scalar VSA fine stage (any d <= 128, any SM): 64 threads = the 64 slots of
+// query tile blockIdx.x; selected tiles streamed through shared memory in
+// halves of 32 keys.
+extern "C" __global__ void fw_vsa_fine(u64 q_, u64 k_, u64 v_, u64 out_, int heads, int seq, int d, float scale,
+        u64 slot_, u64 sel_, u64 coarse_, u64 gate_, int nb, int topk) {
+    __shared__ float kss[32 * 128];
+    __shared__ float vss[32 * 128];
+    __shared__ int ktok[32];
+    const bf16_t *q = (const bf16_t*)q_, *k = (const bf16_t*)k_, *v = (const bf16_t*)v_, *gate = (const bf16_t*)gate_;
+    const unsigned *slot = (const unsigned*)slot_, *sel = (const unsigned*)sel_;
+    const float* coarse = (const float*)coarse_;
+    bf16_t* out = (bf16_t*)out_;
+    const int qt = blockIdx.x, h = blockIdx.y;
+    const unsigned qs = slot[qt * 64 + threadIdx.x];
+    const bool live = qs != 0xffffffffu;
+    float qr[128], acc[128];
+    for (int c = 0; c < d; ++c) { qr[c] = live ? ld(q, ((long)h * seq + qs) * d + c) * scale : 0.f; acc[c] = 0.f; }
+    float m = -1e30f, l = 0.f;
+    for (int ci = 0; ci < topk; ++ci) {
+        const unsigned tile = sel[((long)h * nb + qt) * topk + ci];
+        for (int half = 0; half < 2; ++half) {
+            __syncthreads();
+            if (threadIdx.x < 32) { const unsigned s = slot[tile * 64 + half * 32 + threadIdx.x]; ktok[threadIdx.x] = s == 0xffffffffu ? -1 : (int)s; }
+            __syncthreads();
+            for (int e = threadIdx.x; e < 32 * d; e += 64) {
+                const int j = e / d, c = e % d;
+                const int kt = ktok[j];
+                kss[e] = kt >= 0 ? ld(k, ((long)h * seq + kt) * d + c) : 0.f;
+                vss[e] = kt >= 0 ? ld(v, ((long)h * seq + kt) * d + c) : 0.f;
+            }
+            __syncthreads();
+            if (live) {
+                for (int j = 0; j < 32; ++j) {
+                    if (ktok[j] < 0) continue;
+                    float dot = 0.f;
+                    for (int c = 0; c < d; ++c) dot = fmaf(qr[c], kss[j * d + c], dot);
+                    const float mn = fmaxf(m, dot), corr = __expf(m - mn), p = __expf(dot - mn);
+                    l = l * corr + p;
+                    for (int c = 0; c < d; ++c) acc[c] = acc[c] * corr + p * vss[j * d + c];
+                    m = mn;
+                }
+            }
+        }
+    }
+    if (live) {
+        const float* cr = coarse + ((long)h * nb + qt) * d;
+        for (int c = 0; c < d; ++c)
+            out[((long)qs * heads + h) * d + c] = bf(acc[c] / l + cr[c] * ld(gate, ((long)h * seq + qs) * d + c));
     }
 }
