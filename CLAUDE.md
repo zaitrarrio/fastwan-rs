@@ -21,6 +21,10 @@ State and invariants only; the reasoning is in `docs/design.md`.
   `kernels.cu`). Change both. `fw_` because `norm` collides with a CUDA builtin.
 - Shader change → `python3 web/build.py` (the test page inlines the shaders;
   `web_page_embeds_current_shaders` fails otherwise).
+- WGSL: zero loop-local accumulators explicitly. Dawn (Chrome) on SwiftShader
+  carried a `var` declared in a loop body across iterations, which broke
+  multi-chunk flash attention while naga/wgpu passed. Run the bench page in
+  Chrome as well as `cargo test` after shader changes.
 - WGSL auto layouts drop unused bindings, so every declared binding must be
   statically used (see the guard lines at the end of `conv.wgsl` and
   `elementwise.wgsl`).

@@ -61,7 +61,7 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
   <header>
     <span class="label">fastwan-rs · WebGPU backend</span>
     <h1>FastWan WebGPU Bench</h1>
-    <p class="lede">Runs the WGSL kernels of the fastwan-rs WebGPU backend on this machine's GPU, checks each one against an f32 JavaScript reference, measures throughput at Wan 2.1 1.3B shapes, and estimates how long a 3-step DMD clip would take here.</p>
+    <p class="lede">Runs the WGSL kernels of the fastwan-rs WebGPU backend on this machine's GPU, including video sparse attention (VSA), checks each one against an f32 JavaScript reference, measures throughput at Wan 2.1 1.3B shapes, and estimates how long a 3-step DMD clip would take here.</p>
   </header>
 
   <section class="panel" aria-labelledby="dev-h">
@@ -84,9 +84,9 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
   </section>
 
   <section class="panel" aria-labelledby="est-h">
-    <div class="row"><h2 id="est-h">Clip estimate on this GPU</h2><span class="label">3 DMD steps · 30 layers · dense attention</span></div>
-    <div class="scroll"><table><thead><tr><th>Geometry</th><th class="num">Tokens</th><th class="num">Largest buffer</th><th>Fits binding</th><th class="num">Per step</th><th class="num">Denoise</th></tr></thead><tbody id="est-body"></tbody></table></div>
-    <p class="note">Per-step time is the FLOP count of one DiT forward split into GEMM work (QKV, projections, FFN) and attention work, each divided by the rate measured above. It leaves out the norms, the decoder and dispatch overhead, so treat it as a lower bound. Self-attention grows with tokens², which is why it dominates at 480p and why video sparse attention is the next kernel to write.</p>
+    <div class="row"><h2 id="est-h">Clip estimate on this GPU</h2><span class="label">3 DMD steps · 30 layers · VSA 0.8</span></div>
+    <div class="scroll"><table><thead><tr><th>Geometry</th><th class="num">Tokens</th><th class="num">Largest buffer</th><th>Fits binding</th><th class="num">Per step, VSA</th><th class="num">Denoise, VSA</th><th class="num">Denoise, dense</th></tr></thead><tbody id="est-body"></tbody></table></div>
+    <p class="note">FastWan runs video sparse attention: each 4×4×4 tile of tokens attends to the 20% of tiles its coarse scores rank highest, plus a gated coarse term. Per-step time is the FLOP count of one DiT forward split into GEMM work and attention work, each divided by the rate measured above (VSA's measured at the 480p grid). It leaves out the norms, the decoder and dispatch overhead, so treat it as a lower bound. On an RTX 4090 the native engine measured about 65 s per 480p VSA step through Vulkan.</p>
   </section>
 </div>
 
@@ -98,11 +98,16 @@ const SHADERS = {
  "attention": "// Flash attention: one workgroup = 64 query rows of one head, one thread per\n// row; K/V stream through shared memory {BK} keys at a time with an online\n// softmax, so the [sq, sk] score matrix never exists. Output is written with\n// heads merged ([sq, heads·d]).\nstruct P { heads: u32, sq: u32, sk: u32, d: u32, scale: f32, _a: u32, _b: u32, _c: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> q: array<f32>;\n@group(0) @binding(2) var<storage, read> k: array<f32>;\n@group(0) @binding(3) var<storage, read> v: array<f32>;\n@group(0) @binding(4) var<storage, read_write> out: array<f32>;\n\nconst BK: u32 = {BK}u;\nconst DMAX: u32 = 128u;\nvar<workgroup> ks: array<f32, {BK_D}>;\nvar<workgroup> vs: array<f32, {BK_D}>;\n\n@compute @workgroup_size(64)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {\n    let h = wid.y;\n    let i = wid.x * 64u + lid.x;\n    let live = i < p.sq;\n    let d = p.d;\n    var qr: array<f32, 128>;\n    var acc: array<f32, 128>;\n    if (live) {\n        for (var c = 0u; c < d; c = c + 1u) { qr[c] = q[(h * p.sq + i) * d + c] * p.scale; }\n    }\n    var m = -3.0e38;\n    var l = 0.0;\n    var s: array<f32, {BK}>;\n    for (var j0 = 0u; j0 < p.sk; j0 = j0 + BK) {\n        let nk = min(BK, p.sk - j0);\n        for (var e = lid.x; e < BK * d; e = e + 64u) {\n            let jj = e / d;\n            var kv = 0.0;\n            var vv = 0.0;\n            if (jj < nk) {\n                let g = (h * p.sk + j0 + jj) * d + (e % d);\n                kv = k[g];\n                vv = v[g];\n            }\n            ks[e] = kv;\n            vs[e] = vv;\n        }\n        workgroupBarrier();\n        if (live) {\n            var mt = m;\n            for (var jj = 0u; jj < nk; jj = jj + 1u) {\n                var dot = 0.0;\n                for (var c = 0u; c < d; c = c + 1u) { dot = fma(qr[c], ks[jj * d + c], dot); }\n                s[jj] = dot;\n                mt = max(mt, dot);\n            }\n            let corr = exp(m - mt);\n            l = l * corr;\n            for (var c = 0u; c < d; c = c + 1u) { acc[c] = acc[c] * corr; }\n            for (var jj = 0u; jj < nk; jj = jj + 1u) {\n                let pj = exp(s[jj] - mt);\n                l = l + pj;\n                for (var c = 0u; c < d; c = c + 1u) { acc[c] = fma(pj, vs[jj * d + c], acc[c]); }\n            }\n            m = mt;\n        }\n        workgroupBarrier();\n    }\n    if (live) {\n        let inv = 1.0 / l;\n        for (var c = 0u; c < d; c = c + 1u) { out[(i * p.heads + h) * d + c] = acc[c] * inv; }\n    }\n}\n",
  "norm": "// Row kernels: one 256-thread workgroup per row.\n//   mode 0: out = LN(x)                    (layer_norm)\n//   mode 1: h += a·gate | h += a; out = LN(h)   (residual_norm)\n// then the norm: affine (w, b) or modulated (1 + mods[scale], mods[shift]).\nstruct P { rows: u32, dim: u32, mode: u32, gate: u32, has_gate: u32, affine: u32, scale: u32, shift: u32, eps: f32, _a: u32, _b: u32, _c: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read_write> h: array<f32>;\n@group(0) @binding(2) var<storage, read> a: array<f32>;\n@group(0) @binding(3) var<storage, read> mods: array<f32>;\n@group(0) @binding(4) var<storage, read> nw: array<f32>;\n@group(0) @binding(5) var<storage, read> nb: array<f32>;\n@group(0) @binding(6) var<storage, read_write> out: array<f32>;\n\nvar<workgroup> red: array<f32, 256>;\n\nfn block_sum(v: f32, t: u32) -> f32 {\n    red[t] = v;\n    workgroupBarrier();\n    for (var s = 128u; s > 0u; s = s >> 1u) {\n        if (t < s) { red[t] = red[t] + red[t + s]; }\n        workgroupBarrier();\n    }\n    let r = red[0];\n    workgroupBarrier();\n    return r;\n}\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n    let row = wg_index(wid, nwg);\n    if (row >= p.rows) { return; }\n    let t = lid.x;\n    let base = row * p.dim;\n    var s = 0.0;\n    for (var j = t; j < p.dim; j = j + 256u) {\n        var v = h[base + j];\n        if (p.mode == 1u) {\n            var g = 1.0;\n            if (p.has_gate != 0u) { g = mods[p.gate * p.dim + j]; }\n            v = v + a[base + j] * g;\n            h[base + j] = v;\n        }\n        s = s + v;\n    }\n    let mean = block_sum(s, t) / f32(p.dim);\n    var q = 0.0;\n    for (var j = t; j < p.dim; j = j + 256u) {\n        let dv = h[base + j] - mean;\n        q = q + dv * dv;\n    }\n    let inv = inverseSqrt(block_sum(q, t) / f32(p.dim) + p.eps);\n    for (var j = t; j < p.dim; j = j + 256u) {\n        let n = (h[base + j] - mean) * inv;\n        var o: f32;\n        if (p.affine != 0u) {\n            o = n * nw[j] + nb[j];\n        } else {\n            o = n * (1.0 + mods[p.scale * p.dim + j]) + mods[p.shift * p.dim + j];\n        }\n        out[base + j] = o;\n    }\n}\n",
  "head_split": "// One 256-thread workgroup per token: optional RMS across all heads, optional\n// interleaved-pair RoPE, scatter to [heads, rows, head_dim].\nstruct P { rows: u32, stride: u32, col_off: u32, heads: u32, hd: u32, has_norm: u32, has_rope: u32, _a: u32, eps: f32, _b: u32, _c: u32, _d: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> src: array<f32>;\n@group(0) @binding(2) var<storage, read> nw: array<f32>;\n@group(0) @binding(3) var<storage, read> cs: array<f32>;\n@group(0) @binding(4) var<storage, read> sn: array<f32>;\n@group(0) @binding(5) var<storage, read_write> out: array<f32>;\n\nvar<workgroup> red: array<f32, 256>;\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n    let r = wg_index(wid, nwg);\n    if (r >= p.rows) { return; }\n    let t = lid.x;\n    let width = p.heads * p.hd;\n    let base = r * p.stride + p.col_off;\n    var inv = 1.0;\n    if (p.has_norm != 0u) {\n        var s = 0.0;\n        for (var j = t; j < width; j = j + 256u) { let v = src[base + j]; s = s + v * v; }\n        red[t] = s;\n        workgroupBarrier();\n        for (var k = 128u; k > 0u; k = k >> 1u) {\n            if (t < k) { red[t] = red[t] + red[t + k]; }\n            workgroupBarrier();\n        }\n        inv = inverseSqrt(red[0] / f32(width) + p.eps);\n    }\n    let half = p.hd / 2u;\n    for (var pi = t; pi < width / 2u; pi = pi + 256u) {\n        let j = 2u * pi;\n        let hh = j / p.hd;\n        let c = j % p.hd;\n        var x1 = src[base + j];\n        var x2 = src[base + j + 1u];\n        if (p.has_norm != 0u) {\n            x1 = x1 * inv * nw[j];\n            x2 = x2 * inv * nw[j + 1u];\n        }\n        if (p.has_rope != 0u) {\n            let ti = r * half + c / 2u;\n            let co = cs[ti];\n            let si = sn[ti];\n            let y1 = x1 * co - x2 * si;\n            let y2 = x1 * si + x2 * co;\n            x1 = y1;\n            x2 = y2;\n        }\n        let o = (hh * p.rows + r) * p.hd + c;\n        out[o] = x1;\n        out[o + 1u] = x2;\n    }\n}\n",
- "elementwise": "// Small elementwise kernels, one thread per output element, 256 per group.\n//   op 0 gate_residual: x[i] += y[i] · aux[gate·dim + i % dim]\n//   op 1 dmd_step:      x0 = x − σt·y; x = has_aux ? (1−σn)·x0 + σn·aux : x0\n//   op 2 tanh_clamp:    x = tanh(x / s) · s\n//   op 3 patchify:      x[tok, f] = y[latent]       (gather)\n//   op 4 unpatchify:    x[latent] = y[tok, f]       (gather)\nstruct P { n: u32, op: u32, dim: u32, gate: u32, has_aux: u32, c: u32, t: u32, hh: u32, ww: u32, pp: u32, s0: f32, s1: f32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read_write> x: array<f32>;\n@group(0) @binding(2) var<storage, read> y: array<f32>;\n@group(0) @binding(3) var<storage, read> aux: array<f32>;\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n    let i = wg_index(wid, nwg) * 256u + lid.x;\n    if (i >= p.n) { return; }\n    switch p.op {\n        case 0u: { x[i] = x[i] + y[i] * aux[p.gate * p.dim + i % p.dim]; }\n        case 1u: {\n            let x0 = x[i] - p.s0 * y[i];\n            if (p.has_aux != 0u) { x[i] = (1.0 - p.s1) * x0 + p.s1 * aux[i]; } else { x[i] = x0; }\n        }\n        case 2u: { x[i] = tanh_safe(x[i] / p.s0) * p.s0; }\n        case 3u: {\n            // i = tok·F + f, f = c'·p² + kh·p + kw\n            let f = p.c * p.pp * p.pp;\n            let tok = i / f;\n            let fi = i % f;\n            let cc = fi / (p.pp * p.pp);\n            let kh = (fi / p.pp) % p.pp;\n            let kw = fi % p.pp;\n            let gw = p.ww / p.pp;\n            let gh = p.hh / p.pp;\n            let tt = tok / (gh * gw);\n            let yy = (tok / gw) % gh;\n            let xg = tok % gw;\n            x[i] = y[((cc * p.t + tt) * p.hh + yy * p.pp + kh) * p.ww + xg * p.pp + kw];\n        }\n        default: {\n            // i = ((c'·t + tt)·hh + y)·ww + xx\n            let xx = i % p.ww;\n            let yy = (i / p.ww) % p.hh;\n            let tt = (i / (p.ww * p.hh)) % p.t;\n            let cc = i / (p.ww * p.hh * p.t);\n            let gw = p.ww / p.pp;\n            let gh = p.hh / p.pp;\n            let tok = (tt * gh + yy / p.pp) * gw + xx / p.pp;\n            let f = p.c * p.pp * p.pp;\n            x[i] = y[tok * f + ((yy % p.pp) * p.pp + xx % p.pp) * p.c + cc];\n        }\n    }\n    if (p.op == 9999u) { x[0] = aux[0]; }\n}\n"
+ "elementwise": "// Small elementwise kernels, one thread per output element, 256 per group.\n//   op 0 gate_residual: x[i] += y[i] · aux[gate·dim + i % dim]\n//   op 1 dmd_step:      x0 = x − σt·y; x = has_aux ? (1−σn)·x0 + σn·aux : x0\n//   op 2 tanh_clamp:    x = tanh(x / s) · s\n//   op 3 patchify:      x[tok, f] = y[latent]       (gather)\n//   op 4 unpatchify:    x[latent] = y[tok, f]       (gather)\nstruct P { n: u32, op: u32, dim: u32, gate: u32, has_aux: u32, c: u32, t: u32, hh: u32, ww: u32, pp: u32, s0: f32, s1: f32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read_write> x: array<f32>;\n@group(0) @binding(2) var<storage, read> y: array<f32>;\n@group(0) @binding(3) var<storage, read> aux: array<f32>;\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n    let i = wg_index(wid, nwg) * 256u + lid.x;\n    if (i >= p.n) { return; }\n    switch p.op {\n        case 0u: { x[i] = x[i] + y[i] * aux[p.gate * p.dim + i % p.dim]; }\n        case 1u: {\n            let x0 = x[i] - p.s0 * y[i];\n            if (p.has_aux != 0u) { x[i] = (1.0 - p.s1) * x0 + p.s1 * aux[i]; } else { x[i] = x0; }\n        }\n        case 2u: { x[i] = tanh_safe(x[i] / p.s0) * p.s0; }\n        case 3u: {\n            // i = tok·F + f, f = c'·p² + kh·p + kw\n            let f = p.c * p.pp * p.pp;\n            let tok = i / f;\n            let fi = i % f;\n            let cc = fi / (p.pp * p.pp);\n            let kh = (fi / p.pp) % p.pp;\n            let kw = fi % p.pp;\n            let gw = p.ww / p.pp;\n            let gh = p.hh / p.pp;\n            let tt = tok / (gh * gw);\n            let yy = (tok / gw) % gh;\n            let xg = tok % gw;\n            x[i] = y[((cc * p.t + tt) * p.hh + yy * p.pp + kh) * p.ww + xg * p.pp + kw];\n        }\n        default: {\n            // i = ((c'·t + tt)·hh + y)·ww + xx\n            let xx = i % p.ww;\n            let yy = (i / p.ww) % p.hh;\n            let tt = (i / (p.ww * p.hh)) % p.t;\n            let cc = i / (p.ww * p.hh * p.t);\n            let gw = p.ww / p.pp;\n            let gh = p.hh / p.pp;\n            let tok = (tt * gh + yy / p.pp) * gw + xx / p.pp;\n            let f = p.c * p.pp * p.pp;\n            x[i] = y[tok * f + ((yy % p.pp) * p.pp + xx % p.pp) * p.c + cc];\n        }\n    }\n    if (p.op == 9999u) { x[0] = aux[0]; }\n}\n",
+ "flash": "// Register-tiled flash attention, for dense attention and the VSA fine stage.\n//\n// One workgroup = 64 query rows of one head, 256 threads as 16×16. Each key\n// chunk of 64:\n//   S = Q·Kᵀ    like the linear kernel: d in steps of 16 through shared memory,\n//               each thread a 4×4 block of S in registers (rows ty+16i, cols tx+16j);\n//   softmax     online, base 2, one thread per row over the 64×64 tile in shared memory;\n//   O += P·V    each thread owns 4 rows × d/16 columns of O in registers.\n// Nothing lives in per-thread arrays larger than 32 floats, which is what the\n// one-row-per-thread kernel got wrong (its q/acc arrays of 128 spill).\n//\n// mode 0 dense: query rows wid.x·64 + r, key chunks of consecutive rows.\n// mode 1 VSA:   query tile wid.x (slots via `slot`), key chunk c = selected tile\n//               sel[h][qt][c]; out = O/l + coarse[h][qt] · gate[h][token].\nstruct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> q: array<f32>;\n@group(0) @binding(2) var<storage, read> k: array<f32>;\n@group(0) @binding(3) var<storage, read> v: array<f32>;\n@group(0) @binding(4) var<storage, read_write> out: array<f32>;\n@group(0) @binding(5) var<storage, read> slot: array<u32>;\n@group(0) @binding(6) var<storage, read> sel: array<u32>;\n@group(0) @binding(7) var<storage, read> coarse: array<f32>;\n@group(0) @binding(8) var<storage, read> gate: array<f32>;\n\nconst PAD: u32 = 0xffffffffu;\nconst SS: u32 = 65u;   // padded row stride of the S/P tile\n\nvar<workgroup> buf: array<f32, 2048>;     // Q|K panels (2×16×64) or a V panel (16×128)\nvar<workgroup> ss: array<f32, 4160>;      // 64 × 65\nvar<workgroup> rowm: array<f32, 64>;\nvar<workgroup> rowl: array<f32, 64>;\nvar<workgroup> rowc: array<f32, 64>;\nvar<workgroup> qrows: array<u32, 64>;     // token of each query row (PAD if none)\nvar<workgroup> krows: array<u32, 64>;     // token of each key row in this chunk\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wid: vec3<u32>) {\n    let tx = tid % 16u;\n    let ty = tid / 16u;\n    let h = wid.y;\n    let qt = wid.x;\n    let d = p.d;\n    let nd = d / 16u;\n    if (tid < 64u) {\n        var tok = PAD;\n        if (p.mode == 0u) {\n            let r = qt * 64u + tid;\n            if (r < p.sq) { tok = r; }\n        } else {\n            tok = slot[qt * 64u + tid];\n        }\n        qrows[tid] = tok;\n        rowm[tid] = -1e30;\n        rowl[tid] = 0.0;\n    }\n    var acc: array<array<f32, 8>, 4>;\n    var nchunks = (p.sk + 63u) / 64u;\n    if (p.mode == 1u) { nchunks = p.topk; }\n    workgroupBarrier();\n\n    for (var c = 0u; c < nchunks; c = c + 1u) {\n        if (tid < 64u) {\n            var tok = PAD;\n            if (p.mode == 0u) {\n                let r = c * 64u + tid;\n                if (r < p.sk) { tok = r; }\n            } else {\n                let tile = sel[(h * p.nb + qt) * p.topk + c];\n                tok = slot[tile * 64u + tid];\n            }\n            krows[tid] = tok;\n        }\n        workgroupBarrier();\n        // S = Q·Kᵀ over d in panels of 16. Zeroed explicitly: a `var` in a\n        // loop body is re-initialised per iteration by the spec, but Dawn on\n        // SwiftShader carried it over, summing S across key chunks.\n        var s: array<array<f32, 4>, 4>;\n        for (var i = 0u; i < 4u; i = i + 1u) {\n            for (var j = 0u; j < 4u; j = j + 1u) { s[i][j] = 0.0; }\n        }\n        for (var d0 = 0u; d0 < d; d0 = d0 + 16u) {\n            for (var e = tid; e < 1024u; e = e + 256u) {\n                let r = e / 16u;\n                let kk = e % 16u;\n                let qtok = qrows[r];\n                var qv = 0.0;\n                if (qtok != PAD) { qv = q[(h * p.sq + qtok) * d + d0 + kk]; }\n                buf[kk * 64u + r] = qv;\n                let ktok = krows[r];\n                var kv = 0.0;\n                if (ktok != PAD) { kv = k[(h * p.sk + ktok) * d + d0 + kk]; }\n                buf[1024u + kk * 64u + r] = kv;\n            }\n            workgroupBarrier();\n            for (var kk = 0u; kk < 16u; kk = kk + 1u) {\n                var a: array<f32, 4>;\n                var b: array<f32, 4>;\n                for (var i = 0u; i < 4u; i = i + 1u) {\n                    a[i] = buf[kk * 64u + ty + 16u * i];\n                    b[i] = buf[1024u + kk * 64u + tx + 16u * i];\n                }\n                for (var i = 0u; i < 4u; i = i + 1u) {\n                    for (var j = 0u; j < 4u; j = j + 1u) { s[i][j] = fma(a[i], b[j], s[i][j]); }\n                }\n            }\n            workgroupBarrier();\n        }\n        for (var i = 0u; i < 4u; i = i + 1u) {\n            for (var j = 0u; j < 4u; j = j + 1u) {\n                let col = tx + 16u * j;\n                var val = -1e30;\n                if (krows[col] != PAD) { val = s[i][j] * p.scale_log2; }\n                ss[(ty + 16u * i) * SS + col] = val;\n            }\n        }\n        workgroupBarrier();\n        // Online softmax, one thread per row.\n        if (tid < 64u) {\n            let base = tid * SS;\n            var mx = rowm[tid];\n            for (var j = 0u; j < 64u; j = j + 1u) { mx = max(mx, ss[base + j]); }\n            let corr = exp2(rowm[tid] - mx);\n            var sum = 0.0;\n            for (var j = 0u; j < 64u; j = j + 1u) {\n                let e = exp2(ss[base + j] - mx);\n                ss[base + j] = e;\n                sum = sum + e;\n            }\n            rowl[tid] = rowl[tid] * corr + sum;\n            rowm[tid] = mx;\n            rowc[tid] = corr;\n        }\n        workgroupBarrier();\n        for (var i = 0u; i < 4u; i = i + 1u) {\n            let corr = rowc[ty + 16u * i];\n            for (var j = 0u; j < 8u; j = j + 1u) { acc[i][j] = acc[i][j] * corr; }\n        }\n        // O += P·V, keys in panels of 16.\n        for (var k0 = 0u; k0 < 64u; k0 = k0 + 16u) {\n            for (var e = tid; e < 16u * d; e = e + 256u) {\n                let kk = e / d;\n                let col = e % d;\n                let ktok = krows[k0 + kk];\n                var vv = 0.0;\n                if (ktok != PAD) { vv = v[(h * p.sk + ktok) * d + col]; }\n                buf[kk * 128u + col] = vv;\n            }\n            workgroupBarrier();\n            for (var kk = 0u; kk < 16u; kk = kk + 1u) {\n                var pr: array<f32, 4>;\n                for (var i = 0u; i < 4u; i = i + 1u) { pr[i] = ss[(ty + 16u * i) * SS + k0 + kk]; }\n                for (var j = 0u; j < nd; j = j + 1u) {\n                    let vb = buf[kk * 128u + tx + 16u * j];\n                    for (var i = 0u; i < 4u; i = i + 1u) { acc[i][j] = fma(pr[i], vb, acc[i][j]); }\n                }\n            }\n            workgroupBarrier();\n        }\n    }\n    for (var i = 0u; i < 4u; i = i + 1u) {\n        let r = ty + 16u * i;\n        let tok = qrows[r];\n        if (tok == PAD) { continue; }\n        let inv = 1.0 / rowl[r];\n        for (var j = 0u; j < nd; j = j + 1u) {\n            let col = tx + 16u * j;\n            var o = acc[i][j] * inv;\n            if (p.mode == 1u) {\n                o = o + coarse[(h * p.nb + qt) * d + col] * gate[(h * p.sq + tok) * d + col];\n            }\n            out[(tok * p.heads + h) * d + col] = o;\n        }\n    }\n}\n",
+ "vsa_pool": "// VSA tile means: one workgroup per (tile, head); thread c < d averages\n// column c of q, k, v over the tile's real tokens.\nstruct P { heads: u32, seq: u32, d: u32, nb: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> q: array<f32>;\n@group(0) @binding(2) var<storage, read> k: array<f32>;\n@group(0) @binding(3) var<storage, read> v: array<f32>;\n@group(0) @binding(4) var<storage, read> slot: array<u32>;\n@group(0) @binding(5) var<storage, read> bsz: array<u32>;\n@group(0) @binding(6) var<storage, read_write> pooled: array<f32>;   // [3][heads][nb][d]\n\n@compute @workgroup_size(128)\nfn main(@builtin(local_invocation_index) c: u32, @builtin(workgroup_id) wid: vec3<u32>) {\n    let t = wid.x;\n    let h = wid.y;\n    if (c >= p.d) { return; }\n    let n = bsz[t];\n    var sq = 0.0;\n    var sk = 0.0;\n    var sv = 0.0;\n    for (var i = 0u; i < n; i = i + 1u) {\n        let idx = (h * p.seq + slot[t * 64u + i]) * p.d + c;\n        sq = sq + q[idx];\n        sk = sk + k[idx];\n        sv = sv + v[idx];\n    }\n    let inv = 1.0 / f32(max(n, 1u));\n    let o = (h * p.nb + t) * p.d + c;\n    let plane = p.heads * p.nb * p.d;\n    pooled[o] = sq * inv;\n    pooled[plane + o] = sk * inv;\n    pooled[2u * plane + o] = sv * inv;\n}\n",
+ "vsa_coarse": "// VSA coarse stage: one workgroup per (query tile, head).\n//   scores over all key tiles (mean q · mean k · scale), softmax,\n//   coarse[h][qt] = Σ p · mean v, and the top-k key tiles: every tile whose\n//   score is above the k-th largest, then ties at it by lower index — the same\n//   set as sorting by (score desc, index asc).\nstruct P { heads: u32, d: u32, nb: u32, topk: u32, scale: f32, _a: u32, _b: u32, _c: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> pooled: array<f32>;\n@group(0) @binding(2) var<storage, read_write> coarse: array<f32>;\n@group(0) @binding(3) var<storage, read_write> sel: array<u32>;\n\nvar<workgroup> sc: array<f32, 2048>;\nvar<workgroup> red: array<f32, 256>;\nvar<workgroup> cnt: atomic<u32>;\nvar<workgroup> thr: u32;\n\n// Float → u32 with the same order.\nfn okey(x: f32) -> u32 {\n    let b = bitcast<u32>(x);\n    return select(b | 0x80000000u, ~b, (b & 0x80000000u) != 0u);\n}\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wid: vec3<u32>) {\n    let qt = wid.x;\n    let h = wid.y;\n    let plane = p.heads * p.nb * p.d;\n    let qb = (h * p.nb + qt) * p.d;\n    var mx = -3.0e38;\n    for (var kt = tid; kt < p.nb; kt = kt + 256u) {\n        let kb = plane + (h * p.nb + kt) * p.d;\n        var dot = 0.0;\n        for (var c = 0u; c < p.d; c = c + 1u) { dot = fma(pooled[qb + c], pooled[kb + c], dot); }\n        let s = dot * p.scale;\n        sc[kt] = s;\n        mx = max(mx, s);\n    }\n    red[tid] = mx;\n    workgroupBarrier();\n    for (var st = 128u; st > 0u; st = st >> 1u) {\n        if (tid < st) { red[tid] = max(red[tid], red[tid + st]); }\n        workgroupBarrier();\n    }\n    let m = red[0];\n    workgroupBarrier();\n    var z = 0.0;\n    for (var kt = tid; kt < p.nb; kt = kt + 256u) { z = z + exp(sc[kt] - m); }\n    red[tid] = z;\n    workgroupBarrier();\n    for (var st = 128u; st > 0u; st = st >> 1u) {\n        if (tid < st) { red[tid] = red[tid] + red[tid + st]; }\n        workgroupBarrier();\n    }\n    let zt = red[0];\n    if (tid < p.d) {\n        var o = 0.0;\n        for (var kt = 0u; kt < p.nb; kt = kt + 1u) {\n            o = fma(exp(sc[kt] - m), pooled[2u * plane + (h * p.nb + kt) * p.d + tid], o);\n        }\n        coarse[qb + tid] = o / zt;\n    }\n    // Largest key T with count(key >= T) >= topk, bit by bit from the top.\n    var t = 0u;\n    for (var bit = 31i; bit >= 0i; bit = bit - 1i) {\n        let cand = t | (1u << u32(bit));\n        if (tid == 0u) { atomicStore(&cnt, 0u); }\n        workgroupBarrier();\n        var local = 0u;\n        for (var kt = tid; kt < p.nb; kt = kt + 256u) { if (okey(sc[kt]) >= cand) { local = local + 1u; } }\n        atomicAdd(&cnt, local);\n        workgroupBarrier();\n        if (atomicLoad(&cnt) >= p.topk) { t = cand; }\n        workgroupBarrier();\n    }\n    if (tid == 0u) {\n        let out0 = (h * p.nb + qt) * p.topk;\n        var n = 0u;\n        for (var kt = 0u; kt < p.nb; kt = kt + 1u) { if (okey(sc[kt]) > t) { sel[out0 + n] = kt; n = n + 1u; } }\n        for (var kt = 0u; kt < p.nb && n < p.topk; kt = kt + 1u) { if (okey(sc[kt]) == t) { sel[out0 + n] = kt; n = n + 1u; } }\n    }\n}\n"
 };
 const $ = (id) => document.getElementById(id);
 const MAX_DIM = 65535;
-let device, adapter, dummy, attnBK = 16;
+let device, adapter, dummy, attnBK = 16, flashOK = false;
+// Shared memory flash.wgsl declares: Q|K panel, S tile, row state.
+const FLASH_SHARED = 2048 * 4 + 4160 * 4 + 5 * 64 * 4;
 const pipes = new Map();
 
 // ---- f16 packing (round to nearest) ------------------------------------
@@ -181,7 +186,24 @@ const GPU = {
     const p = pipeline("head_split", () => SHADERS.head_split);
     dispatch(p, [rows, stride, col, heads, hd, w ? 1 : 0, rope ? 1 : 0, 0, { f: eps }], [src, w ?? dummy, rope?.[0] ?? dummy, rope?.[1] ?? dummy, out], grid(rows));
   },
+  flash(mode, q, k, v, out, heads, sq, sk, d, scale, st, gate) {
+    const p = pipeline("flash", () => SHADERS.flash);
+    dispatch(p, [heads, sq, sk, d, { f: scale * Math.LOG2E }, mode, st ? st.nb : 0, st ? st.topk : 0],
+      [q, k, v, out, st ? st.slot : dummy, st ? st.sel : dummy, st ? st.coarse : dummy, gate ?? dummy],
+      [mode === 0 ? Math.ceil(sq / 64) : st.nb, heads, 1]);
+  },
+  vsaPrepare(spec) {
+    const { plan, heads, d, topk } = spec, nb = plan.bsz.length;
+    return { nb, topk, heads, d, seq: plan.seq, scale: spec.scale, slot: upload(plan.slot), bsz: upload(plan.bsz),
+             pooled: alloc(3 * heads * nb * d), coarse: alloc(heads * nb * d), sel: upload(new Uint32Array(heads * nb * topk)) };
+  },
+  vsa(q, k, v, gate, st, out) {
+    dispatch(pipeline("vsa_pool", () => SHADERS.vsa_pool), [st.heads, st.seq, st.d, st.nb], [q, k, v, st.slot, st.bsz, st.pooled], [st.nb, st.heads, 1]);
+    dispatch(pipeline("vsa_coarse", () => SHADERS.vsa_coarse), [st.heads, st.d, st.nb, st.topk, { f: st.scale }], [st.pooled, st.coarse, st.sel], [st.nb, st.heads, 1]);
+    GPU.flash(1, q, k, v, out, st.heads, st.seq, st.seq, st.d, st.scale, st, gate);
+  },
   attention(q, k, v, heads, sq, sk, d, out) {
+    if (flashOK && d % 16 === 0) return GPU.flash(0, q, k, v, out, heads, sq, sk, d, 1 / Math.sqrt(d), null, null);
     const p = pipeline("attention" + attnBK, () => SHADERS.attention.replaceAll("{BK_D}", String(attnBK * 128)).replaceAll("{BK}", String(attnBK)));
     dispatch(p, [heads, sq, sk, d, { f: 1 / Math.sqrt(d) }], [q, k, v, out], [Math.ceil(sq / 64), heads, 1]);
   },
@@ -197,6 +219,24 @@ const GPU = {
       [a, b ?? dummy, w.buf, bias ?? dummy, res ?? dummy, out], [Math.ceil(s.cout / 64), gy, gz]);
   },
 };
+
+// ---- VSA geometry (mirrors fastwan-core::vsa) -------------------------------
+const PAD = 0xffffffff;
+function tilePlan([t, h, w]) {
+  const tiles = [Math.ceil(t / 4), Math.ceil(h / 4), Math.ceil(w / 4)], nb = tiles[0] * tiles[1] * tiles[2];
+  const slot = new Uint32Array(nb * 64).fill(PAD), bsz = new Uint32Array(nb);
+  let tile = 0;
+  for (let tt = 0; tt < tiles[0]; tt++) for (let hh = 0; hh < tiles[1]; hh++) for (let ww = 0; ww < tiles[2]; ww++, tile++) {
+    let s = tile * 64;
+    for (let z = tt * 4; z < Math.min(t, tt * 4 + 4); z++) for (let y = hh * 4; y < Math.min(h, hh * 4 + 4); y++) for (let x = ww * 4; x < Math.min(w, ww * 4 + 4); x++) slot[s++] = (z * h + y) * w + x;
+    bsz[tile] = s - tile * 64;
+  }
+  return { slot, bsz, seq: t * h * w };
+}
+function vsaSpec(grid, heads, d, sparsity) {
+  const plan = tilePlan(grid), nb = plan.bsz.length;
+  return { plan, heads, d, scale: 1 / Math.sqrt(d), topk: Math.min(nb, Math.max(1, Math.ceil((1 - sparsity) * nb))) };
+}
 
 // ---- f32 reference (mirrors fastwan-cpu) -----------------------------------
 const gelu = (x) => 0.5 * x * (1 + Math.tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
@@ -234,6 +274,41 @@ const REF = {
       let den = 0; for (let j = 0; j < sk; j++) { p[j] = Math.exp(p[j] - mx); den += p[j]; }
       for (let c = 0; c < d; c++) { let a = 0; for (let j = 0; j < sk; j++) a += p[j] * v[(h * sk + j) * d + c]; out[(i * heads + h) * d + c] = a / den; }
     } return out;
+  },
+  // fastvideo-rs's VSA host oracle: tile means, coarse attention + top-k
+  // (score desc, index asc), fine attention in the picked tiles, + coarse·gate.
+  vsa(q, k, v, gate, { plan, heads, d, scale, topk }) {
+    const { slot, bsz, seq } = plan, nb = bsz.length, out = new Float32Array(seq * heads * d);
+    for (let h = 0; h < heads; h++) {
+      const m = [q, k, v].map(() => new Float64Array(nb * d));
+      for (let t = 0; t < nb; t++) {
+        for (let i = 0; i < bsz[t]; i++) { const tok = slot[t * 64 + i]; [q, k, v].forEach((src, j) => { for (let c = 0; c < d; c++) m[j][t * d + c] += src[(h * seq + tok) * d + c]; }); }
+        for (const mm of m) for (let c = 0; c < d; c++) mm[t * d + c] /= bsz[t];
+      }
+      for (let qt = 0; qt < nb; qt++) {
+        const sc = new Float64Array(nb);
+        for (let kt = 0; kt < nb; kt++) { let s = 0; for (let c = 0; c < d; c++) s += Math.fround(m[0][qt * d + c]) * Math.fround(m[1][kt * d + c]); sc[kt] = Math.fround(s * scale); }
+        let mx = -Infinity; for (const x of sc) mx = Math.max(mx, x);
+        let z = 0; const e = sc.map((x) => { const y = Math.exp(x - mx); z += y; return y; });
+        const coarse = new Float64Array(d);
+        for (let kt = 0; kt < nb; kt++) for (let c = 0; c < d; c++) coarse[c] += e[kt] / z * Math.fround(m[2][kt * d + c]);
+        const picks = Array.from({ length: nb }, (_, i) => i).sort((a, b) => sc[b] - sc[a] || a - b).slice(0, topk);
+        for (let qs = 0; qs < bsz[qt]; qs++) {
+          const qtok = slot[qt * 64 + qs], acc = new Float64Array(d);
+          let mm = -Infinity, zz = 0;
+          for (const kt of picks) for (let ks = 0; ks < bsz[kt]; ks++) {
+            const ktok = slot[kt * 64 + ks];
+            let s = 0; for (let c = 0; c < d; c++) s += q[(h * seq + qtok) * d + c] * k[(h * seq + ktok) * d + c];
+            s *= scale;
+            if (s > mm) { const shrink = isFinite(mm) ? Math.exp(mm - s) : 0; zz *= shrink; for (let c = 0; c < d; c++) acc[c] *= shrink; mm = s; }
+            const w = Math.exp(s - mm); zz += w;
+            for (let c = 0; c < d; c++) acc[c] += w * v[(h * seq + ktok) * d + c];
+          }
+          for (let c = 0; c < d; c++) out[(qtok * heads + h) * d + c] = coarse[c] * gate[(h * seq + qtok) * d + c] + acc[c] / zz;
+        }
+      }
+    }
+    return out;
   },
   conv(a, b, s, w, bias, ep, res) {
     const up = s.up ? 2 : 1, oh = s.h * up, ow = s.w * up, cin = s.cinA + s.cinB, pad = s.k >> 1;
@@ -297,6 +372,15 @@ function cases() {
       const q = normal(heads * sq * d), k = normal(heads * sk * d), v = normal(heads * sk * d), go = alloc(sq * heads * d);
       GPU.attention(upload(q), upload(k), upload(v), heads, sq, sk, d, go);
       return [await download(go, sq * heads * d), REF.attention(q, k, v, heads, sq, sk, d)];
+    }});
+  }
+  for (const [grid, heads, d, sp] of [[[5, 6, 9], 2, 128, 0.75], [[4, 8, 8], 3, 16, 0.5], [[9, 5, 7], 1, 64, 0.8]]) {
+    const spec = vsaSpec(grid, heads, d, sp);
+    out.push({ kernel: "vsa", label: `grid ${grid.join("×")}, ${heads} heads, d ${d}, top ${spec.topk}/${spec.plan.bsz.length} tiles`, run: async () => {
+      if (!flashOK) throw new Error("adapter shared memory too small for the flash kernel");
+      const n = heads * spec.plan.seq * d, [q, k, v, g] = [normal(n), normal(n), normal(n), normal(n)], go = alloc(n);
+      GPU.vsa(upload(q), upload(k), upload(v), upload(g), GPU.vsaPrepare(spec), go);
+      return [await download(go, n), REF.vsa(q, k, v, g, spec)];
     }});
   }
   out.push({ kernel: "patchify", label: "3×2×6×10, p 2", run: async () => {
@@ -377,13 +461,27 @@ async function runBench() {
     }
     RATES.gemm = gemm.reduce((a, [f]) => a + f, 0) / gemm.reduce((a, [, t]) => a + t, 0);
     const att = [];
-    for (const [name, sq, sk] of Q ? [["attention · self", 512, 512], ["attention · cross", 512, 512]] : [["attention · self", 4096, 4096], ["attention · cross", 8192, 512]]) {
+    for (const [name, sq, sk] of Q ? [["attention · dense self", 512, 512], ["attention · cross", 512, 512]] : [["attention · dense self", 4096, 4096], ["attention · cross", 8192, 512]]) {
       const H = 12, hd = 128, q = alloc(H * sq * hd), k = alloc(H * sk * hd), v = alloc(H * sk * hd), o = alloc(sq * H * hd);
       const tr = row(name, `${H} heads, ${sq}×${sk}, d 128`);
       const ms = await timeIt(() => GPU.attention(q, k, v, H, sq, sk, hd, o), 3);
       fill(tr, ms, 4 * sq * sk * hd * H); if (name.includes("self")) att.push([4 * sq * sk * hd * H, ms]);
     }
     RATES.attn = att[0][0] / att[0][1];
+    if (flashOK) {
+      // VSA at the 480p grid (21×30×52 tokens, 624 tiles, top 125), or fewer
+      // frames if this adapter's binding limit cannot hold a full q/k/v.
+      const H = 12, hd = 128, lim = device.limits.maxStorageBufferBindingSize;
+      let t = Q ? 5 : 21;
+      while (t > 1 && H * t * 30 * 52 * hd * 4 > lim) t -= 4;
+      const spec = vsaSpec(Q ? [5, 8, 13] : [t, 30, 52], H, hd, 0.8), S = spec.plan.seq, n = H * S * hd;
+      const [q, k, v, g, o] = [alloc(n), alloc(n), alloc(n), alloc(n), alloc(n)], st = GPU.vsaPrepare(spec);
+      const tr = row("attention · VSA 0.8", `${H} heads, ${S.toLocaleString()} tokens, ${spec.topk}/${spec.plan.bsz.length} tiles, d 128`);
+      const ms = await timeIt(() => GPU.vsa(q, k, v, g, st, o), 3);
+      const flops = 4 * S * spec.topk * 64 * hd * H;
+      fill(tr, ms, flops);
+      RATES.vsa = flops / ms;
+    }
     {
       const [hh, ww] = Q ? [30, 52] : [240, 416];
       const s = { frames: 1, cinA: 64, cinB: 0, cout: 64, h: hh, w: ww, up: true, k: 3 };
@@ -411,11 +509,16 @@ function renderEstimate() {
     const gemmF = L * 2 * S * (6 * d * d + 2 * d * f), attnF = L * (4 * S * S * d + 4 * S * text * d);
     const largest = Math.max(S * 3 * d, S * f) * 4; // f32: fused QKV or the unchunked FFN hidden
     const fits = largest <= lim;
-    const step = RATES.gemm ? gemmF / RATES.gemm / 1e3 + attnF / RATES.attn / 1e3 : null;
+    const dense = RATES.gemm ? gemmF / RATES.gemm / 1e3 + attnF / RATES.attn / 1e3 : null;
+    // VSA: each tile attends to ceil(20% of tiles) tiles of 64 tokens; cross attention stays dense.
+    const nb = Math.ceil(((fr - 1) / 4 + 1) / 4) * Math.ceil(h / 64) * Math.ceil(w / 64), topk = Math.ceil(0.2 * nb);
+    const vsaF = L * 4 * S * topk * 64 * d, crossF = L * 4 * S * text * d;
+    const step = RATES.gemm && RATES.vsa ? gemmF / RATES.gemm / 1e3 + vsaF / RATES.vsa / 1e3 + crossF / RATES.attn / 1e3 : null;
     const tr = document.createElement("tr");
     tr.innerHTML = `<td>${w}×${h}×${fr} <span class="note">${note}</span></td><td class="num">${S.toLocaleString()}</td><td class="num">${(largest / 2 ** 20).toFixed(0)} MiB</td>`
       + `<td><span class="pill ${fits ? "ok" : "bad"}">${fits ? "yes" : "chunk FFN"}</span></td>`
-      + `<td class="num">${step == null ? "run benchmarks" : dur(step)}</td><td class="num">${step == null ? "–" : dur(3 * step)}</td>`;
+      + `<td class="num">${step == null ? "run benchmarks" : dur(step)}</td><td class="num">${step == null ? "–" : dur(3 * step)}</td>`
+      + `<td class="num">${dense == null ? "–" : dur(3 * dense)}</td>`;
     body.append(tr);
   }
 }
@@ -438,13 +541,14 @@ async function boot() {
     device = await adapter.requestDevice({ requiredLimits });
     device.lost.then((i) => { $("dev-state").className = "pill bad"; $("dev-state").textContent = "device lost"; $("dev-err").hidden = false; $("dev-err").textContent = i.message; });
     attnBK = device.limits.maxComputeWorkgroupStorageSize >= 32768 ? 32 : 16;
+    flashOK = device.limits.maxComputeWorkgroupStorageSize >= FLASH_SHARED;
     dummy = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
     const info = adapter.info ?? {};
     kv("Vendor", info.vendor || "unknown"); kv("Architecture", info.architecture || "unknown");
     kv("Device", info.description || info.device || "not exposed by the browser");
     kv("Max binding", (device.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0) + " MiB");
     kv("Max buffer", (device.limits.maxBufferSize / 2 ** 20).toFixed(0) + " MiB");
-    kv("Workgroup memory", (device.limits.maxComputeWorkgroupStorageSize / 1024) + " KiB → attention tile " + attnBK + " keys");
+    kv("Workgroup memory", (device.limits.maxComputeWorkgroupStorageSize / 1024) + " KiB → " + (flashOK ? "flash attention + VSA" : "fallback attention, no VSA (needs " + Math.ceil(FLASH_SHARED / 1024) + " KiB)"));
     $("dev-state").className = "pill ok"; $("dev-state").textContent = "ready";
     renderEstimate();
     $("bench-run").disabled = false;

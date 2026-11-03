@@ -72,8 +72,13 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wid: v
             krows[tid] = tok;
         }
         workgroupBarrier();
-        // S = Q·Kᵀ over d in panels of 16.
+        // S = Q·Kᵀ over d in panels of 16. Zeroed explicitly: a `var` in a
+        // loop body is re-initialised per iteration by the spec, but Dawn on
+        // SwiftShader carried it over, summing S across key chunks.
         var s: array<array<f32, 4>, 4>;
+        for (var i = 0u; i < 4u; i = i + 1u) {
+            for (var j = 0u; j < 4u; j = j + 1u) { s[i][j] = 0.0; }
+        }
         for (var d0 = 0u; d0 < d; d0 = d0 + 16u) {
             for (var e = tid; e < 1024u; e = e + 256u) {
                 let r = e / 16u;

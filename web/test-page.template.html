@@ -54,7 +54,7 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
   <header>
     <span class="label">fastwan-rs · WebGPU backend</span>
     <h1>FastWan WebGPU Bench</h1>
-    <p class="lede">Runs the WGSL kernels of the fastwan-rs WebGPU backend on this machine's GPU, checks each one against an f32 JavaScript reference, measures throughput at Wan 2.1 1.3B shapes, and estimates how long a 3-step DMD clip would take here.</p>
+    <p class="lede">Runs the WGSL kernels of the fastwan-rs WebGPU backend on this machine's GPU, including video sparse attention (VSA), checks each one against an f32 JavaScript reference, measures throughput at Wan 2.1 1.3B shapes, and estimates how long a 3-step DMD clip would take here.</p>
   </header>
 
   <section class="panel" aria-labelledby="dev-h">
@@ -77,9 +77,9 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
   </section>
 
   <section class="panel" aria-labelledby="est-h">
-    <div class="row"><h2 id="est-h">Clip estimate on this GPU</h2><span class="label">3 DMD steps · 30 layers · dense attention</span></div>
-    <div class="scroll"><table><thead><tr><th>Geometry</th><th class="num">Tokens</th><th class="num">Largest buffer</th><th>Fits binding</th><th class="num">Per step</th><th class="num">Denoise</th></tr></thead><tbody id="est-body"></tbody></table></div>
-    <p class="note">Per-step time is the FLOP count of one DiT forward split into GEMM work (QKV, projections, FFN) and attention work, each divided by the rate measured above. It leaves out the norms, the decoder and dispatch overhead, so treat it as a lower bound. Self-attention grows with tokens², which is why it dominates at 480p and why video sparse attention is the next kernel to write.</p>
+    <div class="row"><h2 id="est-h">Clip estimate on this GPU</h2><span class="label">3 DMD steps · 30 layers · VSA 0.8</span></div>
+    <div class="scroll"><table><thead><tr><th>Geometry</th><th class="num">Tokens</th><th class="num">Largest buffer</th><th>Fits binding</th><th class="num">Per step, VSA</th><th class="num">Denoise, VSA</th><th class="num">Denoise, dense</th></tr></thead><tbody id="est-body"></tbody></table></div>
+    <p class="note">FastWan runs video sparse attention: each 4×4×4 tile of tokens attends to the 20% of tiles its coarse scores rank highest, plus a gated coarse term. Per-step time is the FLOP count of one DiT forward split into GEMM work and attention work, each divided by the rate measured above (VSA's measured at the 480p grid). It leaves out the norms, the decoder and dispatch overhead, so treat it as a lower bound. On an RTX 4090 the native engine measured about 65 s per 480p VSA step through Vulkan.</p>
   </section>
 </div>
 
@@ -87,7 +87,9 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
 const SHADERS = /*SHADERS*/{};
 const $ = (id) => document.getElementById(id);
 const MAX_DIM = 65535;
-let device, adapter, dummy, attnBK = 16;
+let device, adapter, dummy, attnBK = 16, flashOK = false;
+// Shared memory flash.wgsl declares: Q|K panel, S tile, row state.
+const FLASH_SHARED = 2048 * 4 + 4160 * 4 + 5 * 64 * 4;
 const pipes = new Map();
 
 // ---- f16 packing (round to nearest) ------------------------------------
@@ -166,7 +168,24 @@ const GPU = {
     const p = pipeline("head_split", () => SHADERS.head_split);
     dispatch(p, [rows, stride, col, heads, hd, w ? 1 : 0, rope ? 1 : 0, 0, { f: eps }], [src, w ?? dummy, rope?.[0] ?? dummy, rope?.[1] ?? dummy, out], grid(rows));
   },
+  flash(mode, q, k, v, out, heads, sq, sk, d, scale, st, gate) {
+    const p = pipeline("flash", () => SHADERS.flash);
+    dispatch(p, [heads, sq, sk, d, { f: scale * Math.LOG2E }, mode, st ? st.nb : 0, st ? st.topk : 0],
+      [q, k, v, out, st ? st.slot : dummy, st ? st.sel : dummy, st ? st.coarse : dummy, gate ?? dummy],
+      [mode === 0 ? Math.ceil(sq / 64) : st.nb, heads, 1]);
+  },
+  vsaPrepare(spec) {
+    const { plan, heads, d, topk } = spec, nb = plan.bsz.length;
+    return { nb, topk, heads, d, seq: plan.seq, scale: spec.scale, slot: upload(plan.slot), bsz: upload(plan.bsz),
+             pooled: alloc(3 * heads * nb * d), coarse: alloc(heads * nb * d), sel: upload(new Uint32Array(heads * nb * topk)) };
+  },
+  vsa(q, k, v, gate, st, out) {
+    dispatch(pipeline("vsa_pool", () => SHADERS.vsa_pool), [st.heads, st.seq, st.d, st.nb], [q, k, v, st.slot, st.bsz, st.pooled], [st.nb, st.heads, 1]);
+    dispatch(pipeline("vsa_coarse", () => SHADERS.vsa_coarse), [st.heads, st.d, st.nb, st.topk, { f: st.scale }], [st.pooled, st.coarse, st.sel], [st.nb, st.heads, 1]);
+    GPU.flash(1, q, k, v, out, st.heads, st.seq, st.seq, st.d, st.scale, st, gate);
+  },
   attention(q, k, v, heads, sq, sk, d, out) {
+    if (flashOK && d % 16 === 0) return GPU.flash(0, q, k, v, out, heads, sq, sk, d, 1 / Math.sqrt(d), null, null);
     const p = pipeline("attention" + attnBK, () => SHADERS.attention.replaceAll("{BK_D}", String(attnBK * 128)).replaceAll("{BK}", String(attnBK)));
     dispatch(p, [heads, sq, sk, d, { f: 1 / Math.sqrt(d) }], [q, k, v, out], [Math.ceil(sq / 64), heads, 1]);
   },
@@ -182,6 +201,24 @@ const GPU = {
       [a, b ?? dummy, w.buf, bias ?? dummy, res ?? dummy, out], [Math.ceil(s.cout / 64), gy, gz]);
   },
 };
+
+// ---- VSA geometry (mirrors fastwan-core::vsa) -------------------------------
+const PAD = 0xffffffff;
+function tilePlan([t, h, w]) {
+  const tiles = [Math.ceil(t / 4), Math.ceil(h / 4), Math.ceil(w / 4)], nb = tiles[0] * tiles[1] * tiles[2];
+  const slot = new Uint32Array(nb * 64).fill(PAD), bsz = new Uint32Array(nb);
+  let tile = 0;
+  for (let tt = 0; tt < tiles[0]; tt++) for (let hh = 0; hh < tiles[1]; hh++) for (let ww = 0; ww < tiles[2]; ww++, tile++) {
+    let s = tile * 64;
+    for (let z = tt * 4; z < Math.min(t, tt * 4 + 4); z++) for (let y = hh * 4; y < Math.min(h, hh * 4 + 4); y++) for (let x = ww * 4; x < Math.min(w, ww * 4 + 4); x++) slot[s++] = (z * h + y) * w + x;
+    bsz[tile] = s - tile * 64;
+  }
+  return { slot, bsz, seq: t * h * w };
+}
+function vsaSpec(grid, heads, d, sparsity) {
+  const plan = tilePlan(grid), nb = plan.bsz.length;
+  return { plan, heads, d, scale: 1 / Math.sqrt(d), topk: Math.min(nb, Math.max(1, Math.ceil((1 - sparsity) * nb))) };
+}
 
 // ---- f32 reference (mirrors fastwan-cpu) -----------------------------------
 const gelu = (x) => 0.5 * x * (1 + Math.tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
@@ -219,6 +256,41 @@ const REF = {
       let den = 0; for (let j = 0; j < sk; j++) { p[j] = Math.exp(p[j] - mx); den += p[j]; }
       for (let c = 0; c < d; c++) { let a = 0; for (let j = 0; j < sk; j++) a += p[j] * v[(h * sk + j) * d + c]; out[(i * heads + h) * d + c] = a / den; }
     } return out;
+  },
+  // fastvideo-rs's VSA host oracle: tile means, coarse attention + top-k
+  // (score desc, index asc), fine attention in the picked tiles, + coarse·gate.
+  vsa(q, k, v, gate, { plan, heads, d, scale, topk }) {
+    const { slot, bsz, seq } = plan, nb = bsz.length, out = new Float32Array(seq * heads * d);
+    for (let h = 0; h < heads; h++) {
+      const m = [q, k, v].map(() => new Float64Array(nb * d));
+      for (let t = 0; t < nb; t++) {
+        for (let i = 0; i < bsz[t]; i++) { const tok = slot[t * 64 + i]; [q, k, v].forEach((src, j) => { for (let c = 0; c < d; c++) m[j][t * d + c] += src[(h * seq + tok) * d + c]; }); }
+        for (const mm of m) for (let c = 0; c < d; c++) mm[t * d + c] /= bsz[t];
+      }
+      for (let qt = 0; qt < nb; qt++) {
+        const sc = new Float64Array(nb);
+        for (let kt = 0; kt < nb; kt++) { let s = 0; for (let c = 0; c < d; c++) s += Math.fround(m[0][qt * d + c]) * Math.fround(m[1][kt * d + c]); sc[kt] = Math.fround(s * scale); }
+        let mx = -Infinity; for (const x of sc) mx = Math.max(mx, x);
+        let z = 0; const e = sc.map((x) => { const y = Math.exp(x - mx); z += y; return y; });
+        const coarse = new Float64Array(d);
+        for (let kt = 0; kt < nb; kt++) for (let c = 0; c < d; c++) coarse[c] += e[kt] / z * Math.fround(m[2][kt * d + c]);
+        const picks = Array.from({ length: nb }, (_, i) => i).sort((a, b) => sc[b] - sc[a] || a - b).slice(0, topk);
+        for (let qs = 0; qs < bsz[qt]; qs++) {
+          const qtok = slot[qt * 64 + qs], acc = new Float64Array(d);
+          let mm = -Infinity, zz = 0;
+          for (const kt of picks) for (let ks = 0; ks < bsz[kt]; ks++) {
+            const ktok = slot[kt * 64 + ks];
+            let s = 0; for (let c = 0; c < d; c++) s += q[(h * seq + qtok) * d + c] * k[(h * seq + ktok) * d + c];
+            s *= scale;
+            if (s > mm) { const shrink = isFinite(mm) ? Math.exp(mm - s) : 0; zz *= shrink; for (let c = 0; c < d; c++) acc[c] *= shrink; mm = s; }
+            const w = Math.exp(s - mm); zz += w;
+            for (let c = 0; c < d; c++) acc[c] += w * v[(h * seq + ktok) * d + c];
+          }
+          for (let c = 0; c < d; c++) out[(qtok * heads + h) * d + c] = coarse[c] * gate[(h * seq + qtok) * d + c] + acc[c] / zz;
+        }
+      }
+    }
+    return out;
   },
   conv(a, b, s, w, bias, ep, res) {
     const up = s.up ? 2 : 1, oh = s.h * up, ow = s.w * up, cin = s.cinA + s.cinB, pad = s.k >> 1;
@@ -282,6 +354,15 @@ function cases() {
       const q = normal(heads * sq * d), k = normal(heads * sk * d), v = normal(heads * sk * d), go = alloc(sq * heads * d);
       GPU.attention(upload(q), upload(k), upload(v), heads, sq, sk, d, go);
       return [await download(go, sq * heads * d), REF.attention(q, k, v, heads, sq, sk, d)];
+    }});
+  }
+  for (const [grid, heads, d, sp] of [[[5, 6, 9], 2, 128, 0.75], [[4, 8, 8], 3, 16, 0.5], [[9, 5, 7], 1, 64, 0.8]]) {
+    const spec = vsaSpec(grid, heads, d, sp);
+    out.push({ kernel: "vsa", label: `grid ${grid.join("×")}, ${heads} heads, d ${d}, top ${spec.topk}/${spec.plan.bsz.length} tiles`, run: async () => {
+      if (!flashOK) throw new Error("adapter shared memory too small for the flash kernel");
+      const n = heads * spec.plan.seq * d, [q, k, v, g] = [normal(n), normal(n), normal(n), normal(n)], go = alloc(n);
+      GPU.vsa(upload(q), upload(k), upload(v), upload(g), GPU.vsaPrepare(spec), go);
+      return [await download(go, n), REF.vsa(q, k, v, g, spec)];
     }});
   }
   out.push({ kernel: "patchify", label: "3×2×6×10, p 2", run: async () => {
@@ -362,13 +443,27 @@ async function runBench() {
     }
     RATES.gemm = gemm.reduce((a, [f]) => a + f, 0) / gemm.reduce((a, [, t]) => a + t, 0);
     const att = [];
-    for (const [name, sq, sk] of Q ? [["attention · self", 512, 512], ["attention · cross", 512, 512]] : [["attention · self", 4096, 4096], ["attention · cross", 8192, 512]]) {
+    for (const [name, sq, sk] of Q ? [["attention · dense self", 512, 512], ["attention · cross", 512, 512]] : [["attention · dense self", 4096, 4096], ["attention · cross", 8192, 512]]) {
       const H = 12, hd = 128, q = alloc(H * sq * hd), k = alloc(H * sk * hd), v = alloc(H * sk * hd), o = alloc(sq * H * hd);
       const tr = row(name, `${H} heads, ${sq}×${sk}, d 128`);
       const ms = await timeIt(() => GPU.attention(q, k, v, H, sq, sk, hd, o), 3);
       fill(tr, ms, 4 * sq * sk * hd * H); if (name.includes("self")) att.push([4 * sq * sk * hd * H, ms]);
     }
     RATES.attn = att[0][0] / att[0][1];
+    if (flashOK) {
+      // VSA at the 480p grid (21×30×52 tokens, 624 tiles, top 125), or fewer
+      // frames if this adapter's binding limit cannot hold a full q/k/v.
+      const H = 12, hd = 128, lim = device.limits.maxStorageBufferBindingSize;
+      let t = Q ? 5 : 21;
+      while (t > 1 && H * t * 30 * 52 * hd * 4 > lim) t -= 4;
+      const spec = vsaSpec(Q ? [5, 8, 13] : [t, 30, 52], H, hd, 0.8), S = spec.plan.seq, n = H * S * hd;
+      const [q, k, v, g, o] = [alloc(n), alloc(n), alloc(n), alloc(n), alloc(n)], st = GPU.vsaPrepare(spec);
+      const tr = row("attention · VSA 0.8", `${H} heads, ${S.toLocaleString()} tokens, ${spec.topk}/${spec.plan.bsz.length} tiles, d 128`);
+      const ms = await timeIt(() => GPU.vsa(q, k, v, g, st, o), 3);
+      const flops = 4 * S * spec.topk * 64 * hd * H;
+      fill(tr, ms, flops);
+      RATES.vsa = flops / ms;
+    }
     {
       const [hh, ww] = Q ? [30, 52] : [240, 416];
       const s = { frames: 1, cinA: 64, cinB: 0, cout: 64, h: hh, w: ww, up: true, k: 3 };
@@ -396,11 +491,16 @@ function renderEstimate() {
     const gemmF = L * 2 * S * (6 * d * d + 2 * d * f), attnF = L * (4 * S * S * d + 4 * S * text * d);
     const largest = Math.max(S * 3 * d, S * f) * 4; // f32: fused QKV or the unchunked FFN hidden
     const fits = largest <= lim;
-    const step = RATES.gemm ? gemmF / RATES.gemm / 1e3 + attnF / RATES.attn / 1e3 : null;
+    const dense = RATES.gemm ? gemmF / RATES.gemm / 1e3 + attnF / RATES.attn / 1e3 : null;
+    // VSA: each tile attends to ceil(20% of tiles) tiles of 64 tokens; cross attention stays dense.
+    const nb = Math.ceil(((fr - 1) / 4 + 1) / 4) * Math.ceil(h / 64) * Math.ceil(w / 64), topk = Math.ceil(0.2 * nb);
+    const vsaF = L * 4 * S * topk * 64 * d, crossF = L * 4 * S * text * d;
+    const step = RATES.gemm && RATES.vsa ? gemmF / RATES.gemm / 1e3 + vsaF / RATES.vsa / 1e3 + crossF / RATES.attn / 1e3 : null;
     const tr = document.createElement("tr");
     tr.innerHTML = `<td>${w}×${h}×${fr} <span class="note">${note}</span></td><td class="num">${S.toLocaleString()}</td><td class="num">${(largest / 2 ** 20).toFixed(0)} MiB</td>`
       + `<td><span class="pill ${fits ? "ok" : "bad"}">${fits ? "yes" : "chunk FFN"}</span></td>`
-      + `<td class="num">${step == null ? "run benchmarks" : dur(step)}</td><td class="num">${step == null ? "–" : dur(3 * step)}</td>`;
+      + `<td class="num">${step == null ? "run benchmarks" : dur(step)}</td><td class="num">${step == null ? "–" : dur(3 * step)}</td>`
+      + `<td class="num">${dense == null ? "–" : dur(3 * dense)}</td>`;
     body.append(tr);
   }
 }
@@ -423,13 +523,14 @@ async function boot() {
     device = await adapter.requestDevice({ requiredLimits });
     device.lost.then((i) => { $("dev-state").className = "pill bad"; $("dev-state").textContent = "device lost"; $("dev-err").hidden = false; $("dev-err").textContent = i.message; });
     attnBK = device.limits.maxComputeWorkgroupStorageSize >= 32768 ? 32 : 16;
+    flashOK = device.limits.maxComputeWorkgroupStorageSize >= FLASH_SHARED;
     dummy = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
     const info = adapter.info ?? {};
     kv("Vendor", info.vendor || "unknown"); kv("Architecture", info.architecture || "unknown");
     kv("Device", info.description || info.device || "not exposed by the browser");
     kv("Max binding", (device.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0) + " MiB");
     kv("Max buffer", (device.limits.maxBufferSize / 2 ** 20).toFixed(0) + " MiB");
-    kv("Workgroup memory", (device.limits.maxComputeWorkgroupStorageSize / 1024) + " KiB → attention tile " + attnBK + " keys");
+    kv("Workgroup memory", (device.limits.maxComputeWorkgroupStorageSize / 1024) + " KiB → " + (flashOK ? "flash attention + VSA" : "fallback attention, no VSA (needs " + Math.ceil(FLASH_SHARED / 1024) + " KiB)"));
     $("dev-state").className = "pill ok"; $("dev-state").textContent = "ready";
     renderEstimate();
     $("bench-run").disabled = false;
