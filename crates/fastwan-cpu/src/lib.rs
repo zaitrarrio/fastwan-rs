@@ -234,6 +234,10 @@ impl Backend for Cpu {
         self.weight(&q.dequantize(), q.rows, q.cols)
     }
 
+    fn weight_q4(&self, q: &fastwan_core::quant::Q4) -> CpuWeight {
+        self.weight(&q.dequantize(), q.rows, q.cols)
+    }
+
     fn linear(
         &self,
         x: &CpuBuf,

@@ -68,6 +68,14 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     model(&mut p);
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
+    model_vsa(
+        &mut p,
+        WeightQuant::Int4 {
+            group: 32,
+            hqq: true,
+            ffn_only: false,
+        },
+    );
     p.out
 }
 
@@ -116,6 +124,18 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             cpu.linear(&cx, 3, m, &cpu.weight_q8(&q), Some(&cb), act, &cy, 2);
             p.record(
                 format!("linear int8/{} {m}x{k}x{n} {act:?}", q.group),
+                be.download(&gy),
+                cpu.download(&cy),
+            );
+            // 4-bit: group 64 (per row when k is not a multiple), HQQ on the
+            // odd-K case so a fractional zero point is exercised.
+            let q = fastwan_core::quant::Q4::quantize(&w, n, k, 64, k % 64 != 0);
+            let gy = be.alloc((m + 2) * n);
+            be.linear(&gx, 3, m, &be.weight_q4(&q), Some(&gb), act, &gy, 2);
+            let cy = cpu.alloc((m + 2) * n);
+            cpu.linear(&cx, 3, m, &cpu.weight_q4(&q), Some(&cb), act, &cy, 2);
+            p.record(
+                format!("linear int4/{} {m}x{k}x{n} {act:?}", q.group),
                 be.download(&gy),
                 cpu.download(&cy),
             );
@@ -590,10 +610,9 @@ fn model_vsa<B: Backend>(p: &mut Pair<'_, B>, quant: WeightQuant) {
     let (mut t1, mut t2) = (Timings::default(), Timings::default());
     let gl = gp.denoise(be, &embeds, &opt, &mut t1).unwrap();
     let cl = cp.denoise(cpu, &embeds, &opt, &mut t2).unwrap();
-    let tag = if quant == WeightQuant::Int8 {
-        ", int8"
-    } else {
-        ""
+    let tag = match quant {
+        WeightQuant::Native => String::new(),
+        q => format!(", {q}"),
     };
     p.record(
         format!("tiny DiT, VSA 4 tiles, 3 DMD steps{tag} (latent)"),
@@ -634,6 +653,74 @@ mod tests {
         }
         assert_eq!(whole.frames, 4 * lt - 3);
         assert!(rel(&parts, &whole.data) < 1e-6);
+    }
+
+    /// A quantized checkpoint written by `fastwan quantize` loads to the same
+    /// model as `--weights` on the original (up to the f16 storage of the
+    /// unquantized tensors).
+    #[test]
+    fn stored_quantized_checkpoint_matches_load_time_quantization() {
+        use fastwan_core::{
+            export,
+            quant::WeightQuant,
+            weights::{SafetensorsDir, WeightSource, wan_manifest},
+        };
+        let cfg = WanConfig::tiny_vsa();
+        let syn = Synthetic { seed: 4 };
+        let mut names = wan_manifest(&cfg);
+        for l in 0..cfg.layers {
+            let k = format!("blocks.{l}.to_gate_compress");
+            names.push((format!("{k}.weight"), vec![cfg.dim(), cfg.dim()]));
+            names.push((format!("{k}.bias"), vec![cfg.dim()]));
+        }
+        let t: Vec<export::Tensor> = names
+            .iter()
+            .map(|(n, s)| {
+                let v = syn.get(n, s).unwrap();
+                (
+                    n.clone(),
+                    safetensors::Dtype::F32,
+                    s.clone(),
+                    export::f32_bytes(&v),
+                )
+            })
+            .collect();
+        let dir = std::env::temp_dir().join(format!("fastwan-qload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (fsrc, fq) = (dir.join("src.safetensors"), dir.join("q.safetensors"));
+        export::write(&fsrc, &t, Default::default()).unwrap();
+        let src = SafetensorsDir::open(&fsrc).unwrap();
+        let quant: WeightQuant = "int4-hqq-g16-ffn".parse().unwrap();
+        export::write(
+            &fq,
+            &export::quantize_dit(&src, &cfg, quant).unwrap(),
+            export::metadata(quant),
+        )
+        .unwrap();
+        let stored = SafetensorsDir::open(&fq).unwrap();
+        let cpu = Cpu;
+        let run = |dit: &WanDit<Cpu>| {
+            let prompt = dit.prepare_prompt(&cpu, &Rng::new(2).normal(cfg.text_len * cfg.text_dim));
+            let mods = dit.step_mods(&cpu, 757.0);
+            let lat = (2, 4, 6);
+            let x = cpu.upload(&Rng::new(3).normal(cfg.in_channels * 2 * 4 * 6));
+            let ws = dit.workspace(&cpu, lat, usize::MAX, None);
+            let out = cpu.alloc(cfg.in_channels * 2 * 4 * 6);
+            dit.forward(&cpu, &ws, &x, &mods, &prompt, &out);
+            cpu.download(&out)
+        };
+        let a = run(&WanDit::load_with(&cpu, cfg.clone(), &src, quant).unwrap());
+        // The stored file decides its own format: `Native` here is ignored
+        // for the block linears.
+        let b = run(&WanDit::load_with(&cpu, cfg.clone(), &stored, WeightQuant::Native).unwrap());
+        let native = run(&WanDit::load(&cpu, cfg.clone(), &src).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+        let e = rel(&b, &a);
+        assert!(e < 1e-3, "stored vs load-time: {e}");
+        assert!(
+            rel(&a, &native) > 10.0 * e,
+            "quantization should dominate f16 storage"
+        );
     }
 
     #[test]

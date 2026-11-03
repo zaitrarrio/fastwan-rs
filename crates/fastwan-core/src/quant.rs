@@ -1,4 +1,5 @@
-//! Weight-only int8 quantization of the DiT linears.
+//! Weight-only quantization of the DiT block linears: int8 ([`Q8`]) and
+//! 4-bit ([`Q4`]), and which linears get which ([`WeightQuant::for_key`]).
 //!
 //! Symmetric round-to-nearest, one f32 scale per group of [`Q8_GROUP`]
 //! consecutive input columns of a row (per row when the row length is not a
@@ -19,12 +20,9 @@ pub enum WeightQuant {
     /// [`Q8`]: half the bytes of bf16 / f16.
     Int8,
     /// 4-bit [`Q4`] with `group` columns per scale/zero, rounded to nearest
-    /// or HQQ-refined. **Evaluation only:** the weights are quantized and
-    /// expanded back, then stored at native precision, so this measures the
-    /// output of 4-bit weights without saving memory (no int4 kernels yet).
-    /// With `ffn_only`, the attention and gate linears use [`Q8`] (real int8)
-    /// and only the FFN (≈63% of the block weights) is 4-bit.
-    Int4Sim {
+    /// or HQQ-refined. With `ffn_only`, the attention and gate linears use
+    /// [`Q8`] and only the FFN (≈59% of the block weights) is 4-bit.
+    Int4 {
         group: usize,
         hqq: bool,
         ffn_only: bool,
@@ -35,8 +33,47 @@ impl WeightQuant {
     /// The format of the non-FFN block linears.
     pub fn attn(self) -> Self {
         match self {
-            Self::Int4Sim { ffn_only: true, .. } => Self::Int8,
+            Self::Int4 { ffn_only: true, .. } => Self::Int8,
             q => q,
+        }
+    }
+
+    /// The format of the block linear `key` (`blocks.N.<role>`, no
+    /// `.weight`): the FFN gets `self`, attention and gate get [`Self::attn`],
+    /// and everything outside the blocks is `Native`. The exporter and the
+    /// loader both decide with this, so a stored file loads as it was made.
+    pub fn for_key(self, key: &str) -> Self {
+        let Some(role) = key
+            .strip_prefix("blocks.")
+            .and_then(|r| r.split_once('.'))
+            .map(|(_, r)| r)
+        else {
+            return Self::Native;
+        };
+        match role {
+            "ffn.net.0.proj" | "ffn.net.2" => self,
+            "attn1.to_q" | "attn1.to_k" | "attn1.to_v" | "attn1.to_out.0" | "attn2.to_q"
+            | "attn2.to_k" | "attn2.to_v" | "attn2.to_out.0" | "to_gate_compress" => self.attn(),
+            _ => Self::Native,
+        }
+    }
+}
+
+impl std::fmt::Display for WeightQuant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native => f.write_str("native"),
+            Self::Int8 => f.write_str("int8"),
+            Self::Int4 {
+                group,
+                hqq,
+                ffn_only,
+            } => write!(
+                f,
+                "int4{}-g{group}{}",
+                if *hqq { "-hqq" } else { "" },
+                if *ffn_only { "-ffn" } else { "" }
+            ),
         }
     }
 }
@@ -48,15 +85,13 @@ impl std::str::FromStr for WeightQuant {
             "native" | "bf16" | "f16" => Ok(Self::Native),
             "int8" | "q8" => Ok(Self::Int8),
             _ => {
-                // int4-sim[-hqq][-g<N>][-ffn]
+                // int4[-hqq][-g<N>][-ffn]
                 let (s, ffn_only) = match s.strip_suffix("-ffn") {
                     Some(r) => (r, true),
                     None => (s, false),
                 };
-                let rest = s.strip_prefix("int4-sim").ok_or_else(|| {
-                    format!(
-                        "unknown weight format `{s}` (native | int8 | int4-sim[-hqq][-gN][-ffn])"
-                    )
+                let rest = s.strip_prefix("int4").ok_or_else(|| {
+                    format!("unknown weight format `{s}` (native | int8 | int4[-hqq][-gN][-ffn])")
                 })?;
                 let (hqq, rest) = match rest.strip_prefix("-hqq") {
                     Some(r) => (true, r),
@@ -67,7 +102,10 @@ impl std::str::FromStr for WeightQuant {
                     None if rest.is_empty() => 64,
                     None => return Err(format!("bad weight format `{s}`")),
                 };
-                Ok(Self::Int4Sim {
+                if group == 0 || group % 8 != 0 {
+                    return Err(format!("int4 group must be a multiple of 8, got {group}"));
+                }
+                Ok(Self::Int4 {
                     group,
                     hqq,
                     ffn_only,
@@ -75,6 +113,14 @@ impl std::str::FromStr for WeightQuant {
             }
         }
     }
+}
+
+/// A block linear as stored in a quantized checkpoint
+/// ([`crate::weights::WeightSource::stored`]).
+#[derive(Debug, Clone)]
+pub enum Stored {
+    Q8(Q8),
+    Q4(Q4),
 }
 
 /// A `[rows, cols]` matrix as int8 codes and per-group scales.
@@ -123,6 +169,19 @@ impl Q8 {
             .collect()
     }
 
+    /// Stack matrices with the same columns and group by rows (fused QKV).
+    pub fn concat(parts: Vec<Q8>) -> Self {
+        let mut it = parts.into_iter();
+        let mut a = it.next().expect("at least one matrix");
+        for b in it {
+            assert_eq!((a.cols, a.group), (b.cols, b.group));
+            a.q.extend(b.q);
+            a.scales.extend(b.scales);
+            a.rows += b.rows;
+        }
+        a
+    }
+
     /// Device bytes (codes + scales).
     pub fn bytes(&self) -> usize {
         self.q.len() + 4 * self.scales.len()
@@ -131,6 +190,8 @@ impl Q8 {
 
 /// A `[rows, cols]` matrix as unsigned 4-bit codes with an affine
 /// scale / zero per group of columns: `w ≈ (q − z) · s`, `q ∈ [0, 15]`.
+/// Scales and zeros are rounded to f16 when made, which is how they are
+/// stored, so a quantized file and an in-memory quantization are identical.
 #[derive(Debug, Clone)]
 pub struct Q4 {
     /// One code per byte (packing is a storage concern; see [`Q4::bytes`]).
@@ -209,7 +270,8 @@ impl Q4 {
                         for (d, &v) in qg.iter_mut().zip(w) {
                             *d = code(v, z) as u8;
                         }
-                        *sz = (1.0 / is, z);
+                        let f = |v: f32| half::f16::from_f32(v).to_f32();
+                        *sz = (f(1.0 / is), f(z));
                     }
                 });
             }
@@ -234,6 +296,54 @@ impl Q4 {
                 (c as f32 - self.zeros[g]) * self.scales[g]
             })
             .collect()
+    }
+
+    /// Two codes per byte, element `2i` in the low nibble (the stored layout;
+    /// read as little-endian u32 words, code `j` of a word is bits `4j..4j+4`).
+    pub fn packed(&self) -> Vec<u8> {
+        self.q
+            .chunks(2)
+            .map(|c| c[0] | (c.get(1).copied().unwrap_or(0) << 4))
+            .collect()
+    }
+
+    pub fn from_packed(
+        packed: &[u8],
+        scales: Vec<f32>,
+        zeros: Vec<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
+        let n = rows * cols;
+        assert_eq!(packed.len(), n.div_ceil(2));
+        assert!(!scales.is_empty() && scales.len() == zeros.len());
+        assert_eq!(n % scales.len(), 0);
+        let q = (0..n)
+            .map(|i| (packed[i / 2] >> (4 * (i % 2))) & 15)
+            .collect();
+        let group = n / scales.len();
+        Self {
+            q,
+            scales,
+            zeros,
+            rows,
+            cols,
+            group,
+        }
+    }
+
+    /// Stack matrices with the same columns and group by rows (fused QKV).
+    pub fn concat(parts: Vec<Q4>) -> Self {
+        let mut it = parts.into_iter();
+        let mut a = it.next().expect("at least one matrix");
+        for b in it {
+            assert_eq!((a.cols, a.group), (b.cols, b.group));
+            a.q.extend(b.q);
+            a.scales.extend(b.scales);
+            a.zeros.extend(b.zeros);
+            a.rows += b.rows;
+        }
+        a
     }
 
     /// Bytes once packed: two codes per byte, f16 scale and zero per group.
@@ -279,8 +389,9 @@ mod tests {
         };
         let rtn = Q4::quantize(&w, rows, cols, 64, false);
         assert!(rtn.q.iter().all(|&c| c <= 15));
+        // half a step, plus the f16 rounding of scale and zero (≤ 0.015 step)
         for (i, (a, b)) in w.iter().zip(rtn.dequantize()).enumerate() {
-            assert!((a - b).abs() <= rtn.scales[i / 64] * 0.5 + 1e-5);
+            assert!((a - b).abs() <= rtn.scales[i / 64] * 0.52 + 1e-5);
         }
         let hqq = Q4::quantize(&w, rows, cols, 64, true);
         assert!(hqq.q.iter().all(|&c| c <= 15));
@@ -291,25 +402,23 @@ mod tests {
             err(&rtn)
         );
         assert_eq!(
-            "int4-sim-hqq-g32".parse(),
-            Ok(WeightQuant::Int4Sim {
+            "int4-hqq-g32".parse(),
+            Ok(WeightQuant::Int4 {
                 group: 32,
                 hqq: true,
                 ffn_only: false
             })
         );
         assert_eq!(
-            "int4-sim".parse(),
-            Ok(WeightQuant::Int4Sim {
+            "int4".parse(),
+            Ok(WeightQuant::Int4 {
                 group: 64,
                 hqq: false,
                 ffn_only: false
             })
         );
         assert_eq!(
-            "int4-sim-hqq-g64-ffn"
-                .parse::<WeightQuant>()
-                .map(|q| q.attn()),
+            "int4-hqq-g64-ffn".parse::<WeightQuant>().map(|q| q.attn()),
             Ok(WeightQuant::Int8)
         );
     }

@@ -23,7 +23,7 @@ use fastwan_core::{
     Result,
     backend::{Act, Backend, NormKind},
     config::WanConfig,
-    quant::{Q4, Q8, WeightQuant},
+    quant::{Q4, Q8, Stored, WeightQuant},
     rope::rope_table,
     timestep::{matvec, silu, sinusoid},
     weights::WeightSource,
@@ -52,27 +52,67 @@ fn load_linear<B: Backend>(
     keys: &[&str],
     quant: WeightQuant,
 ) -> Result<Linear<B>> {
-    let (mut w, mut b, mut rows, mut cols) = (Vec::new(), Vec::new(), 0, 0);
+    let err = |m: String| fastwan_core::Error::Weights(m);
+    let (mut w, mut b, mut stored, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new(), 0, 0);
     for k in keys {
         let shape = shapes
             .get(&format!("{k}.weight"))
-            .ok_or_else(|| fastwan_core::Error::Weights(format!("`{k}` is not in the manifest")))?;
+            .ok_or_else(|| err(format!("`{k}` is not in the manifest")))?;
         let (o, i) = (shape[0], shape[1..].iter().product::<usize>());
-        w.extend(src.get(&format!("{k}.weight"), shape)?);
+        match src.stored(k)? {
+            Some(s) => {
+                let (r, c) = match &s {
+                    Stored::Q8(q) => (q.rows, q.cols),
+                    Stored::Q4(q) => (q.rows, q.cols),
+                };
+                if (r, c) != (o, i) {
+                    return Err(err(format!("`{k}` is stored {r}x{c}, expected {o}x{i}")));
+                }
+                stored.push(s);
+            }
+            None => w.extend(src.get(&format!("{k}.weight"), shape)?),
+        }
         b.extend(src.get(&format!("{k}.bias"), &[o])?);
         rows += o;
         cols = i;
     }
-    Ok(Linear {
-        w: match quant {
+    let w = if stored.is_empty() {
+        // Quantize at load per `quant` (groups never span the fused keys, so
+        // this equals quantizing each key, as the exporter does).
+        match quant.for_key(keys[0]) {
             WeightQuant::Native => be.weight(&w, rows, cols),
             WeightQuant::Int8 => be.weight_q8(&Q8::quantize(&w, rows, cols)),
-            WeightQuant::Int4Sim { group, hqq, .. } => be.weight(
-                &Q4::quantize(&w, rows, cols, group, hqq).dequantize(),
-                rows,
-                cols,
-            ),
-        },
+            WeightQuant::Int4 { group, hqq, .. } => {
+                be.weight_q4(&Q4::quantize(&w, rows, cols, group, hqq))
+            }
+        }
+    } else if stored.len() != keys.len() {
+        return Err(err(format!("{keys:?}: only some are stored quantized")));
+    } else if stored.iter().all(|s| matches!(s, Stored::Q8(_))) {
+        be.weight_q8(&Q8::concat(
+            stored
+                .into_iter()
+                .map(|s| match s {
+                    Stored::Q8(q) => q,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        ))
+    } else if stored.iter().all(|s| matches!(s, Stored::Q4(_))) {
+        be.weight_q4(&Q4::concat(
+            stored
+                .into_iter()
+                .map(|s| match s {
+                    Stored::Q4(q) => q,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        ))
+    } else {
+        return Err(err(format!("{keys:?}: mixed int8 / int4 storage")));
+    };
+    Ok(Linear {
+        w,
         b: be.upload(&b),
     })
 }
@@ -184,29 +224,29 @@ impl<B: Backend> WanDit<B> {
         for l in 0..cfg.layers {
             shapes.insert(format!("blocks.{l}.to_gate_compress.weight"), vec![d, d]);
         }
-        let lin = |keys: &[&str]| load_linear(be, src, &shapes, keys, WeightQuant::Native);
-        let qlin = |keys: &[&str]| load_linear(be, src, &shapes, keys, quant.attn());
-        let flin = |keys: &[&str]| load_linear(be, src, &shapes, keys, quant);
+        // `quant.for_key` picks each linear's format; a stored quantized
+        // checkpoint overrides it.
+        let lin = |keys: &[&str]| load_linear(be, src, &shapes, keys, quant);
         let vec = |k: &str, n: usize| -> Result<B::Buf> { Ok(be.upload(&src.get(k, &[n])?)) };
         let mut blocks = Vec::with_capacity(cfg.layers);
         for l in 0..cfg.layers {
             let p = |s: &str| format!("blocks.{l}.{s}");
             blocks.push(Block {
-                qkv: qlin(&[&p("attn1.to_q"), &p("attn1.to_k"), &p("attn1.to_v")])?,
+                qkv: lin(&[&p("attn1.to_q"), &p("attn1.to_k"), &p("attn1.to_v")])?,
                 norm_q1: vec(&p("attn1.norm_q.weight"), d)?,
                 norm_k1: vec(&p("attn1.norm_k.weight"), d)?,
-                out1: qlin(&[&p("attn1.to_out.0")])?,
-                q2: qlin(&[&p("attn2.to_q")])?,
-                kv2: qlin(&[&p("attn2.to_k"), &p("attn2.to_v")])?,
+                out1: lin(&[&p("attn1.to_out.0")])?,
+                q2: lin(&[&p("attn2.to_q")])?,
+                kv2: lin(&[&p("attn2.to_k"), &p("attn2.to_v")])?,
                 norm_q2: vec(&p("attn2.norm_q.weight"), d)?,
                 norm_k2: vec(&p("attn2.norm_k.weight"), d)?,
-                out2: qlin(&[&p("attn2.to_out.0")])?,
+                out2: lin(&[&p("attn2.to_out.0")])?,
                 norm2_w: vec(&p("norm2.weight"), d)?,
                 norm2_b: vec(&p("norm2.bias"), d)?,
-                ffn1: flin(&[&p("ffn.net.0.proj")])?,
-                ffn2: flin(&[&p("ffn.net.2")])?,
-                gate: if src.contains(&p("to_gate_compress.weight")) {
-                    Some(qlin(&[&p("to_gate_compress")])?)
+                ffn1: lin(&[&p("ffn.net.0.proj")])?,
+                ffn2: lin(&[&p("ffn.net.2")])?,
+                gate: if src.has_linear(&p("to_gate_compress")) {
+                    Some(lin(&[&p("to_gate_compress")])?)
                 } else {
                     None
                 },

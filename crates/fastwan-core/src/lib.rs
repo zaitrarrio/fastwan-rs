@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod export;
 pub mod geometry;
 pub mod plan;
 pub mod quant;

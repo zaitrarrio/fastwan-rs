@@ -112,6 +112,9 @@ pub trait Backend {
     /// equal `linear` with `weight(&q.dequantize())` up to the backend's own
     /// activation rounding.
     fn weight_q8(&self, q: &crate::quant::Q8) -> Self::Weight;
+    /// A 4-bit weight-only matrix: the same contract as [`Backend::weight_q8`]
+    /// with `weight(&q.dequantize())`.
+    fn weight_q4(&self, q: &crate::quant::Q4) -> Self::Weight;
     /// Wait for queued work (timing only; downloads synchronise themselves).
     fn sync(&self);
 

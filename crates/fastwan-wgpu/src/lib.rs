@@ -92,9 +92,18 @@ pub struct GWeight {
     rows: usize,
     cols: usize,
     f16: bool,
-    /// int8 codes (4 per word) with these per-group scales
-    /// ([`fastwan_core::quant::Q8`]); `buf` then holds the codes.
-    q8: Option<(GBuf, usize)>,
+    /// Weight-only quantized: `buf` holds the codes, this buffer the
+    /// per-group scales (Q8) or interleaved scale / zero pairs (Q4), then the
+    /// group size.
+    quant: Option<(Quant, GBuf, usize)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quant {
+    /// [`fastwan_core::quant::Q8`]: 4 codes per word.
+    Q8,
+    /// [`fastwan_core::quant::Q4`]: 8 codes per word.
+    Q4,
 }
 
 struct Pending {
@@ -340,6 +349,21 @@ impl Wgpu {
                 "{W_LOAD}",
                 "let b = (w[i >> 2u] >> ((i & 3u) * 8u)) << 24u; \
                  return f32(bitcast<i32>(b) >> 24u) * wscale[i / p._p];",
+            )
+    }
+
+    /// The 4-bit twin: 8 codes per word, `(q − zero) · scale` per group with
+    /// (scale, zero) pairs at binding 5 — `fw_dequant_q4` on CUDA.
+    fn q4_src(src: &str) -> String {
+        src.replace("{W_TYPE}", "u32")
+            .replace(
+                "fn load_w(",
+                "@group(0) @binding(5) var<storage, read> wsz: array<vec2<f32>>;\nfn load_w(",
+            )
+            .replace(
+                "{W_LOAD}",
+                "let c = f32((w[i >> 3u] >> ((i & 7u) * 4u)) & 15u); \
+                 let g = wsz[i / p._p]; return (c - g.y) * g.x;",
             )
     }
 
@@ -783,7 +807,7 @@ impl Backend for Wgpu {
                 rows,
                 cols,
                 f16: true,
-                q8: None,
+                quant: None,
             }
         } else {
             GWeight {
@@ -791,7 +815,7 @@ impl Backend for Wgpu {
                 rows,
                 cols,
                 f16: false,
-                q8: None,
+                quant: None,
             }
         }
     }
@@ -810,7 +834,29 @@ impl Backend for Wgpu {
             rows: q.rows,
             cols: q.cols,
             f16: false,
-            q8: Some((self.upload(&q.scales), q.group)),
+            quant: Some((Quant::Q8, self.upload(&q.scales), q.group)),
+        }
+    }
+
+    fn weight_q4(&self, q: &fastwan_core::quant::Q4) -> GWeight {
+        let mut bytes = q.packed();
+        bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let sz: Vec<f32> = q
+            .scales
+            .iter()
+            .zip(&q.zeros)
+            .flat_map(|(&s, &z)| [s, z])
+            .collect();
+        GWeight {
+            buf: self.upload_u32(&words),
+            rows: q.rows,
+            cols: q.cols,
+            f16: false,
+            quant: Some((Quant::Q4, self.upload(&sz), q.group)),
         }
     }
 
@@ -866,8 +912,11 @@ impl Backend for Wgpu {
             _ => (LINEAR3, 64, "linear3"),
         };
         let half = self.f16 && f16 && variant == 3 && rows >= F16_MIN_ROWS;
-        let pipe = if w.q8.is_some() {
-            self.pipeline(&format!("{name}_q8"), || Self::q8_src(src))
+        let pipe = if let Some((kind, ..)) = &w.quant {
+            match kind {
+                Quant::Q8 => self.pipeline(&format!("{name}_q8"), || Self::q8_src(src)),
+                Quant::Q4 => self.pipeline(&format!("{name}_q4"), || Self::q4_src(src)),
+            }
         } else if half {
             self.pipeline("linear3h", || LINEAR3H.to_string())
         } else {
@@ -882,12 +931,12 @@ impl Backend for Wgpu {
             y_row as u32,
             bias.is_some() as u32,
             (act == Act::GeluTanh) as u32,
-            w.q8.as_ref().map_or(0, |q| q.1) as u32,
+            w.quant.as_ref().map_or(0, |q| q.2) as u32,
         ];
         let groups = (w.rows.div_ceil(tile) as u32, rows.div_ceil(tile) as u32, 1);
         let b = bias.unwrap_or(&self.dummy);
-        match &w.q8 {
-            Some((scales, _)) => self.dispatch(&pipe, &p, &[x, &w.buf, b, y, scales], groups),
+        match &w.quant {
+            Some((_, scales, _)) => self.dispatch(&pipe, &p, &[x, &w.buf, b, y, scales], groups),
             None => self.dispatch(&pipe, &p, &[x, &w.buf, b, y], groups),
         }
     }
@@ -1146,7 +1195,7 @@ impl Backend for Wgpu {
         out: &GBuf,
     ) {
         assert_eq!((w.rows, w.cols), (s.cout, s.k_len()), "conv weight shape");
-        assert!(w.q8.is_none(), "conv weights are not quantized");
+        assert!(w.quant.is_none(), "conv weights are not quantized");
         let f16 = w.f16;
         if self.prof.is_some() {
             *self.tag.lock().unwrap() = Some(format!("{}->{} k{}", s.cin(), s.cout, s.k));

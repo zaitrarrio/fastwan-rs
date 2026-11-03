@@ -577,3 +577,17 @@ extern "C" __global__ void fw_dequant_q8(u64 out_, u64 q_, u64 s_, long n, int g
     if (i >= n) return;
     out[i] = bf((float)q[i] * s[i / group]);
 }
+
+// 4-bit weight-only (fastwan_core::quant::Q4): codes packed 2 per byte (low
+// nibble first), (scale, zero) f32 pairs per `group` columns. Expands to
+// bf16 `(q − zero) · scale` — the twin of the WGSL `_q4` GEMMs' `load_w`.
+extern "C" __global__ void fw_dequant_q4(u64 out_, u64 q_, u64 sz_, long n, int group) {
+    bf16_t* out = (bf16_t*)out_;
+    const unsigned char* q = (const unsigned char*)q_;
+    const float* sz = (const float*)sz_;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float c = (float)((q[i >> 1] >> ((i & 1) * 4)) & 15);
+    long g = i / group;
+    out[i] = bf((c - sz[2 * g + 1]) * sz[2 * g]);
+}

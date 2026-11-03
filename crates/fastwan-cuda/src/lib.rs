@@ -48,10 +48,17 @@ pub struct CuWeight {
     buf: CuBuf,
     rows: usize,
     cols: usize,
-    /// int8 weight-only: `buf` holds the codes (2 per word), these the f32
-    /// per-group scales; [`Backend::linear`] expands them into the shared
-    /// bf16 scratch before the GEMM.
-    q8: Option<(CuBuf, usize)>,
+    /// Weight-only quantized: `buf` holds the codes (int8: 2 per word, int4:
+    /// 4 per word), this table the f32 per-group scales (int8) or (scale,
+    /// zero) pairs (int4), then the group. [`Backend::linear`] expands them
+    /// into the shared bf16 scratch before the GEMM.
+    quant: Option<(Quant, CuBuf, usize)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quant {
+    Q8,
+    Q4,
 }
 
 pub struct Cuda {
@@ -86,6 +93,7 @@ struct Kernels {
     patch: CudaFunction,
     conv2d: CudaFunction,
     dequant_q8: CudaFunction,
+    dequant_q4: CudaFunction,
 }
 
 #[derive(Debug)]
@@ -146,6 +154,7 @@ impl Cuda {
             patch: get("fw_patch")?,
             conv2d: get("fw_conv2d")?,
             dequant_q8: get("fw_dequant_q8")?,
+            dequant_q4: get("fw_dequant_q4")?,
         };
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
@@ -311,7 +320,7 @@ impl Backend for Cuda {
             buf: self.upload(data),
             rows,
             cols,
-            q8: None,
+            quant: None,
         }
     }
 
@@ -331,7 +340,34 @@ impl Backend for Cuda {
             },
             rows: q.rows,
             cols: q.cols,
-            q8: Some((Backend::upload_table(self, &q.scales), q.group)),
+            quant: Some((Quant::Q8, Backend::upload_table(self, &q.scales), q.group)),
+        }
+    }
+
+    fn weight_q4(&self, q: &fastwan_core::quant::Q4) -> CuWeight {
+        let bytes = q.packed();
+        let mut words: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| c[0] as u16 | (c.get(1).map_or(0, |&v| v as u16) << 8))
+            .collect();
+        if words.is_empty() {
+            words.push(0);
+        }
+        let sz: Vec<f32> = q
+            .scales
+            .iter()
+            .zip(&q.zeros)
+            .flat_map(|(&s, &z)| [s, z])
+            .collect();
+        CuWeight {
+            buf: CuBuf {
+                s: Arc::new(self.stream.clone_htod(&words).expect("upload")),
+                len: words.len(),
+                f32: false,
+            },
+            rows: q.rows,
+            cols: q.cols,
+            quant: Some((Quant::Q4, Backend::upload_table(self, &sz), q.group)),
         }
     }
 
@@ -353,15 +389,18 @@ impl Backend for Cuda {
         let (n, k) = (w.rows, w.cols);
         assert!((x_row + rows) * k <= x.len && (y_row + rows) * n <= y.len);
         let mut scratch = self.q8_scratch.lock().unwrap();
-        let wp = match &w.q8 {
+        let wp = match &w.quant {
             None => self.ptr(&w.buf),
-            Some((scales, group)) => {
+            Some((kind, scales, group)) => {
                 if scratch.as_ref().is_none_or(|b| b.len < n * k) {
                     *scratch = Some(self.alloc(n * k));
                 }
                 let dst = scratch.as_ref().unwrap();
                 self.launch(
-                    &self.f.dequant_q8,
+                    match kind {
+                        Quant::Q8 => &self.f.dequant_q8,
+                        Quant::Q4 => &self.f.dequant_q4,
+                    },
                     Self::elems(n * k),
                     (256, 1, 1),
                     &[
@@ -695,7 +734,7 @@ impl Backend for Cuda {
         out: &CuBuf,
     ) {
         assert_eq!((w.rows, w.cols), (s.cout, s.k_len()));
-        assert!(w.q8.is_none(), "conv weights are not quantized");
+        assert!(w.quant.is_none(), "conv weights are not quantized");
         let (epc, res) = match ep {
             ConvEpilogue::None => (0, None),
             ConvEpilogue::Relu => (1, None),

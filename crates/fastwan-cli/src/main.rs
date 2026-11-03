@@ -158,6 +158,19 @@ enum Cmd {
         #[arg(long)]
         allow_origin: Option<String>,
     },
+    /// Write a quantized copy of the DiT: block linears as int8 / 4-bit codes,
+    /// everything else f16 (the browser download format; see
+    /// `fastwan_core::export`). Load it with --transformer like the original.
+    Quantize {
+        /// The checkpoint's `transformer/` directory.
+        #[arg(long)]
+        transformer: PathBuf,
+        /// int8 | int4[-hqq][-gN][-ffn], e.g. int4-hqq-g64-ffn.
+        #[arg(long)]
+        weights: fastwan_core::quant::WeightQuant,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Generate a clip from precomputed UMT5 prompt embeddings.
     Generate {
         #[command(flatten)]
@@ -332,6 +345,43 @@ fn main() -> Result<()> {
             serve::serve(settings, move |s, shared, rx| {
                 with_backend!(backend, |be| serve::engine(be, s, shared, rx))
             })?;
+        }
+        Cmd::Quantize {
+            transformer,
+            weights,
+            out,
+        } => {
+            if weights == fastwan_core::quant::WeightQuant::Native {
+                bail!("--weights native would only convert to f16; give int8 or int4…");
+            }
+            let cfg = WanConfig::fastwan_1_3b();
+            let t0 = std::time::Instant::now();
+            let src = SafetensorsDir::open(&transformer)?;
+            let miss = missing(&src, &wan_manifest(&cfg));
+            if !miss.is_empty() {
+                bail!(
+                    "{} tensors missing, e.g. {:?}",
+                    miss.len(),
+                    &miss[..miss.len().min(3)]
+                );
+            }
+            let tensors = fastwan_core::export::quantize_dit(&src, &cfg, weights)?;
+            let bytes: usize = tensors.iter().map(|t| t.3.len()).sum();
+            fastwan_core::export::write(&out, &tensors, fastwan_core::export::metadata(weights))?;
+            let src_bytes: u64 = std::fs::read_dir(&transformer)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum();
+            println!(
+                "{weights}: {} tensors, {:.3} GB (source {:.3} GB) -> {} in {:.1}s",
+                tensors.len(),
+                bytes as f64 / 1e9,
+                src_bytes as f64 / 1e9,
+                out.display(),
+                t0.elapsed().as_secs_f64()
+            );
         }
         Cmd::Generate {
             attn,

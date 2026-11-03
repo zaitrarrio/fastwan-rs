@@ -528,6 +528,7 @@ version = "0.1.0"
 dependencies = [
  "fastwan-core",
  "fastwan-cpu",
+ "safetensors",
 ]
 
 [[package]]

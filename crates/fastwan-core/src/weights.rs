@@ -20,6 +20,18 @@ pub trait WeightSource {
     /// so a Conv3d `[o, i, 1, 2, 2]` may be asked for as `[o, i, 2, 2]`).
     fn get(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>>;
     fn contains(&self, name: &str) -> bool;
+    /// The linear `key` (no `.weight`) if the checkpoint stores it quantized
+    /// (`<key>.weight.q8` / `.q4` + `.scale` [+ `.zero`], see
+    /// [`crate::export`]); `None` for a plain tensor.
+    fn stored(&self, _key: &str) -> Result<Option<crate::quant::Stored>> {
+        Ok(None)
+    }
+    /// Whether the linear `key` (no `.weight`) is present, plain or quantized.
+    fn has_linear(&self, key: &str) -> bool {
+        self.contains(&format!("{key}.weight"))
+            || self.contains(&format!("{key}.weight.q8"))
+            || self.contains(&format!("{key}.weight.q4"))
+    }
 }
 
 fn squeeze(s: &[usize]) -> Vec<usize> {
@@ -100,6 +112,54 @@ fn map_readonly(file: &std::fs::File) -> Result<memmap2::Mmap> {
 impl WeightSource for SafetensorsDir {
     fn contains(&self, name: &str) -> bool {
         self.index.contains_key(name)
+    }
+
+    fn stored(&self, key: &str) -> Result<Option<crate::quant::Stored>> {
+        use crate::quant::{Q4, Q8, Stored};
+        use safetensors::Dtype;
+        let f32s = |name: &str| -> Result<(Vec<usize>, Vec<f32>)> {
+            let (_, shape, _) = self.raw(name)?;
+            let v = self.get(name, &shape)?;
+            Ok((shape, v))
+        };
+        let bad = |m: String| Error::Weights(format!("`{key}`: {m}"));
+        let q8 = format!("{key}.weight.q8");
+        let q4 = format!("{key}.weight.q4");
+        if self.contains_raw(&q8) {
+            let (dt, shape, data) = self.raw(&q8)?;
+            if dt != Dtype::I8 || shape.len() != 2 {
+                return Err(bad(format!("q8 is {dt:?} {shape:?}")));
+            }
+            let (sshape, scales) = f32s(&format!("{key}.weight.scale"))?;
+            if sshape.len() != 2 || sshape[0] != shape[0] || shape[1] % sshape[1] != 0 {
+                return Err(bad(format!("scale {sshape:?} for codes {shape:?}")));
+            }
+            return Ok(Some(Stored::Q8(Q8 {
+                q: data.iter().map(|&b| b as i8).collect(),
+                scales,
+                rows: shape[0],
+                cols: shape[1],
+                group: shape[1] / sshape[1],
+            })));
+        }
+        if self.contains_raw(&q4) {
+            let (dt, shape, data) = self.raw(&q4)?;
+            if dt != Dtype::U8 || shape.len() != 2 {
+                return Err(bad(format!("q4 is {dt:?} {shape:?}")));
+            }
+            let (rows, cols) = (shape[0], 2 * shape[1]);
+            let (sshape, scales) = f32s(&format!("{key}.weight.scale"))?;
+            let (zshape, zeros) = f32s(&format!("{key}.weight.zero"))?;
+            if sshape != zshape || sshape.len() != 2 || sshape[0] != rows || cols % sshape[1] != 0 {
+                return Err(bad(format!(
+                    "scale {sshape:?} / zero {zshape:?} for codes {shape:?}"
+                )));
+            }
+            return Ok(Some(Stored::Q4(Q4::from_packed(
+                data, scales, zeros, rows, cols,
+            ))));
+        }
+        Ok(None)
     }
 
     fn get(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
@@ -284,7 +344,12 @@ pub fn tae_manifest(cfg: &TaeConfig) -> Vec<(String, Vec<usize>)> {
 pub fn missing(src: &dyn WeightSource, manifest: &[(String, Vec<usize>)]) -> Vec<String> {
     manifest
         .iter()
-        .filter(|(n, _)| !src.contains(n))
+        .filter(|(n, _)| {
+            // A quantized checkpoint stores `X.weight` as `X.weight.q8` / `.q4`.
+            !(src.contains(n)
+                || src.contains(&format!("{n}.q8"))
+                || src.contains(&format!("{n}.q4")))
+        })
         .map(|(n, _)| n.clone())
         .collect()
 }
