@@ -601,7 +601,10 @@ pub fn serve(
                     None => true,
                     Some(o) => {
                         !cors.is_empty()
-                            || header("Host").is_some_and(|h| o == format!("http://{h}"))
+                            // Same origin, direct (http) or behind a TLS proxy / tunnel.
+                            || header("Host").is_some_and(|h| {
+                                o == format!("http://{h}") || o == format!("https://{h}")
+                            })
                     }
                 };
                 if !json_body || !origin_ok {

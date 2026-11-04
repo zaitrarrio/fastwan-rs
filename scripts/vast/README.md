@@ -13,6 +13,15 @@ rental is driven through Cloudflare R2 instead of SSH:
    Commands run one at a time, in order, with `/w/fastwan` holding the weights.
 4. Destroy (`DELETE /instances/<id>/`) and check the credit.
 
+Watchdog: `sleep N && <destroy>`, never `sleep N; <destroy>`. With `;`,
+killing the sleep to cancel the timer runs the destroy at once (it took down
+a booting rental on 2026-11-04).
+
+To use a rental's `fastwan serve` from a browser without inbound ports, run a
+Cloudflare quick tunnel on the box (`cloudflared tunnel --url
+http://127.0.0.1:7860`). The URL is public: prefer `--gallery` mode, and
+destroy the rental when done.
+
 Env: `VAST_API_KEY`, `CLOUDFLARE_API_KEY` (token with R2 read/write),
 `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TOKEN_ID`, `FASTWAN_RUN`. Needs boto3.
 
