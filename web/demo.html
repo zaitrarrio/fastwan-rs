@@ -49,6 +49,8 @@ textarea:focus, select:focus, input:focus { outline: 2px solid var(--accent); ou
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { font: 0.8rem var(--f-body); border: 1px solid var(--rule); background: transparent; color: var(--ink); border-radius: 99px; padding: 4px 10px; cursor: pointer; }
 .chip:hover { border-color: var(--accent); color: var(--accent); }
+.chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+textarea[readonly] { color: var(--muted, var(--ink)); background: transparent; }
 button { font: 500 0.92rem var(--f-body); border-radius: 4px; cursor: pointer; padding: 9px 14px; border: 1px solid var(--accent); }
 button.primary { background: var(--accent); color: var(--accent-ink); }
 button.ghost { background: transparent; color: var(--accent); }
@@ -105,9 +107,10 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
         <p class="hint">Chrome and Edge may ask to let this site reach devices on your local network: allow it. Safari blocks pages on https from reaching 127.0.0.1, so use Chrome, Edge or Firefox.</p>
       </div>
       <h2>Prompt</h2>
-      <label class="field"><span class="label">Describe the clip</span>
+      <label class="field"><span class="label" id="prompt-label">Describe the clip</span>
         <textarea id="prompt" maxlength="2000">A red fox trots through fresh snow in a birch forest at dawn, its breath steaming, low golden sunlight, shallow depth of field.</textarea></label>
       <div class="chips" id="examples" aria-label="Example prompts"></div>
+      <p class="msg note" id="gallery-note" hidden>This engine runs without the text encoder, so it can only make its precomputed prompts: pick one above. Add more with <code>fastwan encode</code>.</p>
       <div class="row">
         <label class="field"><span class="label">Size</span><select id="size"></select></label>
         <label class="field"><span class="label">Length</span><select id="length"></select></label>
@@ -194,8 +197,36 @@ async function refreshInfo() {
   setEngine("ok", `${info.model} · ${info.backend}`);
   if (!SAME) $("connect").hidden = true;
   $("synthetic").hidden = !info.synthetic;
+  applyGallery(info.gallery);
   fillOptions();
   $("go").disabled = !!job;
+}
+// Gallery mode (`fastwan serve --gallery`): no text encoder, so the prompt is
+// picked from the engine's precomputed list instead of typed.
+let gallery = null;
+const norm = (p) => p.trim().split(/\s+/).join(" ");
+const escHtml = (t) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+function renderChips() {
+  const list = gallery || EXAMPLES.map(([, p]) => p);
+  const labels = gallery ? gallery.map((p) => (p.length > 42 ? p.slice(0, 40).trimEnd() + "…" : p)) : EXAMPLES.map(([l]) => l);
+  $("examples").innerHTML = list.map((p, i) => `<button type="button" class="chip" data-i="${i}" title="${escHtml(p)}"${gallery ? ' aria-pressed="false"' : ""}>${escHtml(labels[i])}</button>`).join("");
+  markChip();
+}
+function markChip() {
+  if (!gallery) return;
+  const cur = norm($("prompt").value);
+  document.querySelectorAll("#examples .chip").forEach((b) => b.setAttribute("aria-pressed", String(norm(gallery[b.dataset.i]) === cur)));
+}
+function applyGallery(list) {
+  const next = Array.isArray(list) && list.length ? list : null;
+  if (JSON.stringify(next) === JSON.stringify(gallery)) return;
+  gallery = next;
+  $("prompt").readOnly = !!gallery;
+  $("prompt-label").textContent = gallery ? "Prompt (from the engine's gallery)" : "Describe the clip";
+  $("examples").setAttribute("aria-label", gallery ? "Gallery prompts" : "Example prompts");
+  $("gallery-note").hidden = !gallery;
+  if (gallery && !gallery.some((p) => norm(p) === norm($("prompt").value))) $("prompt").value = gallery[0];
+  renderChips();
 }
 function setEngine(kind, text) { $("eng-dot").className = "dot " + kind; $("eng-text").textContent = text; }
 function fillOptions() {
@@ -378,14 +409,18 @@ async function reopen(s) {
   if (!r.ok) { showError("The engine no longer holds that clip (it keeps the last eight)."); return; }
   const cur = await r.json();
   startClip(s.id, cur.width, cur.height, cur.frames);
-  $("prompt").value = cur.prompt; $("seed").value = cur.seed;
+  $("prompt").value = cur.prompt; $("seed").value = cur.seed; markChip();
   await fetchFrames(s.id);
   renderStages(cur); finishClip(cur); document.querySelector(`.clip[data-id="${s.id}"]`)?.remove(); addHistory(cur);
 }
 
 // ---- boot -----------------------------------------------------------------------
-$("examples").innerHTML = EXAMPLES.map(([l], i) => `<button type="button" class="chip" data-i="${i}">${l}</button>`).join("");
-$("examples").onclick = (e) => { const i = e.target.dataset?.i; if (i != null) { $("prompt").value = EXAMPLES[i][1]; $("prompt").focus(); } };
+renderChips();
+$("examples").onclick = (e) => {
+  const i = e.target.dataset?.i; if (i == null) return;
+  $("prompt").value = gallery ? gallery[i] : EXAMPLES[i][1];
+  markChip(); if (!gallery) $("prompt").focus();
+};
 $("dice").onclick = () => { $("seed").value = Math.floor(Math.random() * 1e9); };
 $("form").addEventListener("submit", generate);
 $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) generate(e); });

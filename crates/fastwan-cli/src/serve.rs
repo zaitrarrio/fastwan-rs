@@ -42,13 +42,25 @@ const MAX_QUEUE: usize = 3;
 
 pub enum Weights {
     /// Tiny random model: exercises the engine and the page without a download.
-    Synthetic,
+    /// With a gallery, only its prompts are accepted (embeddings stay random):
+    /// gallery mode's page without the model.
+    Synthetic { gallery: Option<PathBuf> },
     Real {
         transformer: PathBuf,
         tae: PathBuf,
+        text: TextSource,
+    },
+}
+
+pub enum TextSource {
+    /// The native UMT5-XXL on the CPU: any prompt.
+    Umt5 {
         text_encoder: PathBuf,
         tokenizer: PathBuf,
     },
+    /// Precomputed embeddings (`fastwan encode`): only the gallery's prompts,
+    /// no text encoder in memory.
+    Gallery(PathBuf),
 }
 
 pub struct Settings {
@@ -143,14 +155,27 @@ impl Shared {
 
 /// What the engine needs from the prompt side.
 enum Text {
-    Synthetic { len: usize, dim: usize },
+    Synthetic {
+        len: usize,
+        dim: usize,
+        only: Option<crate::gallery::Gallery>,
+    },
     Umt5(Box<fastwan_text::PromptEncoder>),
+    Gallery(crate::gallery::Gallery, WanConfig),
 }
 
 impl Text {
     fn encode(&self, prompt: &str) -> Result<(Vec<f32>, usize)> {
         match self {
-            Text::Synthetic { len, dim } => {
+            Text::Synthetic { len, dim, only } => {
+                if let Some(g) = only {
+                    if g.find(prompt).is_none() {
+                        return Err(anyhow!(
+                            "This engine has no text encoder: pick one of its {} gallery prompts.",
+                            g.entries.len()
+                        ));
+                    }
+                }
                 let seed = prompt.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
                     (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
                 });
@@ -162,6 +187,15 @@ impl Text {
             Text::Umt5(enc) => {
                 let tokens = enc.tokenize(prompt)?.len();
                 Ok((enc.encode(prompt)?, tokens))
+            }
+            Text::Gallery(g, cfg) => {
+                let e = g.find(prompt).ok_or_else(|| {
+                    anyhow!(
+                        "This engine has no text encoder: pick one of its {} gallery prompts.",
+                        g.entries.len()
+                    )
+                })?;
+                Ok((g.embeds(e, cfg)?, e.tokens))
             }
         }
     }
@@ -183,13 +217,23 @@ pub fn engine<B: Backend>(
     };
     stage(&format!("starting on {}", be.name()));
     let (pipe, text, model) = match &s.weights {
-        Weights::Synthetic => {
+        Weights::Synthetic { gallery } => {
             // head_dim 32: small, but runs VSA on every backend.
             let (cfg, tcfg) = (WanConfig::tiny_vsa(), TaeConfig::tiny());
             let src = Synthetic { seed: 1 };
+            let only = match gallery {
+                Some(dir) => {
+                    let g = crate::gallery::Gallery::open(dir)?;
+                    shared.info.lock().unwrap()["gallery"] =
+                        json!(g.entries.iter().map(|e| &e.prompt).collect::<Vec<_>>());
+                    Some(g)
+                }
+                None => None,
+            };
             let text = Text::Synthetic {
                 len: cfg.text_len,
                 dim: cfg.text_dim,
+                only,
             };
             let pipe = Pipeline {
                 dit: WanDit::load_with(&be, cfg, &src, s.quant)?,
@@ -199,14 +243,13 @@ pub fn engine<B: Backend>(
             (
                 pipe,
                 text,
-                "synthetic tiny model (random weights: output is noise)",
+                "synthetic tiny model (random weights: output is noise)".to_string(),
             )
         }
         Weights::Real {
             transformer,
             tae,
-            text_encoder,
-            tokenizer,
+            text,
         } => {
             let cfg = WanConfig::fastwan_1_3b();
             let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy())
@@ -236,12 +279,36 @@ pub fn engine<B: Backend>(
                     &miss[..miss.len().min(3)]
                 ));
             }
-            stage("opening the text encoder");
-            let enc = fastwan_text::PromptEncoder::open(
-                tokenizer,
-                text_encoder,
-                fastwan_text::Umt5Config::xxl(),
-            )?;
+            let text = match text {
+                TextSource::Umt5 {
+                    text_encoder,
+                    tokenizer,
+                } => {
+                    stage("opening the text encoder");
+                    Text::Umt5(Box::new(fastwan_text::PromptEncoder::open(
+                        tokenizer,
+                        text_encoder,
+                        fastwan_text::Umt5Config::xxl(),
+                    )?))
+                }
+                TextSource::Gallery(dir) => {
+                    stage("reading the prompt gallery");
+                    let g = crate::gallery::Gallery::open(dir)?;
+                    shared.info.lock().unwrap()["gallery"] =
+                        json!(g.entries.iter().map(|e| &e.prompt).collect::<Vec<_>>());
+                    Text::Gallery(g, cfg.clone())
+                }
+            };
+            let stored = ["ffn.net.0.proj", "attn1.to_q"]
+                .iter()
+                .find_map(|k| {
+                    let k = format!("blocks.0.{k}.weight");
+                    ["q4", "q8"]
+                        .into_iter()
+                        .find(|q| w.contains_raw(&format!("{k}.{q}")))
+                })
+                .map(|q| if q == "q4" { " · 4-bit" } else { " · int8" })
+                .unwrap_or("");
             stage("loading the transformer onto the GPU (1.4B parameters)");
             let dit = WanDit::load_with(&be, cfg, &w, s.quant)?;
             stage("loading the TAEHV decoder");
@@ -251,11 +318,15 @@ pub fn engine<B: Backend>(
                 tae,
                 schedule: DmdSchedule::fastwan_1_3b(),
             };
-            (
-                pipe,
-                Text::Umt5(Box::new(enc)),
-                "FastWan2.1-T2V-1.3B · DMD 3 steps · TAEHV",
-            )
+            let model = format!(
+                "FastWan2.1-T2V-1.3B{stored} · DMD 3 steps · TAEHV{}",
+                if matches!(text, Text::Gallery(..)) {
+                    " · prompt gallery"
+                } else {
+                    ""
+                }
+            );
+            (pipe, text, model)
         }
     };
     stage("waiting for the GPU");
@@ -442,7 +513,7 @@ pub fn serve(
         jobs: Mutex::new(Vec::new()),
         info: Mutex::new(json!({
             "ready": false, "error": null, "backend": null, "model": null,
-            "synthetic": matches!(s.weights, Weights::Synthetic),
+            "synthetic": matches!(s.weights, Weights::Synthetic { .. }), "gallery": null,
             "max_pixels": s.max_pixels, "max_frames": s.max_frames, "fps": 16,
         })),
         next: Mutex::new(1),
@@ -563,7 +634,26 @@ pub fn serve(
                     respond_json(req, 503, &json!({"error": msg}), &cors);
                     continue;
                 }
-                match parse_request(&body, &s) {
+                // Gallery mode: refuse a prompt it cannot encode now, not
+                // after it has waited in the queue.
+                let parsed = parse_request(&body, &s).and_then(|r| {
+                    let info = shared.info.lock().unwrap();
+                    match info["gallery"].as_array() {
+                        Some(g) if !g.iter().any(|p| {
+                            p.as_str().is_some_and(|p| {
+                                p.split_whitespace().eq(r.0.split_whitespace())
+                            })
+                        }) =>
+                        {
+                            Err(format!(
+                                "This engine has no text encoder: pick one of its {} gallery prompts.",
+                                g.len()
+                            ))
+                        }
+                        _ => Ok(r),
+                    }
+                });
+                match parsed {
                     Err(e) => respond_json(req, 400, &json!({"error": e}), &cors),
                     Ok((prompt, geometry, seed)) => {
                         let mut jobs = shared.jobs.lock().unwrap();

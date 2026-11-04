@@ -8,7 +8,7 @@ use fastwan_core::{
     geometry::Geometry,
     plan::{Device, plan},
     schedule::DmdSchedule,
-    weights::{SafetensorsDir, Synthetic, WeightSource as _, missing, tae_manifest, wan_manifest},
+    weights::{SafetensorsDir, Synthetic, missing, tae_manifest, wan_manifest},
 };
 use fastwan_model::{
     Video,
@@ -18,6 +18,7 @@ use fastwan_model::{
 };
 use std::path::{Path, PathBuf};
 
+mod gallery;
 mod serve;
 
 #[derive(Parser)]
@@ -143,6 +144,14 @@ enum Cmd {
         model_dir: Option<PathBuf>,
         #[arg(long)]
         tae: Option<PathBuf>,
+        /// The DiT checkpoint to load instead of <model-dir>/transformer, e.g. a
+        /// `fastwan quantize` file.
+        #[arg(long)]
+        transformer: Option<PathBuf>,
+        /// Run without the text encoder: only these precomputed prompts
+        /// (`fastwan encode`); <model-dir> then needs no text_encoder/.
+        #[arg(long)]
+        gallery: Option<PathBuf>,
         /// Tiny random model: test the engine and page without weights.
         #[arg(long, default_value_t = false)]
         synthetic: bool,
@@ -170,6 +179,23 @@ enum Cmd {
         weights: fastwan_core::quant::WeightQuant,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Encode prompts once with the native UMT5 and store their embeddings as
+    /// a gallery, so `serve --gallery` / `generate --embeds` run without the
+    /// 11 GB text encoder.
+    Encode {
+        /// A FastWan download with text_encoder/ and tokenizer/.
+        #[arg(long)]
+        model_dir: PathBuf,
+        /// A prompt (repeat for several).
+        #[arg(long = "prompt")]
+        prompts: Vec<String>,
+        /// A text file with one prompt per line (blank lines and `#` lines skipped).
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// The gallery directory (created; existing prompts are kept).
+        #[arg(long)]
+        out_dir: PathBuf,
     },
     /// Generate a clip from precomputed UMT5 prompt embeddings.
     Generate {
@@ -315,6 +341,8 @@ fn main() -> Result<()> {
             backend,
             model_dir,
             tae,
+            transformer,
+            gallery,
             synthetic,
             max_pixels,
             max_frames,
@@ -322,13 +350,18 @@ fn main() -> Result<()> {
             allow_origin,
         } => {
             let weights = if synthetic {
-                serve::Weights::Synthetic
+                serve::Weights::Synthetic { gallery }
             } else {
                 let d = model_dir.expect("clap requires --model-dir");
                 serve::Weights::Real {
-                    transformer: d.join("transformer"),
-                    text_encoder: d.join("text_encoder"),
-                    tokenizer: d.join("tokenizer").join("tokenizer.json"),
+                    transformer: transformer.unwrap_or_else(|| d.join("transformer")),
+                    text: match gallery {
+                        Some(g) => serve::TextSource::Gallery(g),
+                        None => serve::TextSource::Umt5 {
+                            text_encoder: d.join("text_encoder"),
+                            tokenizer: d.join("tokenizer").join("tokenizer.json"),
+                        },
+                    },
                     tae: tae.unwrap_or_else(|| d.join("taew2_1.safetensors")),
                 }
             };
@@ -345,6 +378,46 @@ fn main() -> Result<()> {
             serve::serve(settings, move |s, shared, rx| {
                 with_backend!(backend, |be| serve::engine(be, s, shared, rx))
             })?;
+        }
+        Cmd::Encode {
+            model_dir,
+            mut prompts,
+            prompt_file,
+            out_dir,
+        } => {
+            if let Some(f) = prompt_file {
+                let text =
+                    std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?;
+                prompts.extend(
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(str::to_string),
+                );
+            }
+            if prompts.is_empty() {
+                bail!("give --prompt (repeatable) or --prompt-file");
+            }
+            let t0 = std::time::Instant::now();
+            let enc = fastwan_text::PromptEncoder::open(
+                &model_dir.join("tokenizer").join("tokenizer.json"),
+                &model_dir.join("text_encoder"),
+                fastwan_text::Umt5Config::xxl(),
+            )?;
+            println!("umt5 opened in {:.1}s", t0.elapsed().as_secs_f64());
+            let dim = WanConfig::fastwan_1_3b().text_dim;
+            for p in &prompts {
+                let t = std::time::Instant::now();
+                let tokens = enc.tokenize(p)?.len();
+                let e = enc.encode(p)?;
+                let entry = gallery::Gallery::add(&out_dir, p, tokens, &e, dim)?;
+                println!(
+                    "{} ({tokens} tokens, {:.1}s): {p}",
+                    entry.file,
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            println!("gallery: {}", out_dir.join("gallery.json").display());
         }
         Cmd::Quantize {
             transformer,
@@ -419,7 +492,7 @@ fn main() -> Result<()> {
                     );
                     e
                 }
-                (None, Some(path)) => load_embeds(&path, &cfg)?,
+                (None, Some(path)) => gallery::load_embeds(&path, &cfg)?,
                 (None, None) => bail!("give --prompt or --embeds"),
             };
             with_backend!(backend, |be| generate(
@@ -539,23 +612,6 @@ fn bench<B: Backend>(
         );
     }
     Ok(())
-}
-
-fn load_embeds(path: &Path, cfg: &WanConfig) -> Result<Vec<f32>> {
-    let st = SafetensorsDir::open(path)?;
-    let name = st
-        .names()
-        .find(|n| n.contains("embed"))
-        .map(str::to_string)
-        .context("no `prompt_embeds` tensor in the embeddings file")?;
-    // Accept [L, D] or [1, L, D]; pad with zeros (or trim) to text_len.
-    let total: Vec<f32> = (1..=cfg.text_len)
-        .rev()
-        .find_map(|l| st.get(&name, &[l, cfg.text_dim]).ok())
-        .context("prompt_embeds must be [L <= 512, 4096]")?;
-    let mut out = total;
-    out.resize(cfg.text_len * cfg.text_dim, 0.0);
-    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
