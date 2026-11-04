@@ -62,6 +62,10 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (`scripts/reference/make_fixtures.py`, tiny random weights, checked in). A
   change to either model must keep `hf_parity` green; regenerate fixtures
   only when the reference library changes, and say which version.
+- `fastwan encode` + `fastwan serve --gallery <dir>`: precomputed prompt
+  embeddings (f16, real tokens, `gallery.rs`), engine without the text
+  encoder; only gallery prompts are accepted (400 otherwise). Gallery vs live
+  encoder: 39.4 dB on a clip (`docs/runs/2026-11-04-vast-4090-gallery`).
 - `fastwan serve` binds 127.0.0.1 and sends CORS headers only for the one
   `--allow-origin` site; `/api/generate` also rejects non-JSON bodies and
   foreign `Origin`s (a cross-site form POST skips the preflight). Keep both.
