@@ -15,7 +15,10 @@ State and invariants only; the reasoning is in `docs/design.md`.
   sm_80+; `FASTWAN_CUDA_SCALAR_CONV=1` for the old kernel): 1.55 → 0.56 s on
   an RTX PRO 6000 (325 W cap), clip 4.45 s; fastvideo-rs on that card class:
   denoise 1.92 s / decode 0.26 s vs our 3.80 / 0.56
-  (`docs/runs/2026-11-06-vast-pro6000`).
+  (`docs/runs/2026-11-06-vast-pro6000`). That card was capped at 325 W; at
+  600 W a VSA step is 0.88 s (fastvideo-rs 0.64). `FASTWAN_PROFILE=1` works on
+  CUDA too (per-op, synced): VSA fine 43%, coarse + top-k 12%, GEMMs 26% at
+  332 TFLOP/s, bias pass 8% (`docs/runs/2026-11-06-vast-pro6000-profile`).
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does); `--attention dense` to compare. The VSA
   CPU path is fastvideo-rs's host oracle; keep GPU kernels checked against it.

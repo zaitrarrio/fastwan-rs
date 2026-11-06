@@ -77,6 +77,10 @@ pub struct Cuda {
     q8_scratch: std::sync::Mutex<Option<CuBuf>>,
     /// `FASTWAN_CUDA_SCALAR_CONV=1`: the pre-tensor-core conv, for A/B.
     scalar_conv: bool,
+    /// `FASTWAN_PROFILE=1`: seconds and calls per kernel / GEMM shape. Each
+    /// timed op synchronises the stream before and after (≈10 µs each), so a
+    /// profiled run is a little slower than a plain one.
+    prof: Option<std::sync::Mutex<std::collections::HashMap<String, (f64, usize)>>>,
 }
 
 struct Kernels {
@@ -173,6 +177,9 @@ impl Cuda {
             ampere: maj >= 8,
             q8_scratch: std::sync::Mutex::new(None),
             scalar_conv: std::env::var("FASTWAN_CUDA_SCALAR_CONV").is_ok_and(|v| v == "1"),
+            prof: std::env::var("FASTWAN_PROFILE")
+                .is_ok_and(|v| v == "1")
+                .then(Default::default),
         })
     }
 
@@ -209,7 +216,54 @@ impl Cuda {
         // SAFETY: every kernel's parameter list is matched by the `args`
         // built next to its launch, and every pointer is a live allocation of
         // at least the extent the kernel indexes (lengths asserted by callers).
-        unsafe { lb.launch(cfg) }.expect("kernel launch");
+        self.timed(
+            || self.kernel_name(f).to_string(),
+            || unsafe { lb.launch(cfg) }.expect("kernel launch"),
+        );
+    }
+
+    /// Run `op`; with profiling on, wall time between stream syncs under `tag`.
+    fn timed<R>(&self, tag: impl FnOnce() -> String, op: impl FnOnce() -> R) -> R {
+        let Some(prof) = &self.prof else {
+            return op();
+        };
+        self.stream.synchronize().expect("sync");
+        let t = std::time::Instant::now();
+        let r = op();
+        self.stream.synchronize().expect("sync");
+        let dt = t.elapsed().as_secs_f64();
+        let mut m = prof.lock().unwrap();
+        let e = m.entry(tag()).or_default();
+        e.0 += dt;
+        e.1 += 1;
+        r
+    }
+
+    fn kernel_name(&self, f: &CudaFunction) -> &'static str {
+        let k = &self.f;
+        let all: [(&CudaFunction, &'static str); 18] = [
+            (&k.bias_act, "bias_act"),
+            (&k.norm, "norm"),
+            (&k.head_split, "head_split (qk-norm + rope)"),
+            (&k.attention, "attention (scalar)"),
+            (&k.attention_mma, "attention (mma)"),
+            (&k.vsa_pool, "vsa pool"),
+            (&k.vsa_coarse, "vsa coarse + top-k"),
+            (&k.vsa_fine, "vsa fine (scalar)"),
+            (&k.vsa_fine_mma, "vsa fine (mma)"),
+            (&k.gate_residual, "gate_residual"),
+            (&k.dmd_step, "dmd_step"),
+            (&k.tanh_clamp, "tanh_clamp"),
+            (&k.patch, "patchify"),
+            (&k.conv2d, "conv2d (scalar)"),
+            (&k.conv2d_mma, "conv2d (mma)"),
+            (&k.dequant_q8, "dequant int8"),
+            (&k.dequant_q4, "dequant int4"),
+            (&k.bias_act, "bias_act"),
+        ];
+        all.iter()
+            .find(|(g, _)| std::ptr::eq(*g, f))
+            .map_or("kernel", |(_, n)| n)
     }
 
     fn elems(n: usize) -> (u32, u32, u32) {
@@ -222,6 +276,40 @@ impl Cuda {
     fn words(&self, bits: &[u32]) -> CuBuf {
         let v: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
         Backend::upload_table(self, if v.is_empty() { &[0.0][..] } else { &v })
+    }
+}
+
+impl Cuda {
+    fn profile_table(&self) -> Option<String> {
+        let prof = self.prof.as_ref()?;
+        let m = prof.lock().unwrap();
+        let flops = m.get("gemm FLOP (total)").map_or(0.0, |e| e.0);
+        let mut rows: Vec<(&String, &(f64, usize))> = m
+            .iter()
+            .filter(|(k, _)| k.as_str() != "gemm FLOP (total)")
+            .collect();
+        rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let total: f64 = rows.iter().map(|r| r.1.0).sum();
+        let gemm: f64 = rows
+            .iter()
+            .filter(|r| r.0.starts_with("gemm"))
+            .map(|r| r.1.0)
+            .sum();
+        let mut out = format!(
+            "profile (CUDA, synced per op): {:.1} ms in ops; GEMMs {:.1} ms at {:.1} TFLOP/s\n",
+            total * 1e3,
+            gemm * 1e3,
+            if gemm > 0.0 { flops / gemm / 1e12 } else { 0.0 }
+        );
+        for (k, (t, n)) in rows {
+            out += &format!(
+                "  {k:40} {:9.1} ms {:5.1}%  {n:6} calls  {:8.3} ms/call\n",
+                t * 1e3,
+                100.0 * t / total.max(1e-12),
+                t * 1e3 / *n as f64
+            );
+        }
+        Some(out)
     }
 }
 
@@ -308,15 +396,18 @@ impl Backend for Cuda {
         }
         assert!(!src.f32 && !dst.f32 && so + len <= src.len && d + len <= dst.len);
         // SAFETY: both ranges are inside their allocations (asserted above).
-        unsafe {
-            cudarc::driver::result::memcpy_dtod_async(
-                self.ptr(dst) + (d * 2) as u64,
-                self.ptr(src) + (so * 2) as u64,
-                len * 2,
-                self.stream.cu_stream(),
-            )
-            .expect("dtod");
-        }
+        self.timed(
+            || "copy (dtod)".into(),
+            || unsafe {
+                cudarc::driver::result::memcpy_dtod_async(
+                    self.ptr(dst) + (d * 2) as u64,
+                    self.ptr(src) + (so * 2) as u64,
+                    len * 2,
+                    self.stream.cu_stream(),
+                )
+                .expect("dtod");
+            },
+        );
     }
 
     fn weight(&self, data: &[f32], rows: usize, cols: usize) -> CuWeight {
@@ -380,6 +471,17 @@ impl Backend for Cuda {
         self.stream.synchronize().expect("sync");
     }
 
+    fn profile_report(&self) -> Option<String> {
+        self.profile_table()
+    }
+
+    fn profile_reset(&self) {
+        if let Some(p) = &self.prof {
+            self.stream.synchronize().expect("sync");
+            p.lock().unwrap().clear();
+        }
+    }
+
     fn linear(
         &self,
         x: &CuBuf,
@@ -424,29 +526,44 @@ impl Backend for Cuda {
         // Row-major y[m,n] = x[m,k]·W[n,k]ᵀ is column-major yᵀ = W·xᵀ:
         // A = W (transposed), B = x, C = y, all with leading dims k, k, n.
         // SAFETY: pointers and extents checked above; alpha/beta outlive the call.
-        unsafe {
-            cudarc::cublas::result::gemm_ex(
-                *self.blas.handle(),
-                blas_sys::cublasOperation_t::CUBLAS_OP_T,
-                blas_sys::cublasOperation_t::CUBLAS_OP_N,
-                n as i32,
-                rows as i32,
-                k as i32,
-                (&alpha) as *const f32 as *const _,
-                wp as *const _,
-                blas_sys::cudaDataType_t::CUDA_R_16BF,
-                k as i32,
-                (self.ptr(x) + (x_row * k * 2) as u64) as *const _,
-                blas_sys::cudaDataType_t::CUDA_R_16BF,
-                k as i32,
-                (&beta) as *const f32 as *const _,
-                yp as *mut _,
-                blas_sys::cudaDataType_t::CUDA_R_16BF,
-                n as i32,
-                blas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                blas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-            )
-            .expect("cublas gemm");
+        let flops = 2.0 * rows as f64 * n as f64 * k as f64;
+        self.timed(
+            || {
+                format!(
+                    "gemm n={n} k={k}{}",
+                    if rows < 1024 { " (text)" } else { "" }
+                )
+            },
+            || unsafe {
+                cudarc::cublas::result::gemm_ex(
+                    *self.blas.handle(),
+                    blas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    blas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    n as i32,
+                    rows as i32,
+                    k as i32,
+                    (&alpha) as *const f32 as *const _,
+                    wp as *const _,
+                    blas_sys::cudaDataType_t::CUDA_R_16BF,
+                    k as i32,
+                    (self.ptr(x) + (x_row * k * 2) as u64) as *const _,
+                    blas_sys::cudaDataType_t::CUDA_R_16BF,
+                    k as i32,
+                    (&beta) as *const f32 as *const _,
+                    yp as *mut _,
+                    blas_sys::cudaDataType_t::CUDA_R_16BF,
+                    n as i32,
+                    blas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    blas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+                .expect("cublas gemm");
+            },
+        );
+        if let Some(p) = &self.prof {
+            let mut m = p.lock().unwrap();
+            let e = m.entry("gemm FLOP (total)".into()).or_default();
+            e.0 += flops;
+            e.1 += 1;
         }
         if bias.is_some() || act != Act::None {
             let total = rows * n;
