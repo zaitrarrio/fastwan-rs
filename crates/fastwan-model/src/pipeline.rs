@@ -155,37 +155,43 @@ impl<B: Backend> Pipeline<B> {
         let (mut width, mut height, mut frames) = (0, 0, 0);
         let chunk = chunk.max(1);
         let plane = lh * lw;
-        let mut f0 = 0;
-        while f0 < lt {
-            let nfr = chunk.min(lt - f0);
-            // [C, T, h, w] → frame-major [nfr, C, h, w] for this chunk.
+        // [C, T, h, w] → frame-major [nfr, C, h, w] for one chunk.
+        let gather = |f0: usize, nfr: usize| {
             let mut z = Vec::with_capacity(nfr * c * plane);
             for f in f0..f0 + nfr {
                 for ch in 0..c {
                     z.extend_from_slice(&latent[(ch * lt + f) * plane..][..plane]);
                 }
             }
-            let fr = self.tae.decode_chunk(be, &mut st, &z, nfr, lh, lw);
-            (width, height) = (fr.width, fr.height);
-            frames += fr.frames;
-            let px = fr.width * fr.height;
+            z
+        };
+        // Pipelined: chunk i+1 is queued on the device before chunk i is
+        // converted on the host, so the conversion overlaps GPU work.
+        let starts: Vec<usize> = (0..lt).step_by(chunk).collect();
+        let launch = |st: &mut crate::taehv::DecodeState<B>, f0: usize| {
+            let nfr = chunk.min(lt - f0);
+            self.tae.launch_chunk(be, st, &gather(f0, nfr), nfr, lh, lw)
+        };
+        let mut cur = launch(&mut st, starts[0]);
+        let mut raw = be.download(&cur.rgb);
+        for i in 0..starts.len() {
+            let next = (i + 1 < starts.len()).then(|| launch(&mut st, starts[i + 1]));
+            let (count, h, w, rgb) = cur.rgb8(&raw);
+            (width, height) = (w, h);
+            frames += count;
             let start = out.len();
-            for f in 0..fr.frames {
-                for i in 0..px {
-                    for ch in 0..3 {
-                        let v = fr.data[(f * 3 + ch) * px + i];
-                        out.push((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-                    }
-                }
-            }
+            out.extend_from_slice(&rgb);
             on(Event::Frames {
-                first: frames - fr.frames,
-                count: fr.frames,
+                first: frames - count,
+                count,
                 width,
                 height,
                 rgb: &out[start..],
             });
-            f0 += nfr;
+            if let Some(n) = next {
+                raw = be.download(&n.rgb);
+                cur = n;
+            }
         }
         t.decode_s = t0.elapsed().as_secs_f64();
         Video {

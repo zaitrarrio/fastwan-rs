@@ -12,13 +12,16 @@ State and invariants only; the reasoning is in `docs/design.md`.
   on AMD. WebGPU speed varies by host Vulkan driver (152 vs 83 s/step on
   570.86 vs 595.99 with the old kernels): record the driver with every number.
 - CUDA speed on an RTX PRO 6000 Server Edition (600 W), 832×480×81 VSA:
-  step **0.54 s**, clip 2.41 s (denoise 1.62 s, decode 0.69 s); fastvideo-rs
+  step **0.54 s**, clip 2.21 s (denoise 1.61 s, decode 0.43 s); fastvideo-rs
   on that card class: denoise 1.92 s, decode 0.26 s
   (`docs/runs/2026-11-06-vast-pro6000-opt`). Kernels: tensor-core implicit
   GEMM conv (`fw_conv2d_mma`), radix-select VSA top-k, cuBLASLt bias/GELU
   epilogues (`FASTWAN_CUDA_NO_LT=1` to disable), cp.async-pipelined
   attention with `ldmatrix.trans` V. `FASTWAN_PROFILE=1` gives per-op times
   on CUDA. A 325 W-capped card is ~1.4× slower: record the power limit.
+- The decode is pipelined: `TaeHv::launch_chunk` for chunk i+1 is queued
+  before chunk i is converted on the host (`Chunk::rgb8`, parallel). Keep
+  host work off the GPU's critical path; `--tae-chunk 2` beats 4.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does); `--attention dense` to compare. The VSA
   CPU path is fastvideo-rs's host oracle; keep GPU kernels checked against it.

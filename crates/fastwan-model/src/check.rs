@@ -660,6 +660,55 @@ mod tests {
         }
     }
 
+    /// The pipelined decode (`launch_chunk` → `rgb8`) gives exactly the
+    /// bytes of the chunk-by-chunk f32 path, trimming and chunking included.
+    #[test]
+    fn pipelined_rgb8_decode_equals_f32_path() {
+        let cpu = Cpu;
+        let src = Synthetic { seed: 9 };
+        let cfg = WanConfig::tiny();
+        let pipe = Pipeline {
+            dit: WanDit::load(&cpu, cfg.clone(), &src).unwrap(),
+            tae: TaeHv::load(&cpu, TaeConfig::tiny(), &src).unwrap(),
+            schedule: DmdSchedule::fastwan_1_3b(),
+        };
+        let g = Geometry {
+            width: 64,
+            height: 32,
+            frames: 17,
+        };
+        let (lt, lh, lw) = g.latent();
+        let c = pipe.tae.cfg.latent_channels;
+        let latent = Rng::new(4).normal(c * lt * lh * lw);
+        let mut t = Timings::default();
+        let video = pipe.decode(&cpu, &latent, &g, 2, &mut t);
+        // Reference: decode_chunk per chunk, then the old f32 → u8 loop.
+        let mut st = pipe.tae.state();
+        let mut want = Vec::new();
+        let plane = lh * lw;
+        for f0 in (0..lt).step_by(2) {
+            let nfr = 2.min(lt - f0);
+            let mut z = Vec::new();
+            for f in f0..f0 + nfr {
+                for ch in 0..c {
+                    z.extend_from_slice(&latent[(ch * lt + f) * plane..][..plane]);
+                }
+            }
+            let fr = pipe.tae.decode_chunk(&cpu, &mut st, &z, nfr, lh, lw);
+            let px = fr.width * fr.height;
+            for f in 0..fr.frames {
+                for i in 0..px {
+                    for ch in 0..3 {
+                        let v = fr.data[(f * 3 + ch) * px + i];
+                        want.push((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+                    }
+                }
+            }
+        }
+        assert_eq!(video.frames, g.frames);
+        assert_eq!(video.rgb, want);
+    }
+
     #[test]
     fn chunked_decode_equals_one_shot() {
         let tae = TaeConfig::tiny();

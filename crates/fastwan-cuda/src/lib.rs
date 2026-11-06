@@ -497,10 +497,29 @@ impl Backend for Cuda {
                 .map(|p| f32::from_bits(p[0] as u32 | (p[1] as u32) << 16))
                 .collect()
         } else {
-            h[..buf.len]
-                .iter()
-                .map(|&b| bf16::from_bits(b).to_f32())
-                .collect()
+            // bf16 → f32 is a 16-bit shift; split big buffers (decoded frames)
+            // across the cores.
+            let src = &h[..buf.len];
+            let mut out = vec![0.0f32; src.len()];
+            let threads = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(16);
+            let conv = |s: &[u16], d: &mut [f32]| {
+                for (o, &b) in d.iter_mut().zip(s) {
+                    *o = f32::from_bits((b as u32) << 16);
+                }
+            };
+            if threads <= 1 || src.len() < 1 << 20 {
+                conv(src, &mut out);
+            } else {
+                let per = src.len().div_ceil(threads);
+                std::thread::scope(|sc| {
+                    for (s, d) in src.chunks(per).zip(out.chunks_mut(per)) {
+                        sc.spawn(move || conv(s, d));
+                    }
+                });
+            }
+            out
         }
     }
 

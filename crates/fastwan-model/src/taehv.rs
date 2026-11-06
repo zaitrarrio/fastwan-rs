@@ -52,6 +52,58 @@ pub struct DecodeState<B: Backend> {
     to_trim: usize,
 }
 
+/// One chunk's decoder output on the device: `[frames, 3·p², h, w]`, of
+/// which the first `skip` frames are priming frames to drop.
+pub struct Chunk<B: Backend> {
+    pub rgb: B::Buf,
+    pub frames: usize,
+    pub skip: usize,
+    pub h: usize,
+    pub w: usize,
+    pub p: usize,
+}
+
+impl<B: Backend> Chunk<B> {
+    /// Kept frames as interleaved 8-bit RGB (`[frames, H, W, 3]`), from the
+    /// downloaded `raw` buffer; pixel-shuffle, clamp and rounding in one pass,
+    /// rows split across the available cores.
+    pub fn rgb8(&self, raw: &[f32]) -> (usize, usize, usize, Vec<u8>) {
+        let (p, h, w) = (self.p, self.h, self.w);
+        let (oh, ow, kept, skip) = (h * p, w * p, self.frames - self.skip, self.skip);
+        let mut out = vec![0u8; kept * oh * ow * 3];
+        let row = ow * 3;
+        let fill = |r0: usize, dst: &mut [u8]| {
+            for (ri, line) in dst.chunks_mut(row).enumerate() {
+                let (fo, y) = ((r0 + ri) / oh, (r0 + ri) % oh);
+                let fi = fo + skip;
+                for x in 0..ow {
+                    for c in 0..3 {
+                        let k = c * p * p + (y % p) * p + x % p;
+                        let v = raw[((fi * 3 * p * p + k) * h + y / p) * w + x / p];
+                        line[x * 3 + c] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    }
+                }
+            }
+        };
+        let rows = kept * oh;
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(16);
+        if threads <= 1 || rows < 64 {
+            fill(0, &mut out);
+        } else {
+            let per = rows.div_ceil(threads);
+            std::thread::scope(|sc| {
+                for (i, part) in out.chunks_mut(per * row).enumerate() {
+                    let fill = &fill;
+                    sc.spawn(move || fill(i * per, part));
+                }
+            });
+        }
+        (kept, oh, ow, out)
+    }
+}
+
 /// Decoded frames of one chunk: `[frames, 3, H, W]`, values ≈ `[0, 1]`.
 pub struct Frames {
     pub frames: usize,
@@ -146,6 +198,42 @@ impl<B: Backend> TaeHv<B> {
         h: usize,
         w: usize,
     ) -> Frames {
+        let c = self.launch_chunk(be, st, z, frames, h, w);
+        let raw = be.download(&c.rgb);
+        let (oh, ow) = (c.h * c.p, c.w * c.p);
+        let mut data = vec![0.0f32; (c.frames - c.skip) * 3 * oh * ow];
+        for fi in c.skip..c.frames {
+            for ch in 0..3 {
+                for y in 0..oh {
+                    for xx in 0..ow {
+                        let k = ch * c.p * c.p + (y % c.p) * c.p + xx % c.p;
+                        data[(((fi - c.skip) * 3 + ch) * oh + y) * ow + xx] =
+                            raw[((fi * 3 * c.p * c.p + k) * c.h + y / c.p) * c.w + xx / c.p];
+                    }
+                }
+            }
+        }
+        Frames {
+            frames: c.frames - c.skip,
+            height: oh,
+            width: ow,
+            data,
+        }
+    }
+
+    /// Queue one chunk's decode on the device and return without waiting:
+    /// [`Chunk::rgb8`] after [`Backend::download`] turns it into frames. The
+    /// pipeline launches chunk i+1 before converting chunk i, so the host
+    /// work overlaps the GPU's.
+    pub fn launch_chunk(
+        &self,
+        be: &B,
+        st: &mut DecodeState<B>,
+        z: &[f32],
+        frames: usize,
+        h: usize,
+        w: usize,
+    ) -> Chunk<B> {
         let cfg = &self.cfg;
         let nf = cfg.widths;
         assert_eq!(z.len(), frames * cfg.latent_channels * h * w);
@@ -247,28 +335,15 @@ impl<B: Backend> TaeHv<B> {
             &self.last,
             ConvEpilogue::None,
         );
-        let raw = be.download(&rgb);
-        let p = cfg.patch;
-        let (oh, ow) = (h * p, w * p);
         let skip = st.to_trim.min(f);
         st.to_trim -= skip;
-        let mut data = vec![0.0f32; (f - skip) * 3 * oh * ow];
-        for fi in skip..f {
-            for c in 0..3 {
-                for y in 0..oh {
-                    for xx in 0..ow {
-                        let ch = c * p * p + (y % p) * p + xx % p;
-                        data[(((fi - skip) * 3 + c) * oh + y) * ow + xx] =
-                            raw[((fi * 3 * p * p + ch) * h + y / p) * w + xx / p];
-                    }
-                }
-            }
-        }
-        Frames {
-            frames: f - skip,
-            height: oh,
-            width: ow,
-            data,
+        Chunk {
+            rgb,
+            frames: f,
+            skip,
+            h,
+            w,
+            p: cfg.patch,
         }
     }
 }

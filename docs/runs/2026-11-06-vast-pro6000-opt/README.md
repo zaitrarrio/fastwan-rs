@@ -54,3 +54,33 @@ gone (was 70).
 The denoise is now faster than fastvideo-rs's on this card class; the
 decode is not, and its remaining cost is host-side (per-chunk allocation,
 f32 download and conversion), not GPU work.
+
+## Follow-up: the decode's host side
+
+Vast instance 59462106: RTX PRO 6000 Server Edition, Texas, driver
+580.95.05, 600 W, 256 host threads. Previous build vs this one, same box.
+
+The decode spent most of its wall time on the CPU: three serial passes per
+chunk (bf16 → f32, a pixel-shuffle reorder with a division per element,
+f32 → u8) while the GPU sat idle. Now:
+
+- `TaeHv::launch_chunk` queues a chunk without waiting; the pipeline
+  launches chunk i+1 before converting chunk i, so the conversion overlaps
+  GPU work.
+- `Chunk::rgb8`: reorder, clamp and 8-bit rounding in one pass, rows split
+  across the cores; the CUDA download's bf16 → f32 is split the same way.
+
+| | old | new |
+|---|---|---|
+| decode (`generate`) | 0.97 s | **0.43 s** |
+| decode (`bench`) | 1.34 s | 0.49 s |
+| real clip, total | 2.76 s | **2.21 s** |
+| `--tae-chunk 4` | | 0.52 s (fewer, larger chunks overlap less) |
+
+Output: identical bytes (PSNR ∞ against the old build; unit test
+`pipelined_rgb8_decode_equals_f32_path`). `check`: 50/50 on CUDA.
+
+Against fastvideo-rs on this card class: denoise **1.61 s vs 1.92 s**,
+decode 0.43 s vs **0.26 s**, so a clip now costs about the same (2.21 s here,
+~2.2 s there) on 5–8× less VRAM. The decode's GPU work is 0.28 s; the rest
+is the per-chunk host round trip.
