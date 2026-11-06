@@ -150,6 +150,17 @@ while the rest of the clip decodes. The server binds 127.0.0.1 and sends no
 CORS headers, so another website cannot queue work on your GPU. It keeps the
 last eight clips (their RGB frames are the memory cost).
 
+## Decode on tensor cores
+
+TAEHV's convs were a scalar implicit GEMM with four integer divisions per
+gathered element: 1.55 s per 81-frame 480p decode on an RTX PRO 6000.
+`fw_conv2d_mma` gathers one pixel row per thread with counted (ci, ky, kx),
+feeds bf16 `mma.sync` 128×64×32 tiles and prefetches the next K tile into
+registers: 0.56 s, the same output to bf16 rounding (58.5 dB). fastvideo-rs
+does it in 0.26 s; a double-buffered `cp.async` pipeline and channel-last
+activations are the obvious next steps, but the DiT step (3.80 s) is now
+the larger gap.
+
 ## Reference numbers (fastvideo-rs, not this repo)
 
 `lab/gold/fastwan21-1.3b.toml`, RTX PRO 6000 Blackwell, 832×480×81, VSA:

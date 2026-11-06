@@ -11,6 +11,11 @@ State and invariants only; the reasoning is in `docs/design.md`.
   clip 42.7 s (`docs/runs/2026-11-03-vast-4090-webgpu-perf`). Neither has run
   on AMD. WebGPU speed varies by host Vulkan driver (152 vs 83 s/step on
   570.86 vs 595.99 with the old kernels): record the driver with every number.
+- TAEHV decode on CUDA uses `fw_conv2d_mma` (tensor-core implicit GEMM,
+  sm_80+; `FASTWAN_CUDA_SCALAR_CONV=1` for the old kernel): 1.55 → 0.56 s on
+  an RTX PRO 6000 (325 W cap), clip 4.45 s; fastvideo-rs on that card class:
+  denoise 1.92 s / decode 0.26 s vs our 3.80 / 0.56
+  (`docs/runs/2026-11-06-vast-pro6000`).
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does); `--attention dense` to compare. The VSA
   CPU path is fastvideo-rs's host oracle; keep GPU kernels checked against it.
