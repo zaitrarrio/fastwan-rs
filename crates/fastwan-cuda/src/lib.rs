@@ -75,6 +75,8 @@ pub struct Cuda {
     /// bf16 scratch for the int8 weight being multiplied (grown on demand;
     /// one stream, so consecutive GEMMs reuse it safely).
     q8_scratch: std::sync::Mutex<Option<CuBuf>>,
+    /// `FASTWAN_CUDA_SCALAR_CONV=1`: the pre-tensor-core conv, for A/B.
+    scalar_conv: bool,
 }
 
 struct Kernels {
@@ -92,6 +94,7 @@ struct Kernels {
     tanh_clamp: CudaFunction,
     patch: CudaFunction,
     conv2d: CudaFunction,
+    conv2d_mma: CudaFunction,
     dequant_q8: CudaFunction,
     dequant_q4: CudaFunction,
 }
@@ -153,6 +156,7 @@ impl Cuda {
             tanh_clamp: get("fw_tanh_clamp")?,
             patch: get("fw_patch")?,
             conv2d: get("fw_conv2d")?,
+            conv2d_mma: get("fw_conv2d_mma")?,
             dequant_q8: get("fw_dequant_q8")?,
             dequant_q4: get("fw_dequant_q4")?,
         };
@@ -168,6 +172,7 @@ impl Cuda {
             name,
             ampere: maj >= 8,
             q8_scratch: std::sync::Mutex::new(None),
+            scalar_conv: std::env::var("FASTWAN_CUDA_SCALAR_CONV").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -741,7 +746,11 @@ impl Backend for Cuda {
             ConvEpilogue::AddRelu(r) => (2, Some(r)),
         };
         let (oh, ow) = s.out_hw();
-        let mt = (s.frames * oh * ow).div_ceil(64) as u32;
+        // Tensor-core implicit GEMM on sm_80+ (FASTWAN_CUDA_SCALAR_CONV=1 for
+        // the scalar kernel, to A/B); tiles of 128 pixels instead of 64.
+        let mma = self.ampere && !self.scalar_conv;
+        let tile = if mma { 128 } else { 64 };
+        let mt = (s.frames * oh * ow).div_ceil(tile) as u32;
         let (gy, gz) = if mt <= 65535 {
             (mt, 1)
         } else {
@@ -749,9 +758,13 @@ impl Backend for Cuda {
             (mt.div_ceil(z), z)
         };
         self.launch(
-            &self.f.conv2d,
+            if mma {
+                &self.f.conv2d_mma
+            } else {
+                &self.f.conv2d
+            },
             (s.cout.div_ceil(64) as u32, gy, gz),
-            (16, 16, 1),
+            if mma { (128, 1, 1) } else { (16, 16, 1) },
             &[
                 Arg::P(self.ptr(a)),
                 Arg::P(self.opt(b)),

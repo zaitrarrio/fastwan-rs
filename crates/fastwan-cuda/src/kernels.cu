@@ -591,3 +591,145 @@ extern "C" __global__ void fw_dequant_q4(u64 out_, u64 q_, u64 sz_, long n, int 
     long g = i / group;
     out[i] = bf((c - sz[2 * g + 1]) * sz[2 * g]);
 }
+
+// Tensor-core implicit-GEMM conv (sm_80+), same contract as fw_conv2d:
+// M = output pixels (frames·oh·ow), N = cout, K = (cin_a + cin_b)·k² in
+// (ci, ky, kx) order, bf16 mma.sync.m16n8k16 with f32 accumulation.
+// Block tile 128 (M) × 64 (N) × 32 (K), 4 warps as 2 × 2, 64 × 32 per warp.
+// Each thread owns one pixel row of the A tile: its (f, oy, ox) is computed
+// once, and (ci, ky, kx) advance by counting, so the gather has no divisions.
+// The next K tile is fetched into registers while the current one is used.
+#define CV_BM 128
+#define CV_BN 64
+#define CV_BK 32
+#define CV_LD 20   // u32 words per smem row: 32 bf16 + 8 pad; conflict-free fragment reads
+
+extern "C" __global__ void __launch_bounds__(128) fw_conv2d_mma(
+        u64 a_, u64 b_, u64 w_, u64 bias_, u64 res_, u64 out_,
+        int frames, int cin_a, int cin_b, int cout, int h, int w,
+        int up, int k, int has_bias, int ep) {
+    __shared__ unsigned As[CV_BM * CV_LD];
+    __shared__ unsigned Bs[CV_BN * CV_LD];
+    const unsigned short *a = (const unsigned short*)a_, *b = (const unsigned short*)b_;
+    const unsigned short *wt = (const unsigned short*)w_;
+    const bf16_t *bias = (const bf16_t*)bias_, *res = (const bf16_t*)res_;
+    bf16_t* out = (bf16_t*)out_;
+    const int oh = h * up, ow = w * up, kk2 = k * k, kt = (cin_a + cin_b) * kk2, pad = k / 2;
+    const long plane = (long)oh * ow, mt = (long)frames * plane;
+    const long m0 = ((long)blockIdx.y + (long)blockIdx.z * gridDim.y) * CV_BM;
+    const int n0 = blockIdx.x * CV_BN;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp & 1, wn = warp >> 1, g = lane >> 2, t = lane & 3;
+
+    // This thread's A row: one output pixel.
+    const long m = m0 + tid;
+    const bool mok = m < mt;
+    long fa = 0, fb = 0;
+    int oy = 0, ox = 0;
+    if (mok) {
+        const long f = m / plane, rr = m - f * plane;
+        oy = (int)(rr / ow); ox = (int)(rr - (long)oy * ow);
+        fa = f * cin_a * (long)h * w;
+        fb = f * (long)cin_b * h * w;
+    }
+    const long hw = (long)h * w;
+    // B: 64 rows × 32 k; thread → row tid/2, k half (tid&1)·16.
+    const int bn = tid >> 1, bh = (tid & 1) * 16;
+    const bool bok = n0 + bn < cout;
+    const unsigned short* wrow = wt + (long)(n0 + bn) * kt;
+
+    unsigned ra[16], rb[8];
+    auto fetch = [&](int k0) {
+        // A: 32 consecutive k of this pixel, (ci, ky, kx) counted from k0.
+        int ci = k0 / kk2, q = k0 - ci * kk2, ky = q / k, kx = q - ky * k;
+        #pragma unroll
+        for (int p = 0; p < 16; ++p) {
+            unsigned v[2];
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int gk = k0 + 2 * p + e;
+                unsigned short x = 0;
+                if (mok && gk < kt) {
+                    const int yy = oy + ky - pad, xx = ox + kx - pad;
+                    if (yy >= 0 && xx >= 0 && yy < oh && xx < ow) {
+                        const int sy = up == 2 ? yy >> 1 : yy, sx = up == 2 ? xx >> 1 : xx;
+                        x = ci < cin_a ? a[fa + ci * hw + (long)sy * w + sx]
+                                       : b[fb + (ci - cin_a) * hw + (long)sy * w + sx];
+                    }
+                }
+                v[e] = x;
+                if (++kx == k) { kx = 0; if (++ky == k) { ky = 0; ++ci; } }
+            }
+            ra[p] = v[0] | (v[1] << 16);
+        }
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int gk = k0 + bh + 2 * p;
+            const unsigned lo = (bok && gk < kt) ? wrow[gk] : 0u;
+            const unsigned hi = (bok && gk + 1 < kt) ? wrow[gk + 1] : 0u;
+            rb[p] = lo | (hi << 16);
+        }
+    };
+
+    float acc[4][4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) acc[i][j][r] = 0.0f;
+
+    fetch(0);
+    for (int k0 = 0; k0 < kt; k0 += CV_BK) {
+        #pragma unroll
+        for (int p = 0; p < 16; ++p) As[tid * CV_LD + p] = ra[p];
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) Bs[bn * CV_LD + (bh >> 1) + p] = rb[p];
+        __syncthreads();
+        if (k0 + CV_BK < kt) fetch(k0 + CV_BK);
+        #pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            const int kw = ks * 8 + t;   // u32 column of k = ks·16 + 2t
+            unsigned bf[4][2];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int n = wn * 32 + j * 8 + g;
+                bf[j][0] = Bs[n * CV_LD + kw];
+                bf[j][1] = Bs[n * CV_LD + kw + 4];
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int r0 = wm * 64 + i * 16 + g;
+                const unsigned a0 = As[r0 * CV_LD + kw], a1 = As[(r0 + 8) * CV_LD + kw];
+                const unsigned a2 = As[r0 * CV_LD + kw + 4], a3 = As[(r0 + 8) * CV_LD + kw + 4];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) mma_bf16(acc[i][j], a0, a1, a2, a3, bf[j][0], bf[j][1]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Epilogue: c0,c1 = (row g, cols 2t, 2t+1); c2,c3 = row g + 8.
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int hrow = 0; hrow < 2; ++hrow) {
+            const long mm = m0 + wm * 64 + i * 16 + g + hrow * 8;
+            if (mm >= mt) continue;
+            const long f = mm / plane, px = mm - f * plane;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                #pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    const int n = n0 + wn * 32 + j * 8 + 2 * t + c;
+                    if (n >= cout) continue;
+                    float v = acc[i][j][hrow * 2 + c] + (has_bias ? ld(bias, n) : 0.0f);
+                    const long o = (f * cout + n) * plane + px;
+                    if (ep == 1) v = fmaxf(v, 0.0f);
+                    if (ep == 2) v = fmaxf(v + ld(res, o), 0.0f);
+                    out[o] = bf(v);
+                }
+            }
+        }
+    }
+}

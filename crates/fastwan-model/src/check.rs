@@ -479,6 +479,34 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             },
             0,
         ),
+        // Tensor-core tiling on CUDA: many K tiles, two N tiles + tail,
+        // concat + upsample, M tail.
+        (
+            ConvShape {
+                frames: 2,
+                cin_a: 40,
+                cin_b: 24,
+                cout: 72,
+                h: 13,
+                w: 17,
+                upsample: true,
+                k: 3,
+            },
+            2,
+        ),
+        (
+            ConvShape {
+                frames: 3,
+                cin_a: 130,
+                cin_b: 0,
+                cout: 3,
+                h: 11,
+                w: 9,
+                upsample: false,
+                k: 1,
+            },
+            1,
+        ),
     ];
     for (s, ep) in cases {
         let a = rng.normal(s.frames * s.cin_a * s.h * s.w);
