@@ -1,7 +1,116 @@
-/target
+# Cargo. Cargo.lock stays: this workspace builds the `fastwan` binary.
+/target/
+**/*.rs.bk
+
+# Downloaded checkpoints (`huggingface-cli download … --local-dir fastwan`)
+# and a local checkout of the TAEHV reference. Weights live in R2, not git.
+/fastwan/
+/taehv/
+/fastwan-runs/
+.cache/
+
+# Generated checkpoints, quantized exports, and prompt-gallery embeddings.
+# The tiny transformers/diffusers fixtures under tests/fixtures/ are checked in.
+*.safetensors
+!crates/**/fixtures/*.safetensors
+
+# CLI frame dump (`--out` defaults to out.y4m) and clips written at the repo
+# root. Measurement clips and stills under docs/runs/ stay tracked.
 *.y4m
-/web/dist
-/web/site
-/web/pkg
-/web/pkg-*
-scripts/vast/__pycache__/
+/*.mp4
+/*.webm
+/*.png
+/*.gif
+
+# `python3 web/build.py` output. The sources are web/*.html and the shaders.
+/web/dist/
+/web/site/
+
+# Cloudflare (wrangler cache, Pages local state, Worker secrets).
+.wrangler/
+.dev.vars
+
+# Python (scripts/, web/build.py).
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.python-version
+
+# Hand-built CUDA objects and NVRTC / profiler dumps. Kernels ship as source
+# (`kernels.cu`); NVRTC compiles them at runtime.
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.cubin
+*.ptx
+*.fatbin
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# Profiles and coverage (cargo-flamegraph, llvm-cov, tarpaulin).
+perf.data
+perf.data.old
+flamegraph.svg
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+cobertura.xml
+
+# Secrets. Rental and R2 credentials come from the environment.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Editor and OS junk.
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*~
+*.swp
+*.swo
+*.orig
+*.rej
+.idea/
+.vscode/
+*.code-workspace
+
+# Logs, cores, scratch.
+*.log
+core
+core.*
+/tmp/
+*.tmp
+
+# If a JS toolchain shows up next to wrangler.
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.direnv/
