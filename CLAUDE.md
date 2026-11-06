@@ -11,14 +11,14 @@ State and invariants only; the reasoning is in `docs/design.md`.
   clip 42.7 s (`docs/runs/2026-11-03-vast-4090-webgpu-perf`). Neither has run
   on AMD. WebGPU speed varies by host Vulkan driver (152 vs 83 s/step on
   570.86 vs 595.99 with the old kernels): record the driver with every number.
-- TAEHV decode on CUDA uses `fw_conv2d_mma` (tensor-core implicit GEMM,
-  sm_80+; `FASTWAN_CUDA_SCALAR_CONV=1` for the old kernel): 1.55 → 0.56 s on
-  an RTX PRO 6000 (325 W cap), clip 4.45 s; fastvideo-rs on that card class:
-  denoise 1.92 s / decode 0.26 s vs our 3.80 / 0.56
-  (`docs/runs/2026-11-06-vast-pro6000`). That card was capped at 325 W; at
-  600 W a VSA step is 0.88 s (fastvideo-rs 0.64). `FASTWAN_PROFILE=1` works on
-  CUDA too (per-op, synced): VSA fine 43%, coarse + top-k 12%, GEMMs 26% at
-  332 TFLOP/s, bias pass 8% (`docs/runs/2026-11-06-vast-pro6000-profile`).
+- CUDA speed on an RTX PRO 6000 Server Edition (600 W), 832×480×81 VSA:
+  step **0.54 s**, clip 2.41 s (denoise 1.62 s, decode 0.69 s); fastvideo-rs
+  on that card class: denoise 1.92 s, decode 0.26 s
+  (`docs/runs/2026-11-06-vast-pro6000-opt`). Kernels: tensor-core implicit
+  GEMM conv (`fw_conv2d_mma`), radix-select VSA top-k, cuBLASLt bias/GELU
+  epilogues (`FASTWAN_CUDA_NO_LT=1` to disable), cp.async-pipelined
+  attention with `ldmatrix.trans` V. `FASTWAN_PROFILE=1` gives per-op times
+  on CUDA. A 325 W-capped card is ~1.4× slower: record the power limit.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does); `--attention dense` to compare. The VSA
   CPU path is fastvideo-rs's host oracle; keep GPU kernels checked against it.

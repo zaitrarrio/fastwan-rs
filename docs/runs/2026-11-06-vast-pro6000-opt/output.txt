@@ -1,0 +1,82 @@
+old binary ok
+NVIDIA RTX PRO 6000 Blackwell Server Edition, 595.71.05, 600.00 W
+--- check cuda (new)
+linear 1100x1536x200 GeluTanh                    rel 3.73e-3  ok
+attention h2 5x5 d16                             rel 4.30e-3  ok
+attention h3 70x70 d64                           rel 5.39e-3  ok
+attention h2 100x13 d128                         rel 4.09e-3  ok
+attention h1 33x129 d128                         rel 6.72e-3  ok
+attention h12 200x200 d128                       rel 5.97e-3  ok
+attention h3 130x512 d128                        rel 4.45e-3  ok
+vsa (5, 6, 9) h2 d128 topk 3/12                  rel 4.69e-3  ok
+vsa (4, 8, 8) h3 d16 topk 2/4                    rel 4.15e-3  ok
+vsa (9, 5, 7) h1 d64 topk 3/12                   rel 3.44e-3  ok
+conv2d k3 cin 40+24 up=true ep=2                 rel 3.15e-3  ok
+tiny DiT, 3 DMD steps (latent)                   rel 4.04e-3  ok
+tiny TAEHV decode (frames)                       rel 7.63e-3  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps (latent)      rel 4.58e-3  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps, int8 (latent) rel 3.28e-3  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps, int4-hqq-g32 (latent) rel 3.18e-3  ok
+all 50 checks pass (tolerance 3e-2)
+--- bench old (unprofiled)
+step 0 0.884s  (29.5 ms/layer)
+step 1 0.876s  (29.2 ms/layer)
+step 2 0.862s  (28.7 ms/layer)
+denoise 2.622s; scaled to 30 layers ≈ 2.62s
+decode (TAEHV) 0.690s -> 81 frames 832x480
+--- bench bin (unprofiled)
+step 0 0.540s  (18.0 ms/layer)
+step 1 0.537s  (17.9 ms/layer)
+step 2 0.538s  (17.9 ms/layer)
+denoise 1.616s; scaled to 30 layers ≈ 1.62s
+decode (TAEHV) 0.665s -> 81 frames 832x480
+--- bench new, FASTWAN_CUDA_NO_LT=1
+step 0 0.598s  (19.9 ms/layer)
+step 1 0.593s  (19.8 ms/layer)
+step 2 0.595s  (19.8 ms/layer)
+denoise 1.786s; scaled to 30 layers ≈ 1.79s
+--- bench new, profiled
+cuda NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120)  |  832x480x81  32760 tokens  30 layers
+load (synthetic) 3.61s
+denoise profile (CUDA, synced per op): 1626.6 ms in ops; GEMMs 705.0 ms at 368.7 TFLOP/s
+  vsa fine (mma)                               652.1 ms  40.1%      90 calls     7.245 ms/call
+  gemm+bias n=1536 k=8960                      211.1 ms  13.0%      90 calls     2.346 ms/call
+  gemm+bias+gelu n=8960 k=1536                 210.7 ms  13.0%      90 calls     2.341 ms/call
+  gemm+bias n=1536 k=1536                      161.3 ms   9.9%     360 calls     0.448 ms/call
+  gemm+bias n=4608 k=1536                      110.2 ms   6.8%      90 calls     1.225 ms/call
+  head_split (qk-norm + rope)                   67.1 ms   4.1%     510 calls     0.132 ms/call
+  norm                                          66.4 ms   4.1%     273 calls     0.243 ms/call
+  vsa coarse + top-k                            55.5 ms   3.4%      90 calls     0.617 ms/call
+  attention (mma)                               39.1 ms   2.4%      90 calls     0.434 ms/call
+  vsa pool                                      23.6 ms   1.5%      90 calls     0.262 ms/call
+  gate_residual                                 17.7 ms   1.1%      90 calls     0.197 ms/call
+  gemm+bias+gelu n=1536 k=4096 (text)            8.4 ms   0.5%       1 calls     8.427 ms/call
+  gemm+bias n=3072 k=1536 (text)                 2.3 ms   0.1%      30 calls     0.077 ms/call
+  gemm+bias n=64 k=1536                          0.4 ms   0.0%       3 calls     0.140 ms/call
+  gemm+bias n=1536 k=64                          0.3 ms   0.0%       3 calls     0.112 ms/call
+  patchify                                       0.1 ms   0.0%       6 calls     0.024 ms/call
+  gemm+bias n=1536 k=1536 (text)                 0.1 ms   0.0%       1 calls     0.087 ms/call
+  dmd_step                                       0.0 ms   0.0%       3 calls     0.014 ms/call
+prompt prep 0.139s
+step 0 0.576s  (19.2 ms/layer)
+step 1 0.572s  (19.1 ms/layer)
+step 2 0.538s  (17.9 ms/layer)
+denoise 1.686s; scaled to 30 layers ≈ 1.69s
+decode profile (CUDA, synced per op): 281.4 ms in ops; GEMMs -0.0 ms at 0.0 TFLOP/s
+  conv2d (mma)                                 277.3 ms  98.5%     385 calls     0.720 ms/call
+  copy (dtod)                                    3.9 ms   1.4%     282 calls     0.014 ms/call
+  tanh_clamp                                     0.3 ms   0.1%      11 calls     0.024 ms/call
+decode (TAEHV) 0.728s -> 81 frames 832x480
+--- bench new, dense, unprofiled
+step 0 0.989s  (33.0 ms/layer)
+step 1 0.996s  (33.2 ms/layer)
+step 2 0.997s  (33.2 ms/layer)
+denoise 2.981s; scaled to 30 layers ≈ 2.98s
+--- generate old
+run 0: total 3.35s  prompt 0.13s  denoise 2.53s (["0.85", "0.84", "0.84"])  decode 0.65s
+run 1: total 3.29s  prompt 0.08s  denoise 2.54s (["0.85", "0.85", "0.85"])  decode 0.64s
+--- generate bin
+run 0: total 2.50s  prompt 0.13s  denoise 1.62s (["0.54", "0.54", "0.54"])  decode 0.71s
+run 1: total 2.41s  prompt 0.07s  denoise 1.62s (["0.54", "0.54", "0.54"])  decode 0.69s
+PSNR new vs old: PSNR y:31.631599 u:41.216962 v:42.768481 average:35.658354 min:33.065250 max:38.170156
+exit 0

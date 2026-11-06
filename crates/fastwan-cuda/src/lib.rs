@@ -11,6 +11,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use cudarc::cublas::{CudaBlas, sys as blas_sys};
+use cudarc::cublaslt::{result as lt_result, sys as lt_sys};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
     PushKernelArg,
@@ -66,6 +67,9 @@ pub struct Cuda {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     blas: CudaBlas,
+    /// cuBLASLt with the bias / GELU epilogue fused into the GEMM; `None`
+    /// when unavailable or `FASTWAN_CUDA_NO_LT=1` (then GEMM + `fw_bias_act`).
+    lt: Option<Lt>,
     #[allow(dead_code)]
     module: Arc<CudaModule>,
     f: Kernels,
@@ -130,6 +134,114 @@ pub fn compile_kernels(arch: &'static str) -> Result<cudarc::nvrtc::Ptx, CudaErr
     .map_err(err)
 }
 
+/// One cached cuBLASLt plan per (n, k, rows, epilogue).
+struct LtPlan {
+    desc: lt_sys::cublasLtMatmulDesc_t,
+    a: lt_sys::cublasLtMatrixLayout_t,
+    b: lt_sys::cublasLtMatrixLayout_t,
+    c: lt_sys::cublasLtMatrixLayout_t,
+    algo: lt_sys::cublasLtMatmulAlgo_t,
+}
+
+struct Lt {
+    handle: lt_sys::cublasLtHandle_t,
+    workspace: CudaSlice<u8>,
+    plans: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize, u8), Option<LtPlan>>>,
+}
+
+// SAFETY: the handles are only used from the thread that owns the backend,
+// on its one stream; the Mutex serialises the plan cache.
+unsafe impl Send for Lt {}
+unsafe impl Sync for Lt {}
+
+const LT_WORKSPACE: usize = 32 << 20;
+
+impl Lt {
+    fn new(stream: &Arc<CudaStream>) -> Result<Self, CudaError> {
+        let handle = lt_result::create_handle().map_err(err)?;
+        let workspace = stream.alloc_zeros::<u8>(LT_WORKSPACE).map_err(err)?;
+        Ok(Self {
+            handle,
+            workspace,
+            plans: Default::default(),
+        })
+    }
+
+    /// Column-major yᵀ[n, rows] = Wᵀ… as in the cuBLAS path: A = W (op T,
+    /// stored k × n), B = x (k × rows), C = D = y (n × rows), all bf16, f32
+    /// accumulate. `epi` 0 = bias, 1 = GELU(·+bias). `None` = not supported.
+    fn plan(&self, n: usize, k: usize, rows: usize, epi: u8) -> Option<LtPlan> {
+        use lt_sys::cudaDataType_t::{CUDA_R_16BF, CUDA_R_32F};
+        let a = lt_result::create_matrix_layout(CUDA_R_16BF, k as u64, n as u64, k as i64).ok()?;
+        let b =
+            lt_result::create_matrix_layout(CUDA_R_16BF, k as u64, rows as u64, k as i64).ok()?;
+        let c =
+            lt_result::create_matrix_layout(CUDA_R_16BF, n as u64, rows as u64, n as i64).ok()?;
+        let desc = lt_result::create_matmul_desc(
+            lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            CUDA_R_32F,
+        )
+        .ok()?;
+        let t: i32 = 1;
+        let epilogue = if epi == 1 {
+            lt_sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU_BIAS
+        } else {
+            lt_sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS
+        };
+        let pref = lt_result::create_matmul_pref().ok()?;
+        let ws = LT_WORKSPACE as u64;
+        // SAFETY: freshly created descriptors; attribute buffers outlive the calls.
+        unsafe {
+            lt_result::set_matmul_desc_attribute(
+                desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                (&t) as *const i32 as *const _,
+                4,
+            )
+            .ok()?;
+            lt_result::set_matmul_desc_attribute(
+                desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+                (&epilogue) as *const _ as *const _,
+                std::mem::size_of::<lt_sys::cublasLtEpilogue_t>(),
+            )
+            .ok()?;
+            lt_result::set_matmul_pref_attribute(
+                pref,
+                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&ws) as *const u64 as *const _,
+                8,
+            )
+            .ok()?;
+            // A placeholder bias pointer for the heuristic; set per call.
+            let dummy: u64 = self.workspace_ptr();
+            lt_result::set_matmul_desc_attribute(
+                desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                (&dummy) as *const u64 as *const _,
+                8,
+            )
+            .ok()?;
+            let h = lt_result::get_matmul_algo_heuristic(self.handle, desc, a, b, c, c, pref);
+            let _ = lt_result::destroy_matmul_pref(pref);
+            Some(LtPlan {
+                desc,
+                a,
+                b,
+                c,
+                algo: h.ok()?.algo,
+            })
+        }
+    }
+
+    fn workspace_ptr(&self) -> u64 {
+        // The workspace lives as long as `self`; no stream ordering is needed
+        // for a pointer value.
+        let (p, _sync) = self.workspace.device_ptr(self.workspace.stream());
+        p
+    }
+}
+
 enum Arg {
     P(u64),
     I(i32),
@@ -166,11 +278,17 @@ impl Cuda {
         };
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
+        let lt = if std::env::var("FASTWAN_CUDA_NO_LT").is_ok_and(|v| v == "1") {
+            None
+        } else {
+            Lt::new(&stream).ok()
+        };
         let name = format!("cuda {} (sm_{maj}{min})", ctx.name().unwrap_or_default());
         Ok(Self {
             ctx,
             stream,
             blas,
+            lt,
             module,
             f,
             name,
@@ -523,6 +641,65 @@ impl Backend for Cuda {
         };
         let (alpha, beta) = (1.0f32, 0.0f32);
         let yp = self.ptr(y) + (y_row * n * 2) as u64;
+        let xp = self.ptr(x) + (x_row * k * 2) as u64;
+        // cuBLASLt with the bias (+ GELU) in the epilogue: no second pass.
+        if let (Some(lt), Some(b)) = (&self.lt, bias) {
+            let epi = (act == Act::GeluTanh) as u8;
+            let mut plans = lt.plans.lock().unwrap();
+            let plan = plans
+                .entry((n, k, rows, epi))
+                .or_insert_with(|| lt.plan(n, k, rows, epi));
+            if let Some(p) = plan {
+                let bp = self.ptr(b);
+                let ws = lt.workspace_ptr();
+                self.timed(
+                    || {
+                        format!(
+                            "gemm+bias{} n={n} k={k}{}",
+                            if epi == 1 { "+gelu" } else { "" },
+                            if rows < 1024 { " (text)" } else { "" }
+                        )
+                    },
+                    // SAFETY: the plan's layouts match these extents (checked
+                    // above); bias holds n values; workspace is LT_WORKSPACE.
+                    || unsafe {
+                        lt_result::set_matmul_desc_attribute(
+                            p.desc,
+                            lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                            (&bp) as *const u64 as *const _,
+                            8,
+                        )
+                        .expect("lt bias pointer");
+                        lt_result::matmul(
+                            lt.handle,
+                            p.desc,
+                            (&alpha) as *const f32 as *const _,
+                            (&beta) as *const f32 as *const _,
+                            wp as *const _,
+                            p.a,
+                            xp as *const _,
+                            p.b,
+                            yp as *const _,
+                            p.c,
+                            yp as *mut _,
+                            p.c,
+                            &p.algo,
+                            ws as *mut _,
+                            LT_WORKSPACE,
+                            self.stream.cu_stream() as *mut _,
+                        )
+                        .expect("cublasLt matmul");
+                    },
+                );
+                if let Some(pr) = &self.prof {
+                    let mut m = pr.lock().unwrap();
+                    let e = m.entry("gemm FLOP (total)".into()).or_default();
+                    e.0 += 2.0 * rows as f64 * n as f64 * k as f64;
+                    e.1 += 1;
+                }
+                return;
+            }
+        }
         // Row-major y[m,n] = x[m,k]·W[n,k]ᵀ is column-major yᵀ = W·xᵀ:
         // A = W (transposed), B = x, C = y, all with leading dims k, k, n.
         // SAFETY: pointers and extents checked above; alpha/beta outlive the call.
@@ -546,7 +723,7 @@ impl Backend for Cuda {
                     wp as *const _,
                     blas_sys::cudaDataType_t::CUDA_R_16BF,
                     k as i32,
-                    (self.ptr(x) + (x_row * k * 2) as u64) as *const _,
+                    xp as *const _,
                     blas_sys::cudaDataType_t::CUDA_R_16BF,
                     k as i32,
                     (&beta) as *const f32 as *const _,
