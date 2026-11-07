@@ -28,6 +28,11 @@ State and invariants only; the reasoning is in `docs/design.md`.
   `ex2.approx` were 2% slower; runtime probe branches cost 1.7%: keep
   diagnostics out of the hot kernel. TAEHV reuses buffers across chunks
   (`DecodeState::pool`): 583 → 40 allocations per decode.
+- `FASTWAN_CUDA_ATTN_VARIANT` 0|1|2 selects the MMA attention kernels; v2
+  (swizzled tiles, 3 blocks/SM) is the default on sm_120+ only: 2% faster
+  step there (`docs/runs/2026-11-07-attention-variants`). Check v2 on another
+  architecture before defaulting it there. `examples/ptx.rs` + ptxas gives
+  registers / spills / smem without a GPU.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does); `--attention dense` to compare. The VSA
   CPU path is fastvideo-rs's host oracle; keep GPU kernels checked against it.

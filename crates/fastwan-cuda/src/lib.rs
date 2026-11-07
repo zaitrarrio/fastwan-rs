@@ -81,6 +81,11 @@ pub struct Cuda {
     q8_scratch: std::sync::Mutex<Option<CuBuf>>,
     /// `FASTWAN_CUDA_SCALAR_CONV=1`: the pre-tensor-core conv, for A/B.
     scalar_conv: bool,
+    /// `FASTWAN_CUDA_ATTN_VARIANT` = 0 | 1 | 2: which MMA attention kernels
+    /// run (see `attn_mma_v` in kernels.cu). Default 2 on sm_120+ (measured
+    /// and checked on an RTX PRO 6000: 3% faster VSA fine), 0 elsewhere until
+    /// a run checks it there.
+    attn_variant: usize,
     /// `FASTWAN_PROFILE=1`: seconds and calls per kernel / GEMM shape. Each
     /// timed op synchronises the stream before and after (≈10 µs each), so a
     /// profiled run is a little slower than a plain one.
@@ -93,10 +98,12 @@ struct Kernels {
     head_split: CudaFunction,
     attention: CudaFunction,
     attention_mma: CudaFunction,
+    attention_mma_v: [CudaFunction; 2],
     vsa_pool: CudaFunction,
     vsa_coarse: CudaFunction,
     vsa_fine: CudaFunction,
     vsa_fine_mma: CudaFunction,
+    vsa_fine_mma_v: [CudaFunction; 2],
     gate_residual: CudaFunction,
     dmd_step: CudaFunction,
     tanh_clamp: CudaFunction,
@@ -263,10 +270,12 @@ impl Cuda {
             head_split: get("fw_head_split")?,
             attention: get("fw_attention")?,
             attention_mma: get("fw_attention_mma")?,
+            attention_mma_v: [get("fw_attention_mma_v1")?, get("fw_attention_mma_v2")?],
             vsa_pool: get("fw_vsa_pool")?,
             vsa_coarse: get("fw_vsa_coarse")?,
             vsa_fine: get("fw_vsa_fine")?,
             vsa_fine_mma: get("fw_vsa_fine_mma")?,
+            vsa_fine_mma_v: [get("fw_vsa_fine_mma_v1")?, get("fw_vsa_fine_mma_v2")?],
             gate_residual: get("fw_gate_residual")?,
             dmd_step: get("fw_dmd_step")?,
             tanh_clamp: get("fw_tanh_clamp")?,
@@ -295,6 +304,11 @@ impl Cuda {
             ampere: maj >= 8,
             q8_scratch: std::sync::Mutex::new(None),
             scalar_conv: std::env::var("FASTWAN_CUDA_SCALAR_CONV").is_ok_and(|v| v == "1"),
+            attn_variant: std::env::var("FASTWAN_CUDA_ATTN_VARIANT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v <= 2)
+                .unwrap_or(if maj >= 12 { 2 } else { 0 }),
             prof: std::env::var("FASTWAN_PROFILE")
                 .is_ok_and(|v| v == "1")
                 .then(Default::default),
@@ -359,7 +373,11 @@ impl Cuda {
 
     fn kernel_name(&self, f: &CudaFunction) -> &'static str {
         let k = &self.f;
-        let all: [(&CudaFunction, &'static str); 18] = [
+        let all: [(&CudaFunction, &'static str); 22] = [
+            (&k.attention_mma_v[0], "attention (mma v1)"),
+            (&k.attention_mma_v[1], "attention (mma v2)"),
+            (&k.vsa_fine_mma_v[0], "vsa fine (mma v1)"),
+            (&k.vsa_fine_mma_v[1], "vsa fine (mma v2)"),
             (&k.bias_act, "bias_act"),
             (&k.norm, "norm"),
             (&k.head_split, "head_split (qk-norm + rope)"),
@@ -889,7 +907,10 @@ impl Backend for Cuda {
         let scale = 1.0 / (d as f32).sqrt();
         if d == 128 && self.ampere && std::env::var("FASTWAN_CUDA_SCALAR_ATTN").is_err() {
             self.launch(
-                &self.f.attention_mma,
+                match self.attn_variant {
+                    0 => &self.f.attention_mma,
+                    v => &self.f.attention_mma_v[v - 1],
+                },
                 (sq.div_ceil(64) as u32, heads as u32, 1),
                 (128, 1, 1),
                 &[
@@ -1000,7 +1021,11 @@ impl Backend for Cuda {
                 .chain([Arg::F(s.scale)])
                 .chain(tail)
                 .collect();
-            self.launch(&self.f.vsa_fine_mma, grid, (128, 1, 1), &args);
+            let f = match self.attn_variant {
+                0 => &self.f.vsa_fine_mma,
+                v => &self.f.vsa_fine_mma_v[v - 1],
+            };
+            self.launch(f, grid, (128, 1, 1), &args);
         } else {
             let args: Vec<Arg> = head
                 .into_iter()

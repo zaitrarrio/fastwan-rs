@@ -291,6 +291,7 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool va
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 __device__ __forceinline__ void cp_async_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
+__device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_group 0;\n" ::); }
 
 // Body shared by dense attention (mode 0) and the VSA fine stage (mode 1).
 // Mode 1: the block is query tile blockIdx.x (rows via `slot`), key chunk c is
@@ -464,6 +465,199 @@ extern "C" __global__ void __launch_bounds__(128) fw_vsa_fine_mma(u64 q_, u64 k_
     __shared__ __align__(16) bf16_t vs[MMA_BK * KS_STRIDE];
     __shared__ unsigned char kvalid[2 * MMA_BK];
     attn_mma_body(1, (const bf16_t*)q_, (const bf16_t*)k_, (const bf16_t*)v_, (bf16_t*)out_, heads, seq, seq, scale,
+                  (const unsigned*)slot_, (const unsigned*)sel_, (const float*)coarse_, (const bf16_t*)gate_, nb, topk, ks, vs, kvalid);
+}
+
+// Variants of attn_mma_body for A/B (selected on the host by
+// FASTWAN_CUDA_ATTN_VARIANT; v0 above stays the default until measured):
+//   V = 1: two barriers per key chunk instead of four (V_c is issued after
+//          the top barrier, K_{c+1} after the V-ready barrier), and the
+//          output is rescaled only when some row's running max moved.
+//   V = 2: V = 1 plus unpadded shared tiles with an XOR swizzle of the
+//          16-byte column chunks (bank-conflict-free for the 32-bit K reads
+//          and ldmatrix.trans V reads) and __launch_bounds__(128, 3), for
+//          three blocks (12 warps) per SM.
+template <int V>
+__device__ __forceinline__ int att_sidx(int row, int col) {
+    if (V == 2) return row * MMA_D + ((((col >> 3) ^ (row & 7))) << 3) + (col & 7);
+    return row * KS_STRIDE + col;
+}
+
+template <int V>
+__device__ __forceinline__ void attn_mma_v(int mode, const bf16_t* q, const bf16_t* k, const bf16_t* v, bf16_t* out,
+        int heads, int sq, int sk, float scale, const unsigned* slot, const unsigned* sel,
+        const float* coarse, const bf16_t* gate, int nb, int topk,
+        bf16_t* ks, bf16_t* vs, unsigned char* kvalid) {
+    const int h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int qt = blockIdx.x;
+    const int lr0 = warp * 16 + g, lr1 = lr0 + 8;
+    int tok0, tok1;
+    if (mode == 0) {
+        tok0 = qt * 64 + lr0 < sq ? qt * 64 + lr0 : -1;
+        tok1 = qt * 64 + lr1 < sq ? qt * 64 + lr1 : -1;
+    } else {
+        const unsigned a = slot[qt * 64 + lr0], b = slot[qt * 64 + lr1];
+        tok0 = a == 0xffffffffu ? -1 : (int)a;
+        tok1 = b == 0xffffffffu ? -1 : (int)b;
+    }
+    const float sl2 = scale * 1.4426950408889634f;
+    unsigned qa[8][4];
+    const unsigned* q0 = (const unsigned*)(q + ((long)h * sq + (tok0 < 0 ? 0 : tok0)) * MMA_D);
+    const unsigned* q1 = (const unsigned*)(q + ((long)h * sq + (tok1 < 0 ? 0 : tok1)) * MMA_D);
+    #pragma unroll
+    for (int kk = 0; kk < 8; ++kk) {
+        const int c = (kk * 16 + t * 2) >> 1;
+        qa[kk][0] = tok0 >= 0 ? q0[c] : 0u;
+        qa[kk][1] = tok1 >= 0 ? q1[c] : 0u;
+        qa[kk][2] = tok0 >= 0 ? q0[c + 4] : 0u;
+        qa[kk][3] = tok1 >= 0 ? q1[c + 4] : 0u;
+    }
+    float o[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    float m0 = -1e30f, m1 = -1e30f, l0 = 0.0f, l1 = 0.0f;
+
+    const int nchunks = mode == 0 ? (sk + MMA_BK - 1) / MMA_BK : topk;
+    const bf16_t* kh = k + (long)h * sk * MMA_D;
+    const bf16_t* vh = v + (long)h * sk * MMA_D;
+    const int ch = tid & 15, krow = tid >> 4;
+    auto key_tok = [&](int c, int key) -> int {
+        if (mode == 0) return c * MMA_BK + key < sk ? c * MMA_BK + key : -1;
+        const unsigned s2 = slot[(long)sel[((long)h * nb + qt) * topk + c] * 64 + key];
+        return s2 == 0xffffffffu ? -1 : (int)s2;
+    };
+    auto load = [&](bf16_t* dst, const bf16_t* src, int c, unsigned char* valid) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int key = krow + 8 * j, tk = key_tok(c, key);
+            cp_async16(dst + att_sidx<V>(key, ch * 8), src + (long)(tk < 0 ? 0 : tk) * MMA_D + ch * 8, tk >= 0);
+            if (valid && ch == 0) valid[key] = tk >= 0;
+        }
+    };
+    load(ks, kh, 0, kvalid);
+    cp_async_commit();
+
+    for (int c = 0; c < nchunks; ++c) {
+        const unsigned char* kvb = kvalid + (c & 1) * MMA_BK;
+        cp_async_wait0();          // K_c landed
+        __syncthreads();           // ... for everyone; and every warp is past P·V(c-1): vs is free
+        load(vs, vh, c, 0);        // V_c streams in during Q·Kᵀ and softmax
+        cp_async_commit();
+        float s[8][4];
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
+            #pragma unroll
+            for (int kk = 0; kk < 8; ++kk) {
+                const unsigned b0 = *(const unsigned*)(ks + att_sidx<V>(nt * 8 + g, kk * 16 + t * 2));
+                const unsigned b1 = *(const unsigned*)(ks + att_sidx<V>(nt * 8 + g, kk * 16 + 8 + t * 2));
+                mma_bf16(s[nt], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b0, b1);
+            }
+        }
+        float mx0 = m0, mx1 = m1;
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            #pragma unroll
+            for (int cc = 0; cc < 2; ++cc) {
+                const bool ok = kvb[nt * 8 + t * 2 + cc];
+                s[nt][cc] = ok ? s[nt][cc] * sl2 : -1e30f;
+                s[nt][2 + cc] = ok ? s[nt][2 + cc] * sl2 : -1e30f;
+                mx0 = fmaxf(mx0, s[nt][cc]);
+                mx1 = fmaxf(mx1, s[nt][2 + cc]);
+            }
+        }
+        #pragma unroll
+        for (int off = 1; off < 4; off <<= 1) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, off));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, off));
+        }
+        // Rescale only when some row of this warp has a new max.
+        if (__any_sync(0xffffffffu, mx0 != m0 || mx1 != m1)) {
+            const float c0 = exp2f(m0 - mx0), c1 = exp2f(m1 - mx1);
+            l0 *= c0; l1 *= c1;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) { o[i][0] *= c0; o[i][1] *= c0; o[i][2] *= c1; o[i][3] *= c1; }
+            m0 = mx0; m1 = mx1;
+        }
+        cp_async_wait0();          // V_c landed
+        __syncthreads();           // ... for everyone; and every warp is past Q·Kᵀ(c): ks is free
+        if (c + 1 < nchunks) load(ks, kh, c + 1, kvalid + ((c + 1) & 1) * MMA_BK);
+        cp_async_commit();         // K_{c+1} streams in during P·V(c)
+        #pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            float p[8];
+            #pragma unroll
+            for (int cc = 0; cc < 4; ++cc) {
+                p[cc] = exp2f(s[2 * kk][cc] - (cc < 2 ? m0 : m1));
+                p[4 + cc] = exp2f(s[2 * kk + 1][cc] - (cc < 2 ? m0 : m1));
+            }
+            l0 += p[0] + p[1] + p[4] + p[5];
+            l1 += p[2] + p[3] + p[6] + p[7];
+            const unsigned a0 = pack_bf16(p[0], p[1]), a1 = pack_bf16(p[2], p[3]);
+            const unsigned a2 = pack_bf16(p[4], p[5]), a3 = pack_bf16(p[6], p[7]);
+            const int vkey = kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+            #pragma unroll
+            for (int dt = 0; dt < 16; dt += 2) {
+                const unsigned addr = (unsigned)__cvta_generic_to_shared(vs + att_sidx<V>(vkey, dt * 8 + (lane >> 4) * 8));
+                unsigned b0, b1, b2, b3;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(addr));
+                mma_bf16(o[dt], a0, a1, a2, a3, b0, b1);
+                mma_bf16(o[dt + 1], a0, a1, a2, a3, b2, b3);
+            }
+        }
+    }
+    #pragma unroll
+    for (int off = 1; off < 4; off <<= 1) {
+        l0 += __shfl_xor_sync(0xffffffffu, l0, off);
+        l1 += __shfl_xor_sync(0xffffffffu, l1, off);
+    }
+    const float i0 = 1.0f / l0, i1 = 1.0f / l1;
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        const int c = dt * 8 + t * 2;
+        float a0 = o[dt][0] * i0, a1 = o[dt][1] * i0, b0 = o[dt][2] * i1, b1 = o[dt][3] * i1;
+        if (mode == 1) {
+            const float* cr = coarse + ((long)h * nb + qt) * MMA_D + c;
+            if (tok0 >= 0) { const bf16_t* gr = gate + ((long)h * sq + tok0) * MMA_D + c; a0 += cr[0] * ld(gr, 0); a1 += cr[1] * ld(gr, 1); }
+            if (tok1 >= 0) { const bf16_t* gr = gate + ((long)h * sq + tok1) * MMA_D + c; b0 += cr[0] * ld(gr, 0); b1 += cr[1] * ld(gr, 1); }
+        }
+        if (tok0 >= 0) *(unsigned*)(out + ((long)tok0 * heads + h) * MMA_D + c) = pack_bf16(a0, a1);
+        if (tok1 >= 0) *(unsigned*)(out + ((long)tok1 * heads + h) * MMA_D + c) = pack_bf16(b0, b1);
+    }
+}
+
+#define ATT_V1_SMEM (MMA_BK * KS_STRIDE)
+#define ATT_V2_SMEM (MMA_BK * MMA_D)
+extern "C" __global__ void __launch_bounds__(128) fw_attention_mma_v1(u64 q_, u64 k_, u64 v_, u64 out_, int heads, int sq, int sk, float scale) {
+    __shared__ __align__(16) bf16_t ks[ATT_V1_SMEM];
+    __shared__ __align__(16) bf16_t vs[ATT_V1_SMEM];
+    __shared__ unsigned char kvalid[2 * MMA_BK];
+    attn_mma_v<1>(0, (const bf16_t*)q_, (const bf16_t*)k_, (const bf16_t*)v_, (bf16_t*)out_, heads, sq, sk, scale,
+                  0, 0, 0, 0, 0, 0, ks, vs, kvalid);
+}
+extern "C" __global__ void __launch_bounds__(128) fw_vsa_fine_mma_v1(u64 q_, u64 k_, u64 v_, u64 out_, int heads, int seq, float scale,
+        u64 slot_, u64 sel_, u64 coarse_, u64 gate_, int nb, int topk) {
+    __shared__ __align__(16) bf16_t ks[ATT_V1_SMEM];
+    __shared__ __align__(16) bf16_t vs[ATT_V1_SMEM];
+    __shared__ unsigned char kvalid[2 * MMA_BK];
+    attn_mma_v<1>(1, (const bf16_t*)q_, (const bf16_t*)k_, (const bf16_t*)v_, (bf16_t*)out_, heads, seq, seq, scale,
+                  (const unsigned*)slot_, (const unsigned*)sel_, (const float*)coarse_, (const bf16_t*)gate_, nb, topk, ks, vs, kvalid);
+}
+extern "C" __global__ void __launch_bounds__(128, 3) fw_attention_mma_v2(u64 q_, u64 k_, u64 v_, u64 out_, int heads, int sq, int sk, float scale) {
+    __shared__ __align__(16) bf16_t ks[ATT_V2_SMEM];
+    __shared__ __align__(16) bf16_t vs[ATT_V2_SMEM];
+    __shared__ unsigned char kvalid[2 * MMA_BK];
+    attn_mma_v<2>(0, (const bf16_t*)q_, (const bf16_t*)k_, (const bf16_t*)v_, (bf16_t*)out_, heads, sq, sk, scale,
+                  0, 0, 0, 0, 0, 0, ks, vs, kvalid);
+}
+extern "C" __global__ void __launch_bounds__(128, 3) fw_vsa_fine_mma_v2(u64 q_, u64 k_, u64 v_, u64 out_, int heads, int seq, float scale,
+        u64 slot_, u64 sel_, u64 coarse_, u64 gate_, int nb, int topk) {
+    __shared__ __align__(16) bf16_t ks[ATT_V2_SMEM];
+    __shared__ __align__(16) bf16_t vs[ATT_V2_SMEM];
+    __shared__ unsigned char kvalid[2 * MMA_BK];
+    attn_mma_v<2>(1, (const bf16_t*)q_, (const bf16_t*)k_, (const bf16_t*)v_, (bf16_t*)out_, heads, seq, seq, scale,
                   (const unsigned*)slot_, (const unsigned*)sel_, (const float*)coarse_, (const bf16_t*)gate_, nb, topk, ks, vs, kvalid);
 }
 
