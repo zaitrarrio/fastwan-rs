@@ -50,6 +50,10 @@ pub struct TaeHv<B: Backend> {
 pub struct DecodeState<B: Backend> {
     memory: Vec<Option<B::Buf>>,
     to_trim: usize,
+    /// Intermediate buffers by length, reused by the next chunk (every chunk
+    /// but the last has the same shapes). Device work is ordered, so a buffer
+    /// handed back once its last reader is queued is safe to overwrite.
+    pool: std::collections::HashMap<usize, Vec<B::Buf>>,
 }
 
 /// One chunk's decoder output on the device: `[frames, 3·p², h, w]`, of
@@ -185,6 +189,7 @@ impl<B: Backend> TaeHv<B> {
         DecodeState {
             memory: (0..3 * self.cfg.mem_blocks).map(|_| None).collect(),
             to_trim: self.cfg.frames_to_trim(),
+            pool: Default::default(),
         }
     }
 
@@ -250,12 +255,21 @@ impl<B: Backend> TaeHv<B> {
             upsample,
             k,
         };
+        // Pooled buffers: contents are stale, so only for outputs that are
+        // written in full (every conv output, `keep`, and `past` once a
+        // previous chunk exists).
+        let pool = std::cell::RefCell::new(std::mem::take(&mut st.pool));
+        let take = |n: usize| {
+            let reused = pool.borrow_mut().get_mut(&n).and_then(Vec::pop);
+            reused.unwrap_or_else(|| be.alloc(n))
+        };
+        let give = |b: B::Buf| pool.borrow_mut().entry(be.buf_len(&b)).or_default().push(b);
         let conv = |x: &B::Buf,
                     b: Option<&B::Buf>,
                     s: ConvShape,
                     cw: &ConvW<B>,
                     ep: ConvEpilogue<'_, B::Buf>| {
-            let out = be.alloc(s.out_len());
+            let out = take(s.out_len());
             be.conv2d(x, b, &s, &cw.w, cw.b.as_ref(), ep, &out);
             out
         };
@@ -270,17 +284,24 @@ impl<B: Backend> TaeHv<B> {
             let n = nf[si];
             for (mi, [c0, c2, c4]) in stage.mems.iter().enumerate() {
                 let fsz = n * h * w;
-                let past = be.alloc(f * fsz);
                 let slot = &mut st.memory[si * cfg.mem_blocks + mi];
+                // The first chunk's past frame is zero: a fresh buffer.
+                let past = if slot.is_some() {
+                    take(f * fsz)
+                } else {
+                    be.alloc(f * fsz)
+                };
                 if let Some(prev) = slot.as_ref() {
                     be.copy(prev, 0, &past, 0, fsz);
                 }
                 if f > 1 {
                     be.copy(&x, 0, &past, fsz, (f - 1) * fsz);
                 }
-                let keep = be.alloc(fsz);
+                let keep = take(fsz);
                 be.copy(&x, (f - 1) * fsz, &keep, 0, fsz);
-                *slot = Some(keep);
+                if let Some(old) = slot.replace(keep) {
+                    give(old);
+                }
                 let t1 = conv(
                     &x,
                     Some(&past),
@@ -288,6 +309,7 @@ impl<B: Backend> TaeHv<B> {
                     c0,
                     ConvEpilogue::Relu,
                 );
+                give(past);
                 let t2 = conv(
                     &t1,
                     None,
@@ -295,13 +317,16 @@ impl<B: Backend> TaeHv<B> {
                     c2,
                     ConvEpilogue::Relu,
                 );
-                x = conv(
+                give(t1);
+                let nx = conv(
                     &t2,
                     None,
                     shape(f, n, 0, n, h, w, false, 3),
                     c4,
                     ConvEpilogue::AddRelu(&x),
                 );
+                give(t2);
+                give(std::mem::replace(&mut x, nx));
             }
             let stride = cfg.tgrow[si];
             // [f, n·stride, h, w] is bit-for-bit [f·stride, n, h, w].
@@ -318,13 +343,17 @@ impl<B: Backend> TaeHv<B> {
             } else {
                 ConvEpilogue::None
             };
-            x = conv(
-                &g,
-                None,
-                shape(f, n, 0, nf[si + 1], h, w, true, 3),
-                &stage.conv,
-                ep,
-            );
+            give(std::mem::replace(
+                &mut x,
+                conv(
+                    &g,
+                    None,
+                    shape(f, n, 0, nf[si + 1], h, w, true, 3),
+                    &stage.conv,
+                    ep,
+                ),
+            ));
+            give(g);
             h *= 2;
             w *= 2;
         }
@@ -335,6 +364,8 @@ impl<B: Backend> TaeHv<B> {
             &self.last,
             ConvEpilogue::None,
         );
+        give(x);
+        st.pool = pool.into_inner();
         let skip = st.to_trim.min(f);
         st.to_trim -= skip;
         Chunk {

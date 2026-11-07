@@ -1,0 +1,22 @@
+old binary ok
+NVIDIA GeForce RTX 4090, 615.71.09, 350.00 W
+--- check cuda (new)
+tiny TAEHV decode (frames)                       rel 7.63e-3  ok
+all 50 checks pass (tolerance 3e-2)
+--- new profiled decode
+decode profile (CUDA, synced per op): 301.1 ms in ops; GEMMs -0.0 ms at 0.0 TFLOP/s
+  conv2d (mma)                                 291.5 ms  96.8%     385 calls     0.757 ms/call
+  copy (dtod)                                    5.7 ms   1.9%     282 calls     0.020 ms/call
+  alloc (zeroed)                                 3.8 ms   1.3%      40 calls     0.094 ms/call
+  tanh_clamp                                     0.2 ms   0.1%      11 calls     0.015 ms/call
+decode (TAEHV) 0.478s -> 81 frames 832x480
+--- generate old
+run 0: total 4.20s  prompt 0.18s  denoise 3.57s (["1.17", "1.20", "1.19"])  decode 0.42s
+run 1: total 4.09s  prompt 0.07s  denoise 3.57s (["1.18", "1.20", "1.19"])  decode 0.41s
+run 2: total 4.09s  prompt 0.07s  denoise 3.57s (["1.18", "1.20", "1.19"])  decode 0.41s
+--- generate bin
+run 0: total 4.24s  prompt 0.18s  denoise 3.63s (["1.20", "1.22", "1.21"])  decode 0.40s
+run 1: total 4.13s  prompt 0.07s  denoise 3.63s (["1.20", "1.22", "1.22"])  decode 0.40s
+run 2: total 4.13s  prompt 0.07s  denoise 3.63s (["1.20", "1.21", "1.21"])  decode 0.40s
+PSNR new vs old: PSNR y:inf u:inf v:inf average:inf min:inf max:inf
+exit 0

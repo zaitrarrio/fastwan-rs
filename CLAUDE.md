@@ -22,6 +22,12 @@ State and invariants only; the reasoning is in `docs/design.md`.
 - The decode is pipelined: `TaeHv::launch_chunk` for chunk i+1 is queued
   before chunk i is converted on the host (`Chunk::rgb8`, parallel). Keep
   host work off the GPU's critical path; `--tae-chunk 2` beats 4.
+- The MMA attention kernels are not memory-bound: skipping all K/V loads saves
+  12% (VSA), skipping the MMAs 37%; the rest is softmax, barriers and latency
+  (`docs/runs/2026-11-07-attention-probe-and-decode-pool`). `ldmatrix` K and
+  `ex2.approx` were 2% slower; runtime probe branches cost 1.7%: keep
+  diagnostics out of the hot kernel. TAEHV reuses buffers across chunks
+  (`DecodeState::pool`): 583 → 40 allocations per decode.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does); `--attention dense` to compare. The VSA
   CPU path is fastvideo-rs's host oracle; keep GPU kernels checked against it.

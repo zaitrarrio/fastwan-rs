@@ -441,12 +441,16 @@ impl Backend for Cuda {
     }
 
     fn alloc(&self, len: usize) -> CuBuf {
-        CuBuf {
-            s: Arc::new(
+        let s = self.timed(
+            || "alloc (zeroed)".into(),
+            || {
                 self.stream
                     .alloc_zeros::<u16>(len.max(1))
-                    .expect("cuda alloc"),
-            ),
+                    .expect("cuda alloc")
+            },
+        );
+        CuBuf {
+            s: Arc::new(s),
             len,
             f32: false,
         }
