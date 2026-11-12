@@ -36,6 +36,9 @@ pub enum ConvEpilogue<'a, T> {
     Relu,
     /// `relu(y + r)` with `r` shaped like the output (TAEHV MemBlock skip).
     AddRelu(&'a T),
+    /// PReLU: `y ≥ 0 ? y : y · slope[c]`, one slope per output channel
+    /// (Real-ESRGAN's compact upscaler).
+    Prelu(&'a T),
 }
 
 /// A 2-D convolution over `frames` independent images, NCHW, stride 1,

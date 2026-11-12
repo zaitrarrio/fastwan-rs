@@ -38,13 +38,44 @@ fn squeeze(s: &[usize]) -> Vec<usize> {
     s.iter().copied().filter(|&d| d != 1).collect()
 }
 
-/// All `*.safetensors` under a directory (or one file).
+/// A safetensors file's bytes: mapped from disk, or owned (a buffer fetched
+/// by the browser).
+enum Blob {
+    Map(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for Blob {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Blob::Map(m) => m,
+            Blob::Owned(v) => v,
+        }
+    }
+}
+
+/// All `*.safetensors` under a directory (or one file), or one in memory.
 pub struct SafetensorsDir {
-    maps: Vec<memmap2::Mmap>,
+    maps: Vec<Blob>,
     index: HashMap<String, usize>,
 }
 
 impl SafetensorsDir {
+    /// A complete safetensors file held in memory.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        let index = safetensors::SafeTensors::deserialize(&bytes)
+            .map_err(|e| Error::Weights(format!("in-memory safetensors: {e}")))?
+            .names()
+            .into_iter()
+            .map(|n| (n.to_string(), 0))
+            .collect();
+        Ok(Self {
+            maps: vec![Blob::Owned(bytes)],
+            index,
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let files: Vec<PathBuf> = if path.is_dir() {
             let mut v: Vec<PathBuf> = std::fs::read_dir(path)?
@@ -74,7 +105,7 @@ impl SafetensorsDir {
             for name in st.names() {
                 index.insert(name.to_string(), i);
             }
-            maps.push(map);
+            maps.push(Blob::Map(map));
         }
         Ok(Self { maps, index })
     }

@@ -553,7 +553,7 @@ impl Backend for Cpu {
         let b = b.map(|b| b.r());
         let bias = bias.map(|b| b.r());
         let res = match ep {
-            ConvEpilogue::AddRelu(r) => Some(r.r()),
+            ConvEpilogue::AddRelu(r) | ConvEpilogue::Prelu(r) => Some(r.r()),
             _ => None,
         };
         let (oh, ow) = s.out_hw();
@@ -598,6 +598,8 @@ impl Backend for Cpu {
                             ConvEpilogue::AddRelu(_) => {
                                 (acc + res.as_ref().unwrap()[fc * oh * ow + i]).max(0.0)
                             }
+                            ConvEpilogue::Prelu(_) if acc < 0.0 => acc * res.as_ref().unwrap()[co],
+                            ConvEpilogue::Prelu(_) => acc,
                         };
                     }
                 }

@@ -1207,6 +1207,7 @@ impl Backend for Wgpu {
             ConvEpilogue::None => (0, &self.dummy),
             ConvEpilogue::Relu => (1, &self.dummy),
             ConvEpilogue::AddRelu(r) => (2, r),
+            ConvEpilogue::Prelu(r) => (3, r),
         };
         let p = [
             s.frames as u32,
@@ -1251,6 +1252,12 @@ impl Backend for Wgpu {
 }
 
 impl Wgpu {
+    /// The largest storage-buffer binding this device accepts (the memory
+    /// planner splits the FFN and decoder to stay under it).
+    pub fn max_binding(&self) -> u64 {
+        self.device.limits().max_storage_buffer_binding_size as u64
+    }
+
     /// Non-blocking readback for the browser (and usable natively).
     pub async fn download_async(&self, buf: &GBuf) -> Vec<f32> {
         let size = (buf.len.max(1) * 4) as u64;

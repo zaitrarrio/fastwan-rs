@@ -174,7 +174,7 @@ enum Cmd {
         /// The checkpoint's `transformer/` directory.
         #[arg(long)]
         transformer: PathBuf,
-        /// int8 | int4[-hqq][-gN][-ffn], e.g. int4-hqq-g64-ffn.
+        /// native (all f16) | int8 | int4[-hqq][-gN][-ffn], e.g. int4-hqq-g64.
         #[arg(long)]
         weights: fastwan_core::quant::WeightQuant,
         #[arg(long)]
@@ -235,6 +235,10 @@ enum Cmd {
         ffn_chunk: Option<usize>,
         #[arg(long, default_value_t = 2)]
         tae_chunk: usize,
+        /// Upscale ×4 after decoding with Real-ESRGAN's compact video model
+        /// (`realesr-animevideov3.safetensors`; scripts/upscale/convert_esrgan.py).
+        #[arg(long)]
+        upscale: Option<PathBuf>,
     },
 }
 
@@ -424,9 +428,7 @@ fn main() -> Result<()> {
             weights,
             out,
         } => {
-            if weights == fastwan_core::quant::WeightQuant::Native {
-                bail!("--weights native would only convert to f16; give int8 or int4…");
-            }
+            // `native` writes every tensor as f16 (the browser's f16 option).
             let cfg = WanConfig::fastwan_1_3b();
             let t0 = std::time::Instant::now();
             let src = SafetensorsDir::open(&transformer)?;
@@ -471,6 +473,7 @@ fn main() -> Result<()> {
             out,
             ffn_chunk,
             tae_chunk,
+            upscale,
         } => {
             let g = shape.geometry()?;
             let cfg = WanConfig::fastwan_1_3b();
@@ -507,7 +510,8 @@ fn main() -> Result<()> {
                 tae_chunk,
                 runs,
                 attn.get(),
-                attn.weights
+                attn.weights,
+                upscale.as_deref()
             )?)
         }
     }
@@ -628,6 +632,7 @@ fn generate<B: Backend>(
     runs: usize,
     attention: Option<fastwan_model::Attention>,
     quant: fastwan_core::quant::WeightQuant,
+    upscale: Option<&Path>,
 ) -> Result<()> {
     let cfg = WanConfig::fastwan_1_3b();
     let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
@@ -696,7 +701,46 @@ fn generate<B: Backend>(
     if let Some(r) = be.profile_report() {
         print!("all runs: {r}");
     }
-    let video = last.expect("at least one run");
+    let mut video = last.expect("at least one run");
+    if let Some(path) = upscale {
+        use fastwan_model::upscale::{UpConfig, Upscaler, rgb8, up_manifest};
+        let ucfg = UpConfig::anime_video_v3();
+        let usrc = SafetensorsDir::open(path)?;
+        let miss = missing(&usrc, &up_manifest(&ucfg));
+        if !miss.is_empty() {
+            bail!(
+                "{} is not realesr-animevideov3 (missing {:?})",
+                path.display(),
+                &miss[..miss.len().min(3)]
+            );
+        }
+        let up = Upscaler::load(be, ucfg, &usrc)?;
+        let (h, w, s) = (video.height, video.width, ucfg.scale);
+        // Batches of a few frames: activations are 64 channels at full size.
+        let batch = up.batch(h, w, 1 << 30).min(8);
+        let t0 = std::time::Instant::now();
+        let mut rgb = Vec::with_capacity(video.rgb.len() * s * s);
+        for f0 in (0..video.frames).step_by(batch) {
+            let n = batch.min(video.frames - f0);
+            let src = &video.rgb[f0 * h * w * 3..(f0 + n) * h * w * 3];
+            let c = up.launch(be, src, n, h, w);
+            rgb.extend(rgb8(&be.download(&c.out), src, n, h, w, s));
+        }
+        println!(
+            "upscale x{s} {:.2}s ({}x{} -> {}x{})",
+            t0.elapsed().as_secs_f64(),
+            w,
+            h,
+            w * s,
+            h * s
+        );
+        video = Video {
+            frames: video.frames,
+            width: w * s,
+            height: h * s,
+            rgb,
+        };
+    }
     write_y4m(out, &video, 16)?;
     println!(
         "wrote {} ({} frames {}x{})",

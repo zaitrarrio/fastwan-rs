@@ -7,5 +7,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN}"
 : "${CLOUDFLARE_ACCOUNT_ID:?set CLOUDFLARE_ACCOUNT_ID}"
+scripts/build-web.sh
 python3 web/build.py
 npx -y wrangler@4 pages deploy web/site --project-name fastwan --branch main --commit-dirty=true

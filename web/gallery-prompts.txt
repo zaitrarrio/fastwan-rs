@@ -1,0 +1,20 @@
+# The default gallery for Prompt Studio's in-browser mode: embedded once with
+#   fastwan encode --model-dir <FastWan download> --prompt-file web/gallery-prompts.txt --out-dir gallery/
+# and published with the browser weights (the browser has no text encoder).
+# One prompt per line; the first five are the page's built-in examples.
+A red fox trots through fresh snow in a birch forest at dawn, its breath steaming, low golden sunlight, shallow depth of field.
+A crowded night market in the rain, neon signs reflected in puddles, steam rising from food stalls, handheld camera moving through the crowd.
+Aerial drone shot sweeping along green sea cliffs as waves crash into white foam, overcast sky, cinematic.
+Close-up of hot water pouring in a slow spiral over coffee grounds in a glass pour-over, morning window light, macro detail.
+Top-down view of orange and white koi gliding beneath lily pads in a clear pond, ripples spreading, soft daylight.
+A golden retriever puppy tumbles through tall summer grass chasing a butterfly, warm backlight, slow motion.
+An astronaut in a white suit walks across a rust-red desert of a distant planet, two moons low in a purple sky, dust drifting.
+A steam locomotive crosses a stone viaduct over a misty mountain valley in autumn, smoke trailing, wide shot.
+A hummingbird hovers at a red hibiscus flower, wings blurred, droplets on the petals, macro, bright garden light.
+Time-lapse of clouds rolling over a snow-capped mountain peak at sunset, shadows sweeping across the glacier.
+A paper boat drifts down a rain-filled gutter on a city street, reflections of shop lights shimmering, low angle.
+A jellyfish pulses slowly through deep blue water, its translucent bell glowing with bioluminescent light, dark background.
+A chef tosses vegetables in a flaming wok in a busy restaurant kitchen, sparks and steam, warm tungsten light.
+A cozy cabin in a pine forest at night during a snowfall, warm light glowing from the windows, smoke rising from the chimney, slow push in.
+A surfer rides inside a turquoise barrel wave at golden hour, spray catching the light, tracking shot.
+A field of sunflowers swaying in the wind under a bright blue sky with white clouds, camera gliding low between the stems.

@@ -102,6 +102,8 @@ pub fn quantize_dit(
             WeightQuant::Native => unreachable!(),
         }
     }
+    // Head first, then block by block (stable: manifest order within each).
+    out.sort_by_key(|t| block_of(&t.0).map_or(0, |b| b + 1));
     Ok(out)
 }
 
@@ -134,25 +136,92 @@ pub fn f16_bytes(v: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-/// Write `tensors` as one safetensors file with `metadata`.
+/// Write `tensors` as one safetensors file with `metadata`, **in the given
+/// order** (the `safetensors` crate's serializer sorts by dtype and name).
+/// [`quantize_dit`] orders the DiT head first and then block by block, so a
+/// browser fetches each block as one HTTP range.
 pub fn write(path: &Path, tensors: &[Tensor], metadata: HashMap<String, String>) -> Result<()> {
-    let views = tensors
-        .iter()
-        .map(|(n, dt, shape, data)| {
-            safetensors::tensor::TensorView::new(*dt, shape.clone(), data)
-                .map(|v| (n.clone(), v))
-                .map_err(|e| Error::Weights(format!("`{n}`: {e}")))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    safetensors::serialize_to_file(views, Some(metadata), path)
-        .map_err(|e| Error::Weights(e.to_string()))
+    std::fs::write(path, to_bytes(tensors, &metadata)?)?;
+    Ok(())
+}
+
+/// The bytes of [`write`].
+pub fn to_bytes(tensors: &[Tensor], metadata: &HashMap<String, String>) -> Result<Vec<u8>> {
+    fn esc(s: &str) -> String {
+        let mut o = String::with_capacity(s.len() + 2);
+        o.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => o.push_str("\\\""),
+                '\\' => o.push_str("\\\\"),
+                c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                c => o.push(c),
+            }
+        }
+        o.push('"');
+        o
+    }
+    let mut parts = Vec::new();
+    if !metadata.is_empty() {
+        let mut kv: Vec<_> = metadata.iter().collect();
+        kv.sort();
+        let m: Vec<String> = kv
+            .iter()
+            .map(|(k, v)| format!("{}:{}", esc(k), esc(v)))
+            .collect();
+        parts.push(format!("\"__metadata__\":{{{}}}", m.join(",")));
+    }
+    let mut off = 0usize;
+    for (name, dt, shape, data) in tensors {
+        let n: usize = shape.iter().product();
+        if n * dt.bitsize() / 8 != data.len() {
+            return Err(Error::Weights(format!(
+                "`{name}`: {} bytes for {shape:?} {dt:?}",
+                data.len()
+            )));
+        }
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        parts.push(format!(
+            "{}:{{\"dtype\":\"{dt:?}\",\"shape\":[{}],\"data_offsets\":[{off},{}]}}",
+            esc(name),
+            dims.join(","),
+            off + data.len()
+        ));
+        off += data.len();
+    }
+    let mut header = format!("{{{}}}", parts.join(",")).into_bytes();
+    while header.len() % 8 != 0 {
+        header.push(b' ');
+    }
+    let mut out = Vec::with_capacity(8 + header.len() + off);
+    out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    out.extend_from_slice(&header);
+    for t in tensors {
+        out.extend_from_slice(&t.3);
+    }
+    Ok(out)
+}
+
+/// `blocks.N.…` → N; everything else (the head) sorts first.
+pub fn block_of(name: &str) -> Option<usize> {
+    name.strip_prefix("blocks.")?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// The metadata a quantized checkpoint carries.
 pub fn metadata(quant: WeightQuant) -> HashMap<String, String> {
     HashMap::from([
         ("fastwan.format".to_string(), "quant/1".to_string()),
-        ("fastwan.weights".to_string(), quant.to_string()),
+        (
+            "fastwan.weights".to_string(),
+            match quant {
+                WeightQuant::Native => "f16".to_string(),
+                q => q.to_string(),
+            },
+        ),
     ])
 }
 

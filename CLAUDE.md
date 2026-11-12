@@ -96,6 +96,22 @@ State and invariants only; the reasoning is in `docs/design.md`.
 - Site: https://fastwan.pages.dev (Cloudflare Pages project `fastwan`, account
   "Maximal"), built by `web/build.py` into `web/site/` and deployed with
   `scripts/deploy-pages.sh`. Classic Pages, not Workers: no `--force` needed now.
+- In-browser mode (`crates/fastwan-web`, wasm via `scripts/build-web.sh` →
+  `web/pkg`, wasm-bindgen pinned `=0.2.127` to match wgpu 30): weights stream
+  from the public bucket `fastwan-public/v1/` (`manifest.json`; fv-weights stays
+  private), one block per Range request, so DiT files must be block-ordered
+  (`export::write` keeps the given order; `quantize_dit` sorts head first, then
+  `blocks.N`). Blocking `download` panics on wasm: use `download_async`; no
+  `Instant` on wasm. Tiny-model parity vs the CPU (SwiftShader Chrome): f4/f16
+  clips and the upscaler 99.9% byte-exact, max 1 level.
+- Upscaler (`upscale.rs`, Real-ESRGAN `realesr-animevideov3`, BSD-3): convs on
+  the backend with `ConvEpilogue::Prelu`, pixel-shuffle + nearest skip on the
+  host (`upscale::rgb8`). Real weights match a numpy SRVGGNetCompact 100%
+  (`scripts/upscale/parity.py`). `generate --upscale`, Prompt Studio checkbox.
+  4090 CUDA: 81 frames 480×272 → 1920×1088 in 1.92 s
+  (`docs/runs/2026-11-12-browser-weights-upscaler`). The in-browser model has
+  not yet run on a real GPU: Vast hosts differ in whether they expose Vulkan;
+  `fastwan check --backend wgpu` must name NVIDIA, not llvmpipe.
 - Tests: `cargo test --workspace` (needs a Vulkan driver for the WebGPU suite:
   `mesa-vulkan-drivers`); NVRTC kernel compile needs libnvrtc on
   `LD_LIBRARY_PATH` (`pip install nvidia-cuda-nvrtc-cu12`).

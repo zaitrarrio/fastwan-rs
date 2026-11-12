@@ -2,3 +2,5 @@
 *.y4m
 /web/dist
 /web/site
+/web/pkg
+scripts/vast/__pycache__/

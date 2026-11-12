@@ -1086,6 +1086,7 @@ impl Backend for Cuda {
             ConvEpilogue::None => (0, None),
             ConvEpilogue::Relu => (1, None),
             ConvEpilogue::AddRelu(r) => (2, Some(r)),
+            ConvEpilogue::Prelu(r) => (3, Some(r)),
         };
         let (oh, ow) = s.out_hw();
         // Tensor-core implicit GEMM on sm_80+ (FASTWAN_CUDA_SCALAR_CONV=1 for

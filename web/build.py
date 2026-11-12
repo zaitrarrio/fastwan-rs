@@ -33,5 +33,10 @@ shutil.copy(root / "fastwan-webgpu-bench.html", site / "bench/index.html")
 shutil.copy(root / "demo.html", site / "demo/index.html")
 (site / "media").mkdir()
 shutil.copy(root.parent / "docs/runs/2026-11-03-vast-4090/fox-832x480.mp4", site / "media/fox-832x480.mp4")
+# The in-browser engine (scripts/build-web.sh), served at /pkg/.
+if (root / "pkg/fastwan_web_bg.wasm").exists():
+    shutil.copytree(root / "pkg", site / "pkg")
+else:
+    print("note: web/pkg missing; run scripts/build-web.sh for the in-browser mode")
 (site / "_headers").write_text("/*\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: strict-origin-when-cross-origin\n")
 print("wrote", site)

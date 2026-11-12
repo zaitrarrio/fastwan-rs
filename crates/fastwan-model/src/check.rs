@@ -66,6 +66,7 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     let mut rng = Rng::new(42);
     ops(&mut p, &mut rng);
     model(&mut p);
+    upscaler(&mut p);
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
     model_vsa(
@@ -507,6 +508,20 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             },
             1,
         ),
+        // PReLU (the upscaler): slopes indexed past the first N tile.
+        (
+            ConvShape {
+                frames: 2,
+                cin_a: 64,
+                cin_b: 0,
+                cout: 72,
+                h: 9,
+                w: 10,
+                upsample: false,
+                k: 3,
+            },
+            3,
+        ),
     ];
     for (s, ep) in cases {
         let a = rng.normal(s.frames * s.cin_a * s.h * s.w);
@@ -533,6 +548,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         let (gep, cep) = match ep {
             1 => (ConvEpilogue::Relu, ConvEpilogue::Relu),
             2 => (ConvEpilogue::AddRelu(&gr), ConvEpilogue::AddRelu(&cr)),
+            3 => (ConvEpilogue::Prelu(&gr), ConvEpilogue::Prelu(&cr)),
             _ => (ConvEpilogue::None, ConvEpilogue::None),
         };
         let has_b = s.cin_b > 0;
@@ -603,6 +619,31 @@ fn model<B: Backend>(p: &mut Pair<'_, B>) {
         .decode_chunk(cpu, &mut cp.tae.state(), &z, lt, lh, lw)
         .data;
     p.record("tiny TAEHV decode (frames)", gf, cf);
+}
+
+/// The tiny ×2 upscaler on two noise frames (raw network output, before the
+/// host-side shuffle), both backends.
+fn upscaler<B: Backend>(p: &mut Pair<'_, B>) {
+    use crate::upscale::{UpConfig, Upscaler};
+    let (be, cpu) = (p.be, &Cpu);
+    let cfg = UpConfig::tiny();
+    let src = Synthetic { seed: 11 };
+    let (frames, h, w) = (2, 9, 13);
+    let mut rng = Rng::new(4);
+    let rgb: Vec<u8> = rng
+        .uniform(frames * h * w * 3, 1.0)
+        .into_iter()
+        .map(|v| ((v + 1.0) * 127.5) as u8)
+        .collect();
+    let g = Upscaler::load(be, cfg, &src).expect("synthetic upscaler");
+    let c = Upscaler::load(cpu, cfg, &src).expect("synthetic upscaler");
+    let gc = g.launch(be, &rgb, frames, h, w);
+    let cc = c.launch(cpu, &rgb, frames, h, w);
+    p.record(
+        "tiny upscaler (PReLU convs)",
+        be.download(&gc.out),
+        cpu.download(&cc.out),
+    );
 }
 
 /// The VSA path end to end: a tiny head_dim-32 DiT, 3 DMD steps, 4 tiles at

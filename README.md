@@ -81,6 +81,28 @@ one origin only. Generation requests must be JSON and come from the engine's
 own page or that origin, so another website cannot queue clips on your GPU.
 Safari blocks https pages from calling 127.0.0.1; use Chrome, Edge or Firefox.
 
+### In the browser, no install
+
+Prompt Studio's **In this browser (WebGPU)** mode runs the whole model in the
+tab: the engine is the same Rust code compiled to wasm (`crates/fastwan-web`,
+built by `scripts/build-web.sh` into `web/pkg/`), and the weights stream from
+a public R2 bucket, one transformer block per HTTP Range request, into the
+browser's cache (downloaded once). Two weight files:
+
+| variant | file | size |
+|---|---|---|
+| f4 | int4-hqq-g64 block linears, everything else f16 | 0.88 GB |
+| f16 | everything f16 | 2.98 GB |
+
+plus TAEHV (23 MB) and, if *Upscale ×4* is ticked, Real-ESRGAN's compact
+video model (2.5 MB), which takes a 480×272 clip to 1920×1088. There is no
+text encoder in the browser (UMT5-XXL is 11 GB): prompts come from a
+precomputed gallery (`web/gallery-prompts.txt`, embedded with `fastwan
+encode`). Rebuild the files with `fastwan quantize --weights int4-hqq-g64`
+and `--weights native` (block-ordered on write; the page refuses files that
+are not), the upscaler with `scripts/upscale/convert_esrgan.py`. For a local
+copy of the weights, open `/demo/?weights=<base URL>`.
+
 ### One clip from the command line
 
 Prompt embeddings come from `scripts/encode_prompt.py`:
@@ -93,6 +115,10 @@ python scripts/encode_prompt.py "a fox running through snow" fox.safetensors
     --embeds fox.safetensors --width 832 --height 480 --frames 81 --out fox.y4m
 ffmpeg -i fox.y4m fox.mp4
 ```
+
+Add `--upscale realesr-animevideov3.safetensors` to upscale ×4 after the
+decode (convert the official `.pth` with `python3 -I
+scripts/upscale/convert_esrgan.py`; it is loaded tensors-only, without torch).
 
 ## WebGPU test page
 
@@ -109,7 +135,8 @@ crates/fastwan-core    config, geometry, DMD schedule, RoPE, weights, Backend tr
 crates/fastwan-cpu     reference backend
 crates/fastwan-wgpu    WebGPU backend (src/shaders/*.wgsl)
 crates/fastwan-cuda    CUDA backend (src/kernels.cu, NVRTC + cuBLAS)
-crates/fastwan-model   Wan DiT, TAEHV, DMD pipeline, conformance checker
+crates/fastwan-model   Wan DiT, TAEHV, ×4 upscaler, DMD pipeline, conformance checker
+crates/fastwan-web     the WebGPU engine as wasm, for Prompt Studio's in-browser mode
 crates/fastwan-text    tokenizer + UMT5-XXL encoder (CPU, bf16 weights in place)
 crates/fastwan-cli     the `fastwan` binary (plan / check / bench / generate / serve)
 web/                   demo.html (prompt to clip, served by `fastwan serve`), WebGPU test page
