@@ -98,8 +98,9 @@ State and invariants only; the reasoning is in `docs/design.md`.
   `scripts/deploy-pages.sh`. Classic Pages, not Workers: no `--force` needed now.
 - In-browser mode (`crates/fastwan-web`, wasm via `scripts/build-web.sh` →
   `web/pkg`, wasm-bindgen pinned `=0.2.127` to match wgpu 30): weights stream
-  from the public bucket `fastwan-public/v1/` (`manifest.json`; fv-weights stays
-  private), one block per Range request, so DiT files must be block-ordered
+  from the public bucket `fastwan-public/v1/` (`manifest.json`, served at
+  `PUBLIC_WEIGHTS` in `web/demo.html`, r2.dev for now; fv-weights stays
+  private; CORS is an origin allowlist, add new site domains to it), one block per Range request, so DiT files must be block-ordered
   (`export::write` keeps the given order; `quantize_dit` sorts head first, then
   `blocks.N`). Blocking `download` panics on wasm: use `download_async`; no
   `Instant` on wasm. Tiny-model parity vs the CPU (SwiftShader Chrome): f4/f16

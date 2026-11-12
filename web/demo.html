@@ -197,10 +197,11 @@ const LENGTHS = [[81, "5 s · 81 frames"], [49, "3 s · 49 frames"], [33, "2 s �
 // ?weights=<base URL> points it elsewhere (tests use a local server).
 // The public copy of the browser weights (R2 bucket fastwan-public, prefix v1/);
 // empty until it is published. ?weights=<base URL> points the page elsewhere.
-const PUBLIC_WEIGHTS = "";
+const PUBLIC_WEIGHTS = "https://pub-0dd4721bafbf4846bab726e463f941e1.r2.dev/v1";
 const WEIGHTS = (new URLSearchParams(location.search).get("weights") || PUBLIC_WEIGHTS).replace(/\/+$/, "");
 const CAN_BROWSER = !SAME && "gpu" in navigator;
-let MODE = CAN_BROWSER && store("fastwan.mode") === "browser" ? "browser" : "engine";
+// Hosted page with WebGPU: run in the tab unless the visitor chose their engine.
+let MODE = CAN_BROWSER && store("fastwan.mode") !== "engine" ? "browser" : "engine";
 const bw = { mod: null, eng: null, manifest: null, loaded: null, entries: [], clips: new Map() };
 
 let info = null, job = null, poll = null;

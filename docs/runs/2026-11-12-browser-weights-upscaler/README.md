@@ -18,9 +18,12 @@ Both DiT files are block-ordered (head tensors first, then `blocks.N`
 contiguous), so the page fetches one block per Range request. The earlier
 `fv-weights/…-quant/` files are not, and the page refuses them.
 
-**Not yet public**: the bucket exists with CORS for fastwan.pages.dev and
-localhost, but its r2.dev URL has not been enabled, so `PUBLIC_WEIGHTS` in
-`web/demo.html` is still empty.
+Public at `https://pub-0dd4721bafbf4846bab726e463f941e1.r2.dev/v1/`
+(`PUBLIC_WEIGHTS` in `web/demo.html`), CORS for fastwan.pages.dev,
+fastwan.dev, www.fastwan.dev and localhost. Live check: the deployed
+https://fastwan.pages.dev/demo/ in headless Chromium loaded the f4 model from
+there in 55.3 s (16 chips, upscaler loaded). r2.dev is rate-limited and meant
+for development; the plan is a custom domain (weights.fastwan.dev).
 
 ## Rental (Vast 60388658, RTX 4090 48 GB, Texas, driver 615.71.09, 450 W, ~$0.32)
 
