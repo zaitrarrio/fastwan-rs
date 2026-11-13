@@ -581,6 +581,7 @@ async function bwLoad() {
   bw.entries = (await (await fetch(gurl, { cache: "no-store" })).json()).prompts;
   bw.galleryBase = gurl.slice(0, gurl.lastIndexOf("/") + 1);
   bw.loaded = `${bw.manifest.name || "FastWan2.1-T2V-1.3B"} · ${v.label} · in this browser`;
+  console.info("fastwan: WebGPU", bw.eng.adapter(), "|", bw.eng.limits());
   $("bw-load").disabled = false; $("bw-load").textContent = "Reload";
   bwStatus("ok", `Model ready in ${((performance.now() - t0) / 1000).toFixed(1)} s.`);
   showBrowserInfo();
@@ -604,7 +605,7 @@ async function upscaleClip(s) {
       const d = clip.frames[f0 + f].data;
       for (let i = 0, j = 0, o = f * px * 3; i < px; i++, j += 4, o += 3) { rgb[o] = d[j]; rgb[o + 1] = d[j + 1]; rgb[o + 2] = d[j + 2]; }
     }
-    const big = await bw.eng.upscale(rgb, m, h, w), W = w * k, H = h * k, P = W * H;
+    const big = await wasmCall(bw.eng.upscale(rgb, m, h, w)), W = w * k, H = h * k, P = W * H;
     for (let f = 0; f < m; f++) {
       const img = new ImageData(W, H), d = img.data;
       for (let i = 0, j = 0, o = f * P * 3; i < P; i++, j += 4, o += 3) { d[j] = big[o]; d[j + 1] = big[o + 1]; d[j + 2] = big[o + 2]; d[j + 3] = 255; }
@@ -616,6 +617,23 @@ async function upscaleClip(s) {
   clip.frames = out; clip.width = w * k; clip.height = h * k;
   $("canvas").width = clip.width; $("canvas").height = clip.height;
   updateControls();
+}
+// A Rust panic aborts the wasm module and leaves its promise pending forever;
+// it surfaces only as an uncaught RuntimeError. Fail the call on one, and
+// drop the engine (it cannot be used again) so the next load starts clean.
+function wasmCall(p) {
+  return new Promise((resolve, reject) => {
+    const crash = (e) => {
+      const err = e.reason || e.error || e;
+      if (!(err instanceof WebAssembly.RuntimeError) && !/unreachable|RuntimeError/.test(String(e.message || err))) return;
+      cleanup(); bw.eng = null; bw.loaded = null; bw.upScale = 0;
+      $("bw-load").textContent = "Load model"; bwStatus("bad", "The engine crashed; load the model again.");
+      reject(new Error(`the engine crashed (${String(err.message || err)}); see the browser console`));
+    };
+    const cleanup = () => { removeEventListener("error", crash); removeEventListener("unhandledrejection", crash); };
+    addEventListener("error", crash); addEventListener("unhandledrejection", crash);
+    p.then((v) => { cleanup(); resolve(v); }, (e) => { cleanup(); reject(e); });
+  });
 }
 function pushFrames(ev) {
   const { width: w, height: h, count, rgb } = ev, px = w * h;
@@ -643,12 +661,12 @@ async function browserGenerate(width, height, frames) {
     const emb = await cached(eurl, () => fetchBytes(eurl, null));
     s.encode_s = (performance.now() - t0) / 1000; s.stage = "preparing"; renderStages(s);
     let tDec = 0;
-    await bw.eng.generate(emb, width, height, frames, seed, (ev) => {
+    await wasmCall(bw.eng.generate(emb, width, height, frames, seed, (ev) => {
       if (ev.type === "prepared") s.stage = "denoising";
       else if (ev.type === "step") { s.steps.push(ev.ms / 1000); if (s.steps.length === ev.total) { s.stage = "decoding"; tDec = performance.now(); } }
       else if (ev.type === "frames") { pushFrames(ev); s.frames += ev.count; }
       renderStages(s);
-    });
+    }));
     s.decode_s = (performance.now() - tDec) / 1000;
     if (bw.manifest.upscaler && $("bw-up").checked) await upscaleClip(s);
     s.total_s = (performance.now() - t0) / 1000; s.stage = "done";

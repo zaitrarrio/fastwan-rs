@@ -103,7 +103,12 @@ State and invariants only; the reasoning is in `docs/design.md`.
   private; CORS is an origin allowlist, add new site domains to it), one block per Range request, so DiT files must be block-ordered
   (`export::write` keeps the given order; `quantize_dit` sorts head first, then
   `blocks.N`). Blocking `download` panics on wasm: use `download_async`; no
-  `Instant` on wasm. Tiny-model parity vs the CPU (SwiftShader Chrome): f4/f16
+  `Instant` on wasm. In the browser wgpu's default error handler panics
+  inside a JS callback, which left generate's promise pending forever (the
+  "stuck after step 3" report): `Wgpu` records uncaptured errors and device
+  loss (`fault()`), the web driver uses `try_download_async` and refuses a
+  size whose largest buffer exceeds the binding cap before denoising, and the
+  page fails the call on a wasm `RuntimeError`. Tiny-model parity vs the CPU (SwiftShader Chrome): f4/f16
   clips and the upscaler 99.9% byte-exact, max 1 level.
 - Upscaler (`upscale.rs`, Real-ESRGAN `realesr-animevideov3`, BSD-3): convs on
   the backend with `ConvEpilogue::Prelu`, pixel-shuffle + nearest skip on the

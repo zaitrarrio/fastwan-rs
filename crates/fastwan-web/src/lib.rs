@@ -95,6 +95,11 @@ mod web {
             self.inner.be.name()
         }
 
+        /// The adapter limits that decide which sizes fit.
+        pub fn limits(&self) -> String {
+            self.inner.be.limits_text()
+        }
+
         /// Largest storage binding the device allows, bytes.
         #[wasm_bindgen(js_name = maxBinding)]
         pub fn max_binding(&self) -> f64 {
@@ -174,7 +179,7 @@ mod web {
                     }
                     up.launch(&inner.be, &rgb, frames, h, w)
                 };
-                let raw = inner.be.download_async(&chunk.out).await;
+                let raw = inner.be.try_download_async(&chunk.out).await.map_err(err)?;
                 let px = rgb8(&raw, &rgb, frames, h, w, chunk.scale);
                 Ok(Uint8Array::from(&px[..]).into())
             })
@@ -265,6 +270,17 @@ mod web {
                 act_bytes: 4,
             },
         );
+        // Refuse a size this GPU cannot bind before spending the denoise on it.
+        if p.largest_binding > be.max_binding() {
+            return Err(err(format!(
+                "{}×{} needs a {} MiB GPU buffer; this browser's GPU allows {} ({}). Pick a smaller size.",
+                g.width,
+                g.height,
+                p.largest_binding >> 20,
+                be.max_binding() >> 20,
+                be.limits_text()
+            )));
+        }
         let schedule = DmdSchedule::fastwan_1_3b();
         let prompt = dit.prepare_prompt(be, &e);
         let mods: Vec<_> = schedule
@@ -274,7 +290,7 @@ mod web {
             .collect();
         let ws = dit.workspace(be, g.latent(), p.ffn_chunk, None);
         let fence = be.alloc(1);
-        be.download_async(&fence).await;
+        be.try_download_async(&fence).await.map_err(err)?;
         emit(Object::new().tap(|o| set(o, "type", "prepared")));
 
         let n = g.latent_len(cfg);
@@ -290,7 +306,7 @@ mod web {
                 be.write(&noise, &rng.normal(n));
             }
             be.dmd_step(&x, &v, next.map(|_| &noise), st, next.unwrap_or(0.0), n);
-            be.download_async(&fence).await; // wait for the step: honest timing
+            be.try_download_async(&fence).await.map_err(err)?; // wait for the step: honest timing
             let o = Object::new();
             set(&o, "type", "step");
             set(&o, "index", i as u32);
@@ -298,14 +314,19 @@ mod web {
             set(&o, "ms", now_ms() - t0);
             emit(o);
         }
-        let latent = be.download_async(&x).await;
+        let latent = be.try_download_async(&x).await.map_err(err)?;
         drop((ws, prompt, mods, v, noise));
 
         // TAEHV, chunk by chunk.
         let (lt, lh, lw) = g.latent();
         let c = tae.cfg.latent_channels;
         let plane = lh * lw;
-        let chunk = p.tae_chunk.clamp(1, 2);
+        // The plan's chunk respects the binding cap. 2 is faster, but above
+        // 480×272 one latent frame at a time halves the decoder's peak memory
+        // (818 → 409 MiB for its largest buffer at 832×480): browsers run on
+        // laptop GPUs too. Chunking does not change the frames.
+        let chunk = if g.width * g.height > 480 * 272 { 1 } else { p.tae_chunk.clamp(1, 2) };
+        let decode_err = |e: String| err(format!("decode failed: {e} ({})", be.limits_text()));
         let mut st = tae.state();
         let mut done = 0usize;
         let mut f0 = 0;
@@ -318,7 +339,7 @@ mod web {
                 }
             }
             let ck = tae.launch_chunk(be, &mut st, &z, nfr, lh, lw);
-            let raw = be.download_async(&ck.rgb).await;
+            let raw = be.try_download_async(&ck.rgb).await.map_err(decode_err)?;
             let (count, h, w, rgb) = ck.rgb8(&raw);
             let o = Object::new();
             set(&o, "type", "frames");

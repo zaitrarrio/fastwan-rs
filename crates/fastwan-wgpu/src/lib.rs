@@ -128,6 +128,10 @@ pub struct Wgpu {
     /// `FASTWAN_PROFILE=1` and the adapter has timestamp queries.
     prof: Option<Mutex<Prof>>,
     pending: Mutex<Pending>,
+    /// In the browser: the first uncaptured WebGPU error or the device-loss
+    /// reason. wgpu's default handler panics, which inside a JS callback
+    /// leaves the caller's promise pending forever (a silent hang).
+    fault: Arc<Mutex<Option<String>>>,
     dummy: GBuf,
     pub allow_f16_weights: bool,
 }
@@ -182,6 +186,24 @@ impl Wgpu {
             })
             .await
             .map_err(|e| InitError(format!("request_device: {e}")))?;
+        let fault = Arc::new(Mutex::new(None::<String>));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let f = fault.clone();
+            device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+                let mut f = f.lock().unwrap();
+                if f.is_none() {
+                    *f = Some(format!("WebGPU error: {e}"));
+                }
+            }));
+            let f = fault.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                let mut f = f.lock().unwrap();
+                if f.is_none() {
+                    *f = Some(format!("the GPU device was lost ({reason:?}): {msg}"));
+                }
+            });
+        }
         // K and V tiles of BK keys × 128 dims, f32, must fit shared memory.
         let wgs = device.limits().max_compute_workgroup_storage_size as usize;
         let attn_bk = if wgs >= 2 * 32 * 128 * 4 { 32 } else { 16 };
@@ -222,6 +244,7 @@ impl Wgpu {
             tag: Mutex::new(None),
             prof,
             pending: Mutex::new(Pending { enc: None, n: 0 }),
+            fault,
             dummy,
             allow_f16_weights: true,
         })
@@ -1256,6 +1279,70 @@ impl Wgpu {
     /// planner splits the FFN and decoder to stay under it).
     pub fn max_binding(&self) -> u64 {
         self.device.limits().max_storage_buffer_binding_size as u64
+    }
+
+    /// The first WebGPU error or device loss seen so far (browser only;
+    /// natively wgpu panics on them).
+    pub fn fault(&self) -> Option<String> {
+        self.fault.lock().unwrap().clone()
+    }
+
+    /// Adapter limits that decide what fits, for messages.
+    pub fn limits_text(&self) -> String {
+        let l = self.device.limits();
+        format!(
+            "maxStorageBufferBindingSize {} MiB, maxBufferSize {} MiB",
+            l.max_storage_buffer_binding_size as u64 >> 20,
+            l.max_buffer_size >> 20
+        )
+    }
+
+    /// [`Self::download_async`] that reports a failed map or a recorded
+    /// WebGPU error instead of panicking.
+    pub async fn try_download_async(&self, buf: &GBuf) -> Result<Vec<f32>, String> {
+        if let Some(f) = self.fault() {
+            return Err(f);
+        }
+        let size = (buf.len.max(1) * 4) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        {
+            let mut pend = self.pending.lock().unwrap();
+            let enc = pend
+                .enc
+                .get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
+            enc.copy_buffer_to_buffer(&buf.buf, 0, &staging, 0, size);
+        }
+        self.flush();
+        let (tx, rx) = futures_oneshot();
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| tx.send(r));
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        if let Err(e) = rx.await {
+            return Err(self
+                .fault()
+                .unwrap_or_else(|| format!("GPU readback failed: {e}")));
+        }
+        if let Some(f) = self.fault() {
+            return Err(f);
+        }
+        let data = staging
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| format!("GPU readback failed: {e:?}"))?;
+        let out = bytemuck::cast_slice::<u8, f32>(&data)[..buf.len].to_vec();
+        drop(data);
+        staging.unmap();
+        Ok(out)
     }
 
     /// Non-blocking readback for the browser (and usable natively).

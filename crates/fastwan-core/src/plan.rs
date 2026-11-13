@@ -110,14 +110,26 @@ pub fn plan(cfg: &WanConfig, tae: &TaeConfig, g: &Geometry, dev: &Device) -> Pla
         // conv pair holds its input, the 64-channel map and the RGB output.
         (5 * s0).max(5 * s1).max(5 * s2).max(s2 + 2 * out) * a
     };
+    // The largest single decoder buffer for `c` latent frames (the
+    // 64-channel map of the last stage at full resolution, at real sizes).
+    let decode_buffer = |c: u64| {
+        let s0 = c * nf[0] * px;
+        let s1 = c * tae.tgrow[0] as u64 * nf[1] * 4 * px;
+        let s2 = c * (tae.tgrow[0] * tae.tgrow[1]) as u64 * nf[2] * 16 * px;
+        let out = c * tae.t_upscale() as u64 * nf[3] * 64 * px;
+        s0.max(s1).max(s2).max(out) * a
+    };
     let mut tae_chunk = (t as u64).min(4);
-    while tae_chunk > 1 && weights + per_latent_peak(tae_chunk) > dev.budget_bytes {
+    while tae_chunk > 1
+        && (weights + per_latent_peak(tae_chunk) > dev.budget_bytes
+            || decode_buffer(tae_chunk) > dev.max_binding_bytes)
+    {
         tae_chunk -= 1;
     }
     let decode_peak = per_latent_peak(tae_chunk);
     let largest_binding = (s * 3 * d * a)
         .max(chunk * cfg.ffn_dim as u64 * a)
-        .max(per_latent_peak(tae_chunk) / 2);
+        .max(decode_buffer(tae_chunk));
     if largest_binding > dev.max_binding_bytes {
         notes.push(format!(
             "largest buffer {} MiB exceeds the device binding cap {} MiB",
