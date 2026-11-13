@@ -626,7 +626,8 @@ impl Backend for Cpu {
                         let k = c * p * p + iy * p + ix;
                         let mut v = src[((f * 3 * p * p + k) * h + sy) * w + sx];
                         if let Some(b) = &base {
-                            v += b[((f * 3 + c) * h + sy) * w + sx];
+                            let word = b[(f * h + sy) * w + sx].to_bits();
+                            v += ((word >> (8 * c)) & 0xff) as f32 / 255.0;
                         }
                         v
                     };

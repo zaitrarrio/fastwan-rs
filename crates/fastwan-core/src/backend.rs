@@ -69,19 +69,52 @@ pub fn pack_pixel(r: f32, g: f32, b: f32) -> u32 {
 }
 
 /// The bytes of a downloaded [`Backend::alloc_words`] buffer: each f32's bit
-/// pattern is one packed pixel, so this is RGBA, 4 bytes per pixel.
+/// pattern is one packed pixel, so this is RGBA, 4 bytes per pixel. On a
+/// little-endian target (every one this runs on) that is a plain copy.
 pub fn rgba8_bytes(words: &[f32]) -> Vec<u8> {
-    words
-        .iter()
-        .flat_map(|w| w.to_bits().to_le_bytes())
-        .collect()
+    if cfg!(target_endian = "little") {
+        let mut out = vec![0u8; words.len() * 4];
+        // SAFETY: `out` holds exactly `words.len() * 4` bytes, the regions do
+        // not overlap, and any bit pattern is a valid u8.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, out.as_mut_ptr(), out.len())
+        };
+        out
+    } else {
+        words
+            .iter()
+            .flat_map(|w| w.to_bits().to_le_bytes())
+            .collect()
+    }
 }
 
-/// RGBA → RGB (drops alpha).
+/// RGBA → RGB (drops alpha); large frames are split across the cores.
 pub fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
-    rgba.chunks_exact(4)
-        .flat_map(|p| [p[0], p[1], p[2]])
-        .collect()
+    let px = rgba.len() / 4;
+    let mut out = vec![0u8; px * 3];
+    let conv = |src: &[u8], dst: &mut [u8]| {
+        for (d, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+            d.copy_from_slice(&s[..3]);
+        }
+    };
+    let threads = if cfg!(target_arch = "wasm32") {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(16)
+    };
+    if threads <= 1 || px < 1 << 16 {
+        conv(rgba, &mut out);
+    } else {
+        let per = px.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (s, d) in rgba.chunks(per * 4).zip(out.chunks_mut(per * 3)) {
+                sc.spawn(move || conv(s, d));
+            }
+        });
+    }
+    out
 }
 
 /// A 2-D convolution over `frames` independent images, NCHW, stride 1,
@@ -351,9 +384,21 @@ pub trait Backend {
     fn alloc_words(&self, n: usize) -> Self::Buf {
         self.alloc(n)
     }
-    /// Pixel-shuffle `src`, add `base` upsampled ×p (nearest; `[skip +
-    /// frames, 3, h, w]`) when given, clamp, round to 8 bits and pack as
-    /// [`pack_pixel`] into `out` (from [`Backend::alloc_words`], one word per
-    /// pixel). Frames leave the device at 4 bytes per pixel, ready to show.
+    /// Blocking read of an [`Backend::alloc_words`] buffer as bytes (packed
+    /// RGBA: 4 per pixel). Backends override it to skip the f32 detour.
+    fn download_rgba8(&self, buf: &Self::Buf) -> Vec<u8> {
+        rgba8_bytes(&self.download(buf))
+    }
+    /// Packed 32-bit words uploaded bit-exactly (e.g. 8-bit RGBA frames).
+    fn upload_words(&self, words: &[u32]) -> Self::Buf {
+        let v: Vec<f32> = words.iter().map(|&w| f32::from_bits(w)).collect();
+        self.upload_table(if v.is_empty() { &[0.0][..] } else { &v })
+    }
+    /// Pixel-shuffle `src`, add `base` upsampled ×p (nearest) when given,
+    /// clamp, round to 8 bits and pack as [`pack_pixel`] into `out` (from
+    /// [`Backend::alloc_words`], one word per pixel). `base` is 8-bit RGBA
+    /// frames `[skip + frames, h, w]` from [`Backend::upload_words`], added as
+    /// `byte / 255` exactly (bf16 activations would lose a level near 1).
+    /// Frames leave the device at 4 bytes per pixel, ready to show.
     fn pack_rgba8(&self, src: &Self::Buf, base: Option<&Self::Buf>, s: &PackShape, out: &Self::Buf);
 }

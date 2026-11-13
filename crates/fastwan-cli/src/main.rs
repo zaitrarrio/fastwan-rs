@@ -718,14 +718,30 @@ fn generate<B: Backend>(
         let (h, w, s) = (video.height, video.width, ucfg.scale);
         // Batches of a few frames: activations are 64 channels at full size.
         let batch = up.batch(h, w, 1 << 30).min(8);
+        be.profile_reset();
         let t0 = std::time::Instant::now();
         let mut rgb = Vec::with_capacity(video.rgb.len() * s * s);
-        for f0 in (0..video.frames).step_by(batch) {
+        // Pipelined like the decode: batch i+1 is queued before batch i is
+        // read back and converted, so host work overlaps the GPU.
+        let starts: Vec<usize> = (0..video.frames).step_by(batch).collect();
+        let launch = |f0: usize| {
             let n = batch.min(video.frames - f0);
-            let src = &video.rgb[f0 * h * w * 3..(f0 + n) * h * w * 3];
-            let c = up.launch(be, src, n, h, w);
-            let rgba = c.rgba8(&be.download(&c.out));
+            up.launch(
+                be,
+                &video.rgb[f0 * h * w * 3..(f0 + n) * h * w * 3],
+                n,
+                h,
+                w,
+            )
+        };
+        let mut cur = launch(starts[0]);
+        for i in 0..starts.len() {
+            let next = starts.get(i + 1).map(|&f0| launch(f0));
+            let rgba = be.download_rgba8(&cur.out);
             rgb.extend(fastwan_core::backend::rgba_to_rgb(&rgba));
+            if let Some(n) = next {
+                cur = n;
+            }
         }
         println!(
             "upscale x{s} {:.2}s ({}x{} -> {}x{})",
@@ -735,6 +751,9 @@ fn generate<B: Backend>(
             w * s,
             h * s
         );
+        if let Some(r) = be.profile_report() {
+            print!("upscale: {r}");
+        }
         video = Video {
             frames: video.frames,
             width: w * s,

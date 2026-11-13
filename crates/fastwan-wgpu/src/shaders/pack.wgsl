@@ -1,13 +1,14 @@
 // Packed 8-bit RGBA frames (Backend::pack_rgba8), one thread per pixel.
 // src [skip + frames, 3·p², h, w] (pixel-shuffled RGB), optional base
-// [skip + frames, 3, h, w] added after a nearest ×p upsample; out holds one
+// [skip + frames, h, w] packed 8-bit RGBA added (÷255) after a nearest ×p
+// upsample; out holds one
 // R | G<<8 | B<<16 | 255<<24 word per pixel. `out` is a u32 view: a packed
 // pixel is not a valid f32 in general (WGSL leaves NaN bitcasts undefined).
 struct P { n: u32, skip: u32, h: u32, w: u32, p: u32, has_base: u32 }
 @group(0) @binding(0) var<uniform> pp: P;
 @group(0) @binding(1) var<storage, read_write> out: array<u32>;
 @group(0) @binding(2) var<storage, read> src: array<f32>;
-@group(0) @binding(3) var<storage, read> base: array<f32>;
+@group(0) @binding(3) var<storage, read> base: array<u32>;
 
 fn q8(v: f32) -> u32 {
     return u32(clamp(v, 0.0, 1.0) * 255.0 + 0.5);
@@ -33,12 +34,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     var g = src[(s0 + p * p) * plane + at];
     var b = src[(s0 + 2u * p * p) * plane + at];
     if (pp.has_base != 0u) {
-        let b0 = f * 3u * plane + at;
-        r = r + base[b0];
-        g = g + base[b0 + plane];
-        b = b + base[b0 + 2u * plane];
+        let wd = base[f * plane + at];
+        r = r + f32(wd & 255u) / 255.0;
+        g = g + f32((wd >> 8u) & 255u) / 255.0;
+        b = b + f32((wd >> 16u) & 255u) / 255.0;
     }
     out[i] = q8(r) | (q8(g) << 8u) | (q8(b) << 16u) | 0xff000000u;
     // Keep every binding statically used (auto layouts drop unused ones).
-    if (pp.n == 0xffffffffu) { out[0] = u32(base[0]); }
+    if (pp.n == 0xffffffffu) { out[0] = base[0]; }
 }

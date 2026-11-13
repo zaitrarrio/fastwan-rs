@@ -743,38 +743,14 @@ impl Backend for Wgpu {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn download(&self, buf: &GBuf) -> Vec<f32> {
-        let size = (buf.len.max(1) * 4) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        {
-            let mut pend = self.pending.lock().unwrap();
-            let enc = pend
-                .enc
-                .get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
-            enc.copy_buffer_to_buffer(&buf.buf, 0, &staging, 0, size);
-        }
-        self.flush();
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .expect("device lost while reading back");
-        rx.recv().unwrap().expect("map failed");
-        let data = slice.get_mapped_range().expect("mapped range");
-        let out = bytemuck::cast_slice::<u8, f32>(&data)[..buf.len].to_vec();
-        drop(data);
-        staging.unmap();
-        out
+        self.read_with(buf, |d| {
+            bytemuck::cast_slice::<u8, f32>(d)[..buf.len].to_vec()
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn download_rgba8(&self, buf: &GBuf) -> Vec<u8> {
+        self.read_with(buf, |d| d[..buf.len * 4].to_vec())
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -1304,6 +1280,43 @@ impl Wgpu {
     /// planner splits the FFN and decoder to stay under it).
     pub fn max_binding(&self) -> u64 {
         self.device.limits().max_storage_buffer_binding_size as u64
+    }
+
+    /// Blocking readback (native only): `f` sees the mapped bytes.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_with<T>(&self, buf: &GBuf, f: impl FnOnce(&[u8]) -> T) -> T {
+        let size = (buf.len.max(1) * 4) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        {
+            let mut pend = self.pending.lock().unwrap();
+            let enc = pend
+                .enc
+                .get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
+            enc.copy_buffer_to_buffer(&buf.buf, 0, &staging, 0, size);
+        }
+        self.flush();
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .expect("device lost while reading back");
+        rx.recv().unwrap().expect("map failed");
+        let data = slice.get_mapped_range().expect("mapped range");
+        let out = f(&data);
+        drop(data);
+        staging.unmap();
+        out
     }
 
     /// The first WebGPU error or device loss seen so far (browser only;

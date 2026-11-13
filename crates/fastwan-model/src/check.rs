@@ -674,19 +674,22 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             .into_iter()
             .map(|v| v + 0.4)
             .collect();
-        let base: Vec<f32> = rng
-            .uniform(total * 3 * s.h * s.w, 0.5)
-            .into_iter()
-            .map(|v| v + 0.5)
+        let base: Vec<u32> = rng
+            .uniform(total * s.h * s.w * 3, 1.0)
+            .chunks_exact(3)
+            .map(|c| {
+                let q = |v: f32| ((v + 1.0) * 127.5) as u32;
+                q(c[0]) | q(c[1]) << 8 | q(c[2]) << 16
+            })
             .collect();
         let (gs, gb, go) = (
             be.upload(&src),
-            be.upload(&base),
+            be.upload_words(&base),
             be.alloc_words(s.pixels()),
         );
         let (cs, cb, co) = (
             cpu.upload(&src),
-            cpu.upload(&base),
+            cpu.upload_words(&base),
             cpu.alloc_words(s.pixels()),
         );
         be.pack_rgba8(&gs, with_base.then_some(&gb), &s, &go);

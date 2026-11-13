@@ -111,13 +111,24 @@ State and invariants only; the reasoning is in `docs/design.md`.
   page fails the call on a wasm `RuntimeError`. Tiny-model parity vs the CPU (SwiftShader Chrome): f4/f16
   clips and the upscaler 99.9% byte-exact, max 1 level.
 - Upscaler (`upscale.rs`, Real-ESRGAN `realesr-animevideov3`, BSD-3): convs on
-  the backend with `ConvEpilogue::Prelu`, pixel-shuffle + nearest skip on the
-  host (`upscale::rgb8`). Real weights match a numpy SRVGGNetCompact 100%
+  the backend with `ConvEpilogue::Prelu`, pixel-shuffle + nearest skip in
+  `pack_rgba8` (below). Real weights match a numpy SRVGGNetCompact 100%
   (`scripts/upscale/parity.py`). `generate --upscale`, Prompt Studio checkbox.
-  4090 CUDA: 81 frames 480×272 → 1920×1088 in 1.92 s
-  (`docs/runs/2026-11-12-browser-weights-upscaler`). The in-browser model has
-  not yet run on a real GPU: Vast hosts differ in whether they expose Vulkan;
-  `fastwan check --backend wgpu` must name NVIDIA, not llvmpipe.
+  4090 CUDA: 81 frames 480×272 → 1920×1088 in 0.87 s, of which 285 ms is GPU.
+- `pack_rgba8` (+ `alloc_words` / `upload_words` / `download_rgba8`): TAEHV's
+  and the upscaler's last step on the device, frames out as packed RGBA. A
+  packed word is not a valid f32 in general: WGSL writes it through a u32
+  view, CUDA through an f32-flagged buffer (activations are bf16), and the
+  upscaler's residual is the exact 8-bit input (bf16 lost a level). Native
+  win is small (decode 0.36 → 0.33 s, upscale 0.99 → 0.87 s, output
+  identical); the browser loses its per-pixel loops
+  (`docs/runs/2026-11-13-vast-4090-gpu-pack-browser`).
+- In the browser on an RTX 4090 (Chrome, real GPU): 832×480×81 in 35.7 s
+  (10.9 s/step), 480×272×81 + ×4 upscale in 12.7 s. Playwright's headless
+  *shell* has no `navigator.gpu`: use the full Chromium build. Vast hosts
+  differ in whether they expose Vulkan; `fastwan check --backend wgpu` must
+  name NVIDIA, not llvmpipe. `fastwan serve` marks its page
+  (`fastwan-served` meta); only that page hides browser mode.
 - Tests: `cargo test --workspace` (needs a Vulkan driver for the WebGPU suite:
   `mesa-vulkan-drivers`); NVRTC kernel compile needs libnvrtc on
   `LD_LIBRARY_PATH` (`pip install nvidia-cuda-nvrtc-cu12`).

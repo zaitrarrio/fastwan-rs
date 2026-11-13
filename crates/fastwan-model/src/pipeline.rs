@@ -176,11 +176,12 @@ impl<B: Backend> Pipeline<B> {
             (c, packed)
         };
         let (mut cur, packed) = launch(&mut st, starts[0]);
-        let mut raw = be.download(&packed);
+        let mut raw = be.download_rgba8(&packed);
         for i in 0..starts.len() {
             let next = (i + 1 < starts.len()).then(|| launch(&mut st, starts[i + 1]));
-            let (count, h, w, rgba) = cur.rgba8(&raw);
-            let rgb = fastwan_core::backend::rgba_to_rgb(&rgba);
+            let (count, h, w) = cur.dims();
+            let rgba = &raw[..count * h * w * 4];
+            let rgb = fastwan_core::backend::rgba_to_rgb(rgba);
             (width, height) = (w, h);
             frames += count;
             let start = out.len();
@@ -193,7 +194,7 @@ impl<B: Backend> Pipeline<B> {
                 rgb: &out[start..],
             });
             if let Some((n, packed)) = next {
-                raw = be.download(&packed);
+                raw = be.download_rgba8(&packed);
                 cur = n;
             }
         }

@@ -575,7 +575,12 @@ pub fn serve(
                     .unwrap();
                 send(
                     req,
-                    tiny_http::Response::from_string(PAGE).with_header(h),
+                    tiny_http::Response::from_string(PAGE.replacen(
+                        r#"<meta name="fastwan-served" content="">"#,
+                        r#"<meta name="fastwan-served" content="engine">"#,
+                        1,
+                    ))
+                    .with_header(h),
                     &cors,
                 );
             }
@@ -770,3 +775,19 @@ pub fn serve(
 }
 
 use std::io::Read as _;
+
+#[cfg(test)]
+mod tests {
+    /// The page decides "served by the engine" from this marker, which the
+    /// GET / handler fills in; if the placeholder drifted, the engine's own
+    /// page would offer browser mode and lose its engine.
+    #[test]
+    fn page_has_the_served_marker() {
+        assert_eq!(
+            super::PAGE
+                .matches(r#"<meta name="fastwan-served" content="">"#)
+                .count(),
+            1
+        );
+    }
+}

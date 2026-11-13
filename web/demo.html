@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
+<meta name="fastwan-served" content="">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>FastWan Prompt Studio</title>
@@ -63,7 +64,7 @@ button:focus-visible, .chip:focus-visible { outline: 2px solid var(--ink); outli
 .modes button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
 .progress { height: 6px; background: var(--rule); border-radius: 3px; overflow: hidden; }
 .check { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; margin-top: 12px; cursor: pointer; }
-.check input { margin-top: 3px; accent-color: var(--accent); }
+.check input { flex: none; width: auto; padding: 0; margin: 3px 0 0; accent-color: var(--accent); }
 .progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
 .cmd { font: 0.8rem/1.5 var(--f-mono); background: var(--bg); border: 1px solid var(--rule); border-radius: 4px; padding: 8px 10px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg { font: 0.88rem/1.45 var(--f-mono); padding: 10px 12px; border-radius: 4px; white-space: pre-wrap; margin: 0; }
@@ -177,7 +178,9 @@ const $ = (id) => document.getElementById(id);
 const FPS = 16;
 // Served by the engine itself → same origin. Hosted (Cloudflare Pages) → the
 // engine on this machine, which must be started with --allow-origin <this site>.
-const SAME = location.protocol === "http:" && ["127.0.0.1", "localhost"].includes(location.hostname);
+// `fastwan serve` marks the page it serves; a copy of the site hosted
+// anywhere else (localhost included) drives an engine or runs in the tab.
+const SAME = document.querySelector('meta[name="fastwan-served"]')?.content === "engine";
 let ENGINE = SAME ? "" : (store("fastwan.engine") || "http://127.0.0.1:7860");
 const api = (path) => ENGINE + path;
 function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { return null; } }

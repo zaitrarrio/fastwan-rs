@@ -1131,6 +1131,19 @@ impl Backend for Cuda {
         );
     }
 
+    fn download_rgba8(&self, buf: &CuBuf) -> Vec<u8> {
+        assert!(buf.f32, "download_rgba8: buffer must come from alloc_words");
+        let h = self.stream.clone_dtoh(&*buf.s).expect("download");
+        // Each word is two little-endian u16 halves: in memory, already the
+        // packed RGBA bytes. One copy, no per-element work.
+        let n = buf.len * 4;
+        let mut out = vec![0u8; n];
+        // SAFETY: `h` holds at least `2 * buf.len` u16s = `n` bytes; the
+        // regions do not overlap and any bit pattern is a valid u8.
+        unsafe { std::ptr::copy_nonoverlapping(h.as_ptr() as *const u8, out.as_mut_ptr(), n) };
+        out
+    }
+
     fn alloc_words(&self, n: usize) -> CuBuf {
         // Two u16 per word, flagged f32 so `download` returns the bits as-is.
         let s = self
@@ -1150,7 +1163,7 @@ impl Backend for Cuda {
             out.f32 && out.len >= n,
             "pack_rgba8: out must come from alloc_words"
         );
-        assert!(!src.f32 && base.is_none_or(|b| !b.f32));
+        assert!(!src.f32 && base.is_none_or(|b| b.f32), "base: upload_words");
         self.launch(
             &self.f.pack_rgba8,
             Self::elems(n),

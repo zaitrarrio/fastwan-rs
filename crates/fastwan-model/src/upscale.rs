@@ -82,7 +82,7 @@ pub struct Upscaler<B: Backend> {
 pub struct UpChunk<B: Backend> {
     pub out: B::Buf,
     /// Held until the caller has downloaded `out`.
-    _keep: [B::Buf; 4],
+    _keep: [B::Buf; 5],
     pub frames: usize,
     pub h: usize,
     pub w: usize,
@@ -165,10 +165,16 @@ impl<B: Backend> Upscaler<B> {
             p: self.cfg.scale,
         };
         let packed = be.alloc_words(shape.pixels());
-        be.pack_rgba8(&out, Some(&input), &shape, &packed);
+        // The residual is the input itself, as exact 8-bit words.
+        let words: Vec<u32> = rgb
+            .chunks_exact(3)
+            .map(|p| p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16)
+            .collect();
+        let base = be.upload_words(&words);
+        be.pack_rgba8(&out, Some(&base), &shape, &packed);
         UpChunk {
             out: packed,
-            _keep: [input, f0, f1, out],
+            _keep: [input, f0, f1, out, base],
             frames,
             h,
             w,
