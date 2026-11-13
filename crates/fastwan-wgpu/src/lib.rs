@@ -11,6 +11,11 @@
 //! a host write or read flushes first, so queue ordering always matches
 //! program order.
 
+#[cfg(target_arch = "wasm32")]
+mod canvas;
+#[cfg(target_arch = "wasm32")]
+pub use canvas::CanvasView;
+
 use fastwan_core::backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind, PackShape};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -113,6 +118,11 @@ struct Pending {
 }
 
 pub struct Wgpu {
+    /// For canvas surfaces (browser only).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    instance: wgpu::Instance,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     info: wgpu::AdapterInfo,
@@ -235,6 +245,8 @@ impl Wgpu {
         });
         Ok(Self {
             info: adapter.get_info(),
+            instance,
+            adapter,
             device,
             queue,
             attn_bk,
@@ -479,7 +491,7 @@ impl Wgpu {
         }
     }
 
-    fn flush(&self) {
+    pub(crate) fn flush(&self) {
         let mut pend = self.pending.lock().unwrap();
         let mut enc = pend.enc.take();
         pend.n = 0;

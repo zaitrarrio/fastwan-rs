@@ -73,6 +73,8 @@ button:focus-visible, .chip:focus-visible { outline: 2px solid var(--ink); outli
 code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 5px; border-radius: 3px; }
 .screen { background: var(--screen); border-radius: 4px; display: grid; place-items: center; aspect-ratio: 832 / 480; max-width: 100%; overflow: hidden; position: relative; }
 .screen canvas { width: 100%; height: 100%; object-fit: contain; display: block; image-rendering: auto; }
+.screen #canvas-up { position: absolute; inset: 0; }
+.screen canvas[hidden] { display: none; }
 .screen .empty { position: absolute; inset: 0; display: grid; place-items: center; color: #8d9792; font: 0.9rem var(--f-mono); text-align: center; padding: 16px; }
 .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .controls input[type=range] { flex: 1 1 200px; padding: 0; accent-color: var(--accent); background: transparent; border: 0; }
@@ -117,7 +119,7 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
         </div>
         <div class="progress" id="bw-progress" hidden><div id="bw-bar"></div></div>
         <p class="hint" id="bw-status"></p>
-        <label class="check" id="bw-up-row" hidden><input type="checkbox" id="bw-up"><span>Upscale ×4 after decoding <span class="hint" id="bw-up-hint">(Real-ESRGAN compact video model, 2.5 MB more)</span></span></label>
+        <label class="check" id="bw-up-row" hidden><input type="checkbox" id="bw-up"><span>Upscale ×4 after decoding <span class="hint" id="bw-up-hint">(480×272 → 1920×1088; Real-ESRGAN compact video model, 2.5 MB more)</span></span></label>
       </div>
       <div class="connect" id="connect" hidden>
         <h2>Connect your engine</h2>
@@ -151,7 +153,7 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
     <div style="display:grid;gap:20px;min-width:0">
       <section class="panel" aria-labelledby="out-h">
         <div class="controls"><h2 id="out-h" style="flex:1">Clip</h2><span class="summary" id="summary"></span></div>
-        <div class="screen" id="screen"><canvas id="canvas" width="832" height="480"></canvas><div class="empty" id="empty">Your clip plays here as soon as the first frames are decoded.</div></div>
+        <div class="screen" id="screen"><canvas id="canvas" width="832" height="480"></canvas><canvas id="canvas-up" hidden></canvas><div class="empty" id="empty">Your clip plays here as soon as the first frames are decoded.</div></div>
         <div class="controls">
           <button type="button" class="ghost" id="play" disabled>Pause</button>
           <input type="range" id="scrub" min="0" max="0" value="0" disabled aria-label="Frame">
@@ -333,7 +335,9 @@ function resetButton() { job = null; $("go").textContent = "Generate clip"; $("g
 function showError(m) { $("err").textContent = m; $("err").hidden = false; }
 
 function startClip(id, w, h, total) {
-  clip = { frames: [], width: w, height: h, total, id };
+  clip = { frames: [], width: w, height: h, total, id, up: null };
+  try { bw.eng?.clearUpscaled(); } catch {}
+  $("canvas-up").hidden = true;
   frame = 0; playing = true;
   $("canvas").width = w; $("canvas").height = h;
   $("screen").style.aspectRatio = `${w} / ${h}`;
@@ -385,10 +389,17 @@ function finishClip(s) {
 }
 
 // ---- playback -----------------------------------------------------------------
-// Frames are ImageData, or ImageBitmap once upscaled (kept off the JS heap).
+// Frames are ImageData (low-res); upscaled frames are drawn by the engine on #canvas-up.
 function paint(c, f) { if (f instanceof ImageData) c.putImageData(f, 0, 0); else c.drawImage(f, 0, 0); }
 function draw() {
-  if (clip.frames.length) paint(ctx, clip.frames[Math.min(frame, clip.frames.length - 1)]);
+  const n = clip.frames.length;
+  if (n) {
+    const f = Math.min(frame, n - 1);
+    let up = false;
+    if (clip.up && f < clip.up.ready && bw.eng) { try { bw.eng.showUpscaled(f); up = true; } catch {} }
+    $("canvas-up").hidden = !up;
+    if (!up) paint(ctx, clip.frames[f]);
+  }
   $("counter").textContent = `${clip.frames.length ? frame + 1 : 0} / ${clip.total || clip.frames.length}`;
   $("scrub").value = frame;
 }
@@ -418,9 +429,22 @@ function download(blob, name) {
   document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 function slug() { return (job?.prompt || $("prompt").value).toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-+$/, "") || "fastwan"; }
-$("save-png").onclick = () => $("canvas").toBlob((b) => b && download(b, `${slug()}-f${frame + 1}.png`), "image/png");
+$("save-png").onclick = async () => {
+  const name = `${slug()}-f${frame + 1}.png`;
+  if (clip.up && frame < clip.up.ready && bw.eng) {
+    // The upscaled frame lives on the GPU: read just this one back.
+    const k = clip.up.k, W = clip.width * k, H = clip.height * k, rgba = await bw.eng.upscaledFrame(frame);
+    const c = document.createElement("canvas"); c.width = W; c.height = H;
+    c.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, W * H * 4), W, H), 0, 0);
+    c.toBlob((b) => b && download(b, name), "image/png");
+    return;
+  }
+  $("canvas").toBlob((b) => b && download(b, name), "image/png");
+};
 $("save-webm").onclick = () => {
-  const stream = $("canvas").captureStream(FPS);
+  // Record the upscaled canvas once every frame is upscaled.
+  const upAll = clip.up && clip.up.ready >= clip.frames.length;
+  const stream = $(upAll ? "canvas-up" : "canvas").captureStream(FPS);
   const type = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"].find((t) => MediaRecorder.isTypeSupported(t));
   const rec = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 8e6 });
   const parts = [];
@@ -457,6 +481,11 @@ async function reopen(s) {
     clip.frames = c.frames.slice(); $("empty").hidden = true; updateControls();
     $("prompt").value = c.s.prompt; $("seed").value = c.s.seed; markChip();
     renderStages(c.s); finishClip(c.s); document.querySelector(`.clip[data-id="${s.id}"]`)?.remove(); addHistory(c.s);
+    // Upscaled frames are kept on the GPU for the current clip only: redo them.
+    if (c.s.upscale && bw.eng && bw.upScale) {
+      job = { id: s.id }; $("go").disabled = true;
+      upscaleClip(c.s).catch((e) => showError("Upscale failed: " + (e?.message || e))).finally(() => { renderStages(c.s); resetButton(); });
+    }
     return;
   }
   const r = await fetch(api(`/api/jobs/${s.id}`), { cache: "no-store" });
@@ -554,7 +583,7 @@ async function bwLoad() {
   bwStatus("wait", "Starting WebGPU…");
   if (!bw.mod) { bw.mod = await import("/pkg/fastwan_web.js"); await bw.mod.default(); }
   if (bw.eng) { bw.eng.free(); bw.eng = null; bw.loaded = null; }
-  bw.eng = await bw.mod.createEngine(bw.manifest.model); bw.upScale = 0;
+  bw.eng = await bw.mod.createEngine(bw.manifest.model); bw.upScale = 0; bw.upAttached = false;
   const url = `${WEIGHTS}/${v.file}`, { dataStart, groups } = await readGroups(url);
   const blocks = [...groups.keys()].filter((k) => k >= 0).sort((a, b) => a - b);
   if (blocks.length !== bw.eng.layers()) throw new Error(`${v.file} has ${blocks.length} blocks, the model ${bw.eng.layers()}`);
@@ -590,31 +619,37 @@ async function bwLoad() {
   showBrowserInfo();
   if ($("size").querySelector('option[value="480x272"]')) $("size").value = "480x272";
 }
-// The upscaler loads on first use (it is small); frames go through it in
-// batches that fit one storage binding, and come back as ImageBitmaps.
+// The upscaler loads on first use (it is small).
+// Upscaled frames never leave the GPU: each batch is kept there and drawn
+// straight onto #canvas-up (a WebGPU canvas over the 2D one). The low-res
+// clip plays meanwhile; every frame switches to 4× as soon as its batch is
+// done. Only "Save frame PNG" reads one frame back.
 async function upscaleClip(s) {
   const u = bw.manifest.upscaler;
   if (!bw.upScale) {
     const url = `${WEIGHTS}/${u.file}`;
     bw.upScale = bw.eng.loadUpscaler(await cached(`${url}?size=${u.bytes}`, () => fetchBytes(url, null)));
   }
-  const k = bw.upScale, w = clip.width, h = clip.height, px = w * h, n = clip.frames.length;
+  if (!bw.upAttached) { bw.eng.attachCanvas($("canvas-up")); bw.upAttached = true; }
+  const k = bw.upScale, w = clip.width, h = clip.height, px = w * h, n = clip.frames.length, id = clip.id;
+  $("canvas-up").width = w * k; $("canvas-up").height = h * k;
+  bw.eng.clearUpscaled();
+  clip.up = { k, ready: 0 };
   const batch = Math.max(1, Math.min(n, bw.eng.upscaleBatch(h, w), 4));
   s.upscale = k; s.up_frames = 0; s.stage = "upscaling"; renderStages(s);
-  const t = performance.now(), out = [];
+  const t = performance.now();
   for (let f0 = 0; f0 < n; f0 += batch) {
     const m = Math.min(batch, n - f0), rgb = new Uint8Array(m * px * 3);
     for (let f = 0; f < m; f++) {
       const d = clip.frames[f0 + f].data;
       for (let i = 0, j = 0, o = f * px * 3; i < px; i++, j += 4, o += 3) { rgb[o] = d[j]; rgb[o + 1] = d[j + 1]; rgb[o + 2] = d[j + 2]; }
     }
-    const big = await wasmCall(bw.eng.upscale(rgb, m, h, w));
-    for (let f = 0; f < m; f++) out.push(await createImageBitmap(rgbaFrame(big, f, w * k, h * k)));
-    s.up_frames += m; renderStages(s);
+    const ready = await wasmCall(bw.eng.upscaleKeep(rgb, m, h, w));
+    if (clip.id !== id) return;
+    clip.up.ready = ready; s.up_frames = ready; renderStages(s);
+    if (!playing) draw();
   }
   s.up_s = (performance.now() - t) / 1000;
-  clip.frames = out; clip.width = w * k; clip.height = h * k;
-  $("canvas").width = clip.width; $("canvas").height = clip.height;
   updateControls();
 }
 // A Rust panic aborts the wasm module and leaves its promise pending forever;
@@ -625,7 +660,7 @@ function wasmCall(p) {
     const crash = (e) => {
       const err = e.reason || e.error || e;
       if (!(err instanceof WebAssembly.RuntimeError) && !/unreachable|RuntimeError/.test(String(e.message || err))) return;
-      cleanup(); bw.eng = null; bw.loaded = null; bw.upScale = 0;
+      cleanup(); bw.eng = null; bw.loaded = null; bw.upScale = 0; bw.upAttached = false;
       $("bw-load").textContent = "Load model"; bwStatus("bad", "The engine crashed; load the model again.");
       reject(new Error(`the engine crashed (${String(err.message || err)}); see the browser console`));
     };
@@ -668,7 +703,8 @@ async function browserGenerate(width, height, frames) {
       renderStages(s);
     }));
     s.decode_s = (performance.now() - tDec) / 1000;
-    if (bw.manifest.upscaler && $("bw-up").checked) await upscaleClip(s);
+    // ×4 of 480×272 is 1920×1088; larger sizes would need GBs of GPU memory.
+    if (bw.manifest.upscaler && $("bw-up").checked && width * height <= 480 * 272) await upscaleClip(s);
     s.total_s = (performance.now() - t0) / 1000; s.stage = "done";
     renderStages(s);
     bw.clips.set(id, { s, frames: clip.frames.slice() });

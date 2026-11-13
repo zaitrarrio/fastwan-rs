@@ -565,6 +565,7 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -577,6 +578,7 @@ dependencies = [
  "fastwan-model",
  "half",
  "pollster",
+ "web-sys",
  "wgpu",
 ]
 

@@ -184,6 +184,12 @@ impl<B: Backend> Upscaler<B> {
 }
 
 impl<B: Backend> UpChunk<B> {
+    /// The packed frames, dropping the intermediates. Only once the work is
+    /// known to be done: in a browser, dropping a buffer destroys it at once.
+    pub fn into_out(self) -> B::Buf {
+        self.out
+    }
+
     /// `[frames, H·s, W·s, 4]` RGBA bytes from the downloaded `out`.
     pub fn rgba8(&self, words: &[f32]) -> Vec<u8> {
         let n = self.frames * self.h * self.scale * self.w * self.scale;

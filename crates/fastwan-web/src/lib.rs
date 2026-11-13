@@ -46,6 +46,11 @@ mod web {
         dit: RefCell<Option<WanDit<Wgpu>>>,
         tae: RefCell<Option<TaeHv<Wgpu>>>,
         up: RefCell<Option<Upscaler<Wgpu>>>,
+        /// The canvas upscaled frames are drawn on, and the frames kept on
+        /// the GPU: (packed buffer, frames in it), one entry per batch.
+        view: RefCell<Option<fastwan_wgpu::CanvasView>>,
+        kept: RefCell<Vec<(fastwan_wgpu::GBuf, usize)>>,
+        kept_dims: std::cell::Cell<(u32, u32)>,
     }
 
     #[wasm_bindgen]
@@ -73,6 +78,9 @@ mod web {
                 dit: RefCell::new(None),
                 tae: RefCell::new(None),
                 up: RefCell::new(None),
+                view: RefCell::new(None),
+                kept: RefCell::new(Vec::new()),
+                kept_dims: std::cell::Cell::new((0, 0)),
             }),
         })
     }
@@ -180,6 +188,89 @@ mod web {
                 let raw = inner.be.try_download_async(&chunk.out).await.map_err(err)?;
                 let px = chunk.rgba8(&raw);
                 Ok(Uint8Array::from(&px[..]).into())
+            })
+        }
+
+        /// The canvas upscaled frames are drawn on (it must not have a 2D
+        /// context). Keep its width × height at the upscaled size.
+        #[wasm_bindgen(js_name = attachCanvas)]
+        pub fn attach_canvas(&self, canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
+            *self.inner.view.borrow_mut() = Some(self.inner.be.canvas_view(canvas).map_err(err)?);
+            Ok(())
+        }
+
+        /// Upscale `frames` RGB frames and keep the result on the GPU (no
+        /// readback); resolves to the number of frames kept so far, once this
+        /// batch has finished. Show them with `showUpscaled`.
+        #[wasm_bindgen(js_name = upscaleKeep)]
+        pub fn upscale_keep(
+            &self,
+            rgb: Vec<u8>,
+            frames: usize,
+            h: usize,
+            w: usize,
+        ) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            wasm_bindgen_futures::future_to_promise(async move {
+                let chunk = {
+                    let up = inner.up.borrow();
+                    let up = up
+                        .as_ref()
+                        .ok_or_else(|| err("the upscaler is not loaded"))?;
+                    if rgb.len() != frames * h * w * 3 {
+                        return Err(err("rgb is not frames × h × w × 3"));
+                    }
+                    up.launch(&inner.be, &rgb, frames, h, w)
+                };
+                let s = chunk.scale as u32;
+                // Wait for the batch: progress for the page, and the
+                // intermediates may only be dropped (destroyed) after it.
+                let fence = inner.be.alloc(1);
+                inner.be.try_download_async(&fence).await.map_err(err)?;
+                let mut kept = inner.kept.borrow_mut();
+                kept.push((chunk.into_out(), frames));
+                inner.kept_dims.set((w as u32 * s, h as u32 * s));
+                Ok(JsValue::from(kept.iter().map(|k| k.1).sum::<usize>() as u32))
+            })
+        }
+
+        /// Upscaled frames kept on the GPU.
+        #[wasm_bindgen(js_name = upscaledCount)]
+        pub fn upscaled_count(&self) -> usize {
+            self.inner.kept.borrow().iter().map(|k| k.1).sum()
+        }
+
+        /// Free the kept upscaled frames.
+        #[wasm_bindgen(js_name = clearUpscaled)]
+        pub fn clear_upscaled(&self) {
+            self.inner.kept.borrow_mut().clear();
+        }
+
+        /// Draw kept upscaled frame `i` on the attached canvas.
+        #[wasm_bindgen(js_name = showUpscaled)]
+        pub fn show_upscaled(&self, i: usize) -> Result<(), JsValue> {
+            let (buf, first) = self
+                .locate(i)
+                .ok_or_else(|| err("frame not upscaled yet"))?;
+            let (w, h) = self.inner.kept_dims.get();
+            let view = self.inner.view.borrow();
+            let view = view.as_ref().ok_or_else(|| err("no canvas attached"))?;
+            view.show(&self.inner.be, &buf, first, w, h).map_err(err)
+        }
+
+        /// Kept upscaled frame `i` as RGBA bytes (for saving one frame).
+        #[wasm_bindgen(js_name = upscaledFrame)]
+        pub fn upscaled_frame(&self, i: usize) -> js_sys::Promise {
+            let found = self.locate(i);
+            let (w, h) = self.inner.kept_dims.get();
+            let inner = self.inner.clone();
+            wasm_bindgen_futures::future_to_promise(async move {
+                let (buf, first) = found.ok_or_else(|| err("frame not upscaled yet"))?;
+                let n = (w * h) as usize;
+                let one = inner.be.alloc_words(n);
+                inner.be.copy(&buf, first, &one, 0, n);
+                let raw = inner.be.try_download_async(&one).await.map_err(err)?;
+                Ok(Uint8Array::from(&fastwan_core::backend::rgba8_bytes(&raw)[..]).into())
             })
         }
 
@@ -369,6 +460,20 @@ mod web {
             }
         }
         Ok(())
+    }
+
+    impl Engine {
+        fn locate(&self, i: usize) -> Option<(fastwan_wgpu::GBuf, usize)> {
+            let (w, h) = self.inner.kept_dims.get();
+            let mut i = i;
+            for (buf, n) in self.inner.kept.borrow().iter() {
+                if i < *n {
+                    return Some((buf.clone(), i * (w * h) as usize));
+                }
+                i -= n;
+            }
+            None
+        }
     }
 
     trait Tap: Sized {
