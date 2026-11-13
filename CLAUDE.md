@@ -124,7 +124,13 @@ State and invariants only; the reasoning is in `docs/design.md`.
   identical); the browser loses its per-pixel loops
   (`docs/runs/2026-11-13-vast-4090-gpu-pack-browser`).
 - In the browser on an RTX 4090 (Chrome, real GPU): 832×480×81 in 35.7 s
-  (10.9 s/step), 480×272×81 + ×4 upscale in 12.7 s. Playwright's headless
+  (10.9 s/step), 480×272×81 + ×4 upscale in ~11 s. Upscaled frames stay on
+  the GPU and are drawn on a WebGPU canvas over the 2D one
+  (`fastwan_wgpu::CanvasView`, wasm only): the low-res clip plays at once,
+  first 1080p frame 0.5 s after the decode, all 81 in 1.4–1.7 s (was 2.4–2.6
+  s with readback; `docs/runs/2026-11-13-vast-4090-browser-upscale-gpu`). In
+  a browser dropping a buffer destroys it: drop the upscaler's intermediates
+  only after a fence. Upscale is offered for 480×272 only. Playwright's headless
   *shell* has no `navigator.gpu`: use the full Chromium build. Vast hosts
   differ in whether they expose Vulkan; `fastwan check --backend wgpu` must
   name NVIDIA, not llvmpipe. `fastwan serve` marks its page
