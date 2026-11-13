@@ -3,7 +3,7 @@
 //! `upscale_raw WEIGHTS.safetensors IN.rgb FRAMES H W OUT.rgb`.
 use fastwan_core::weights::SafetensorsDir;
 use fastwan_cpu::Cpu;
-use fastwan_model::upscale::{UpConfig, Upscaler, rgb8};
+use fastwan_model::upscale::{UpConfig, Upscaler};
 use std::path::Path;
 
 fn main() {
@@ -23,7 +23,7 @@ fn main() {
     let c = up.launch(&Cpu, &rgb, frames, h, w_);
     use fastwan_core::backend::Backend;
     let raw = Cpu.download(&c.out);
-    let px = rgb8(&raw, &rgb, frames, h, w_, c.scale);
+    let px = fastwan_core::backend::rgba_to_rgb(&c.rgba8(&raw));
     eprintln!(
         "{frames}x{h}x{w_} -> x{} in {:.2}s",
         c.scale,

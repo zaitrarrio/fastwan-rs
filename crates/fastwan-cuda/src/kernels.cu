@@ -186,6 +186,35 @@ extern "C" __global__ void fw_tanh_clamp(u64 x_, long n, float s) {
     x[i] = bf(tanhf(ld(x, i) / s) * s);
 }
 
+// Packed 8-bit RGBA frames (Backend::pack_rgba8), one thread per pixel:
+// src [skip + frames, 3·p², h, w] bf16, optional base [skip + frames, 3, h, w]
+// bf16 added after a nearest ×p upsample; out is u32 words.
+__device__ __forceinline__ unsigned int fw_q8(float v) {
+    return (unsigned int)(fminf(fmaxf(v, 0.0f), 1.0f) * 255.0f + 0.5f);
+}
+extern "C" __global__ void fw_pack_rgba8(u64 src_, u64 base_, u64 out_, long n, int skip, int h, int w, int p, int has_base) {
+    const bf16_t* src = (const bf16_t*)src_;
+    const bf16_t* base = (const bf16_t*)base_;
+    unsigned int* out = (unsigned int*)out_;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long ow = (long)w * p, oh = (long)h * p, plane = (long)h * w;
+    const long f = i / (oh * ow) + skip;
+    const long y = (i / ow) % oh, x = i % ow;
+    const long at = (y / p) * w + x / p;
+    const long s0 = f * 3 * p * p + (y % p) * p + x % p;
+    float r = ld(src, s0 * plane + at);
+    float g = ld(src, (s0 + p * p) * plane + at);
+    float b = ld(src, (s0 + 2 * p * p) * plane + at);
+    if (has_base) {
+        const long b0 = f * 3 * plane + at;
+        r += ld(base, b0);
+        g += ld(base, b0 + plane);
+        b += ld(base, b0 + 2 * plane);
+    }
+    out[i] = fw_q8(r) | (fw_q8(g) << 8) | (fw_q8(b) << 16) | 0xff000000u;
+}
+
 // dir 0: patchify (tokens ← latent), dir 1: unpatchify (latent ← tokens).
 extern "C" __global__ void fw_patch(u64 dst_, u64 src_, long n, int c, int t, int hh, int ww, int p, int dir) {
     bf16_t* dst = (bf16_t*)dst_;

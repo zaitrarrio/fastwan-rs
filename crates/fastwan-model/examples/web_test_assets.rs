@@ -107,7 +107,7 @@ fn main() {
     std::fs::remove_file(&src_path).ok();
 
     // The tiny ×2 upscaler, and its CPU output on the f16 reference clip.
-    use fastwan_model::upscale::{UpConfig, Upscaler, rgb8, up_manifest};
+    use fastwan_model::upscale::{UpConfig, Upscaler, up_manifest};
     let ucfg = UpConfig::tiny();
     let up_path = out.join("tiny-up.safetensors");
     export::write(
@@ -121,7 +121,7 @@ fn main() {
     let c = up.launch(&Cpu, &clip, g.frames, g.height, g.width);
     use fastwan_core::Backend;
     let raw = Cpu.download(&c.out);
-    let big = rgb8(&raw, &clip, g.frames, g.height, g.width, c.scale);
+    let big = fastwan_core::backend::rgba_to_rgb(&c.rgba8(&raw));
     std::fs::write(out.join("tiny-f16.up.rgb"), &big).unwrap();
     println!("tiny-up: x{} reference {} bytes", c.scale, big.len());
 }

@@ -11,7 +11,7 @@ use crate::{
     taehv::TaeHv,
 };
 use fastwan_core::{
-    backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind},
+    backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind, rgba8_bytes},
     config::{TaeConfig, WanConfig},
     geometry::Geometry,
     quant::WeightQuant,
@@ -47,6 +47,25 @@ struct Pair<'a, B: Backend> {
 }
 
 impl<'a, B: Backend> Pair<'a, B> {
+    /// Packed RGBA words (`pack_rgba8`): ok when no byte differs by more than
+    /// one 8-bit level (a ~1e-4 difference upstream may flip a rounding);
+    /// the reported error is the relative error of the levels.
+    fn record_rgba8(&mut self, name: impl Into<String>, got: Vec<f32>, want: Vec<f32>) {
+        let (g, w) = (rgba8_bytes(&got), rgba8_bytes(&want));
+        let max = g
+            .iter()
+            .zip(&w)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        let lv = |v: &[u8]| v.iter().map(|&b| b as f32).collect::<Vec<_>>();
+        self.out.push(CheckResult {
+            name: name.into(),
+            rel_err: rel(&lv(&g), &lv(&w)),
+            ok: g.len() == w.len() && max <= 1,
+        });
+    }
+
     fn record(&mut self, name: impl Into<String>, got: Vec<f32>, want: Vec<f32>) {
         let e = rel(&got, &want);
         self.out.push(CheckResult {
@@ -67,6 +86,7 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     ops(&mut p, &mut rng);
     model(&mut p);
     upscaler(&mut p);
+    pack(&mut p, &mut rng);
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
     model_vsa(
@@ -621,6 +641,67 @@ fn model<B: Backend>(p: &mut Pair<'_, B>) {
     p.record("tiny TAEHV decode (frames)", gf, cf);
 }
 
+/// `pack_rgba8` (decoder / upscaler output → 8-bit RGBA), with and without
+/// the residual, values straddling [0, 1]; compared as 8-bit levels.
+fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
+    use fastwan_core::backend::PackShape;
+    let (be, cpu) = (p.be, &Cpu);
+    for (s, with_base) in [
+        (
+            PackShape {
+                frames: 3,
+                skip: 1,
+                h: 5,
+                w: 7,
+                p: 2,
+            },
+            false,
+        ),
+        (
+            PackShape {
+                frames: 2,
+                skip: 0,
+                h: 6,
+                w: 9,
+                p: 4,
+            },
+            true,
+        ),
+    ] {
+        let total = s.skip + s.frames;
+        let src: Vec<f32> = rng
+            .uniform(total * 3 * s.p * s.p * s.h * s.w, 0.7)
+            .into_iter()
+            .map(|v| v + 0.4)
+            .collect();
+        let base: Vec<f32> = rng
+            .uniform(total * 3 * s.h * s.w, 0.5)
+            .into_iter()
+            .map(|v| v + 0.5)
+            .collect();
+        let (gs, gb, go) = (
+            be.upload(&src),
+            be.upload(&base),
+            be.alloc_words(s.pixels()),
+        );
+        let (cs, cb, co) = (
+            cpu.upload(&src),
+            cpu.upload(&base),
+            cpu.alloc_words(s.pixels()),
+        );
+        be.pack_rgba8(&gs, with_base.then_some(&gb), &s, &go);
+        cpu.pack_rgba8(&cs, with_base.then_some(&cb), &s, &co);
+        p.record_rgba8(
+            format!(
+                "pack_rgba8 p{} skip {} base {with_base} (≤1 level)",
+                s.p, s.skip
+            ),
+            be.download(&go),
+            cpu.download(&co),
+        );
+    }
+}
+
 /// The tiny ×2 upscaler on two noise frames (raw network output, before the
 /// host-side shuffle), both backends.
 fn upscaler<B: Backend>(p: &mut Pair<'_, B>) {
@@ -639,8 +720,10 @@ fn upscaler<B: Backend>(p: &mut Pair<'_, B>) {
     let c = Upscaler::load(cpu, cfg, &src).expect("synthetic upscaler");
     let gc = g.launch(be, &rgb, frames, h, w);
     let cc = c.launch(cpu, &rgb, frames, h, w);
-    p.record(
-        "tiny upscaler (PReLU convs)",
+    // `out` is packed RGBA: within one 8-bit level (the convs alone are the
+    // `conv2d … ep=3` case at f32 precision).
+    p.record_rgba8(
+        "tiny upscaler, packed RGBA (≤1 level)",
         be.download(&gc.out),
         cpu.download(&cc.out),
     );

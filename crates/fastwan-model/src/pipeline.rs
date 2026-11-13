@@ -166,17 +166,21 @@ impl<B: Backend> Pipeline<B> {
             z
         };
         // Pipelined: chunk i+1 is queued on the device before chunk i is
-        // converted on the host, so the conversion overlaps GPU work.
+        // handed out, so the host side overlaps GPU work. The device packs
+        // each chunk to 8-bit RGBA (`Chunk::pack`); the host only drops alpha.
         let starts: Vec<usize> = (0..lt).step_by(chunk).collect();
         let launch = |st: &mut crate::taehv::DecodeState<B>, f0: usize| {
             let nfr = chunk.min(lt - f0);
-            self.tae.launch_chunk(be, st, &gather(f0, nfr), nfr, lh, lw)
+            let c = self.tae.launch_chunk(be, st, &gather(f0, nfr), nfr, lh, lw);
+            let packed = c.pack(be);
+            (c, packed)
         };
-        let mut cur = launch(&mut st, starts[0]);
-        let mut raw = be.download(&cur.rgb);
+        let (mut cur, packed) = launch(&mut st, starts[0]);
+        let mut raw = be.download(&packed);
         for i in 0..starts.len() {
             let next = (i + 1 < starts.len()).then(|| launch(&mut st, starts[i + 1]));
-            let (count, h, w, rgb) = cur.rgb8(&raw);
+            let (count, h, w, rgba) = cur.rgba8(&raw);
+            let rgb = fastwan_core::backend::rgba_to_rgb(&rgba);
             (width, height) = (w, h);
             frames += count;
             let start = out.len();
@@ -188,8 +192,8 @@ impl<B: Backend> Pipeline<B> {
                 height,
                 rgb: &out[start..],
             });
-            if let Some(n) = next {
-                raw = be.download(&n.rgb);
+            if let Some((n, packed)) = next {
+                raw = be.download(&packed);
                 cur = n;
             }
         }

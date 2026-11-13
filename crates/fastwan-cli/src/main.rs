@@ -703,7 +703,7 @@ fn generate<B: Backend>(
     }
     let mut video = last.expect("at least one run");
     if let Some(path) = upscale {
-        use fastwan_model::upscale::{UpConfig, Upscaler, rgb8, up_manifest};
+        use fastwan_model::upscale::{UpConfig, Upscaler, up_manifest};
         let ucfg = UpConfig::anime_video_v3();
         let usrc = SafetensorsDir::open(path)?;
         let miss = missing(&usrc, &up_manifest(&ucfg));
@@ -724,7 +724,8 @@ fn generate<B: Backend>(
             let n = batch.min(video.frames - f0);
             let src = &video.rgb[f0 * h * w * 3..(f0 + n) * h * w * 3];
             let c = up.launch(be, src, n, h, w);
-            rgb.extend(rgb8(&be.download(&c.out), src, n, h, w, s));
+            let rgba = c.rgba8(&be.download(&c.out));
+            rgb.extend(fastwan_core::backend::rgba_to_rgb(&rgba));
         }
         println!(
             "upscale x{s} {:.2}s ({}x{} -> {}x{})",

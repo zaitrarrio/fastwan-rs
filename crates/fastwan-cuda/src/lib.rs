@@ -16,7 +16,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
     PushKernelArg,
 };
-use fastwan_core::backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind};
+use fastwan_core::backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind, PackShape};
 use half::bf16;
 use std::sync::Arc;
 
@@ -107,6 +107,7 @@ struct Kernels {
     gate_residual: CudaFunction,
     dmd_step: CudaFunction,
     tanh_clamp: CudaFunction,
+    pack_rgba8: CudaFunction,
     patch: CudaFunction,
     conv2d: CudaFunction,
     conv2d_mma: CudaFunction,
@@ -279,6 +280,7 @@ impl Cuda {
             gate_residual: get("fw_gate_residual")?,
             dmd_step: get("fw_dmd_step")?,
             tanh_clamp: get("fw_tanh_clamp")?,
+            pack_rgba8: get("fw_pack_rgba8")?,
             patch: get("fw_patch")?,
             conv2d: get("fw_conv2d")?,
             conv2d_mma: get("fw_conv2d_mma")?,
@@ -1125,6 +1127,44 @@ impl Backend for Cuda {
                 Arg::I(s.k as i32),
                 Arg::I(bias.is_some() as i32),
                 Arg::I(epc),
+            ],
+        );
+    }
+
+    fn alloc_words(&self, n: usize) -> CuBuf {
+        // Two u16 per word, flagged f32 so `download` returns the bits as-is.
+        let s = self
+            .stream
+            .alloc_zeros::<u16>(2 * n.max(1))
+            .expect("cuda alloc");
+        CuBuf {
+            s: Arc::new(s),
+            len: n,
+            f32: true,
+        }
+    }
+
+    fn pack_rgba8(&self, src: &CuBuf, base: Option<&CuBuf>, s: &PackShape, out: &CuBuf) {
+        let n = s.pixels();
+        assert!(
+            out.f32 && out.len >= n,
+            "pack_rgba8: out must come from alloc_words"
+        );
+        assert!(!src.f32 && base.is_none_or(|b| !b.f32));
+        self.launch(
+            &self.f.pack_rgba8,
+            Self::elems(n),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(src)),
+                Arg::P(self.opt(base)),
+                Arg::P(self.ptr(out)),
+                Arg::L(n as i64),
+                Arg::I(s.skip as i32),
+                Arg::I(s.h as i32),
+                Arg::I(s.w as i32),
+                Arg::I(s.p as i32),
+                Arg::I(base.is_some() as i32),
             ],
         );
     }

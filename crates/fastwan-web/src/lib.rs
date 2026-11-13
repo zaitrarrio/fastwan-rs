@@ -12,9 +12,10 @@
 //! The page fetches each block as one HTTP range of a block-ordered
 //! checkpoint (`fastwan quantize`), so wasm memory holds one block at a time.
 //! Events: `{type: "prepared"}`, `{type: "step", index, total, ms}`,
-//! `{type: "frames", first, count, width, height, rgb: Uint8Array}`.
+//! `{type: "frames", first, count, width, height, rgba: Uint8Array}` (packed
+//! on the GPU, alpha 255: straight into `ImageData`).
 //! There is no blocking readback in a browser: everything that leaves the
-//! GPU goes through `Wgpu::download_async`.
+//! GPU goes through `Wgpu::try_download_async`.
 
 #[cfg(target_arch = "wasm32")]
 mod web {
@@ -26,11 +27,7 @@ mod web {
         rng::Rng,
         weights::{SafetensorsDir, WeightSource},
     };
-    use fastwan_model::{
-        TaeHv, Upscaler, WanDit,
-        dit::DitBuilder,
-        upscale::{UpConfig, rgb8},
-    };
+    use fastwan_model::{TaeHv, Upscaler, WanDit, dit::DitBuilder, upscale::UpConfig};
     use fastwan_wgpu::Wgpu;
     use js_sys::{Function, Object, Reflect, Uint8Array};
     use std::cell::RefCell;
@@ -165,7 +162,8 @@ mod web {
         }
 
         /// Upscale `frames` interleaved RGB frames (`[frames, h, w, 3]`);
-        /// resolves to the `[frames, h·s, w·s, 3]` bytes.
+        /// resolves to the `[frames, h·s, w·s, 4]` RGBA bytes (alpha 255),
+        /// packed on the GPU.
         pub fn upscale(&self, rgb: Vec<u8>, frames: usize, h: usize, w: usize) -> js_sys::Promise {
             let inner = self.inner.clone();
             wasm_bindgen_futures::future_to_promise(async move {
@@ -180,7 +178,7 @@ mod web {
                     up.launch(&inner.be, &rgb, frames, h, w)
                 };
                 let raw = inner.be.try_download_async(&chunk.out).await.map_err(err)?;
-                let px = rgb8(&raw, &rgb, frames, h, w, chunk.scale);
+                let px = chunk.rgba8(&raw);
                 Ok(Uint8Array::from(&px[..]).into())
             })
         }
@@ -325,32 +323,50 @@ mod web {
         // 480×272 one latent frame at a time halves the decoder's peak memory
         // (818 → 409 MiB for its largest buffer at 832×480): browsers run on
         // laptop GPUs too. Chunking does not change the frames.
-        let chunk = if g.width * g.height > 480 * 272 { 1 } else { p.tae_chunk.clamp(1, 2) };
+        let chunk = if g.width * g.height > 480 * 272 {
+            1
+        } else {
+            p.tae_chunk.clamp(1, 2)
+        };
         let decode_err = |e: String| err(format!("decode failed: {e} ({})", be.limits_text()));
         let mut st = tae.state();
-        let mut done = 0usize;
-        let mut f0 = 0;
-        while f0 < lt {
-            let nfr = chunk.min(lt - f0);
+        let gather = |f0: usize, nfr: usize| {
             let mut z = Vec::with_capacity(nfr * c * plane);
             for f in f0..f0 + nfr {
                 for ch in 0..c {
                     z.extend_from_slice(&latent[(ch * lt + f) * plane..][..plane]);
                 }
             }
-            let ck = tae.launch_chunk(be, &mut st, &z, nfr, lh, lw);
-            let raw = be.try_download_async(&ck.rgb).await.map_err(decode_err)?;
-            let (count, h, w, rgb) = ck.rgb8(&raw);
+            z
+        };
+        // The device packs each chunk to 8-bit RGBA (`Chunk::pack`); the
+        // next chunk is queued before this one's readback is awaited, so the
+        // GPU never idles on the copy.
+        let starts: Vec<usize> = (0..lt).step_by(chunk).collect();
+        let mut launch = |f0: usize| {
+            let nfr = chunk.min(lt - f0);
+            let ck = tae.launch_chunk(be, &mut st, &gather(f0, nfr), nfr, lh, lw);
+            let packed = ck.pack(be);
+            (ck, packed)
+        };
+        let mut done = 0usize;
+        let mut cur = launch(starts[0]);
+        for i in 0..starts.len() {
+            let next = (i + 1 < starts.len()).then(|| launch(starts[i + 1]));
+            let raw = be.try_download_async(&cur.1).await.map_err(decode_err)?;
+            let (count, h, w, rgba) = cur.0.rgba8(&raw);
             let o = Object::new();
             set(&o, "type", "frames");
             set(&o, "first", done as u32);
             set(&o, "count", count as u32);
             set(&o, "width", w as u32);
             set(&o, "height", h as u32);
-            set(&o, "rgb", Uint8Array::from(&rgb[..]));
+            set(&o, "rgba", Uint8Array::from(&rgba[..]));
             emit(o);
             done += count;
-            f0 += nfr;
+            if let Some(n) = next {
+                cur = n;
+            }
         }
         Ok(())
     }

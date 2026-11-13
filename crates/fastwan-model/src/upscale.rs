@@ -4,16 +4,17 @@
 //! conv3×3 3→F, PReLU → `convs` × (conv3×3 F→F, PReLU) → conv3×3 F→3·s²
 //! → pixel-shuffle s, plus the input upsampled ×s (nearest).
 //!
-//! Every conv runs on the backend (the PReLU is a [`ConvEpilogue`]); the
-//! pixel-shuffle, residual add, clamp and rounding run on the host in one
-//! pass over the downloaded `[frames, 3·s², h, w]`, like
-//! [`crate::taehv::Chunk::rgb8`]. Chosen over the alternatives in
+//! Everything runs on the backend: the convs (the PReLU is a
+//! [`ConvEpilogue`]), then `pack_rgba8` does the pixel-shuffle, the residual
+//! add, clamp and rounding, so a frame leaves the device as 4 bytes per
+//! output pixel (the f32 map was 12, and the host pass ran single-threaded in
+//! the browser). Chosen over the alternatives in
 //! `docs/runs/2026-11-12-upscalers`: fastest and steadiest learned option,
 //! 2.5 MB of weights.
 
 use fastwan_core::{
     Result,
-    backend::{Backend, ConvEpilogue, ConvShape},
+    backend::{Backend, ConvEpilogue, ConvShape, PackShape, rgba8_bytes},
     weights::WeightSource,
 };
 
@@ -76,11 +77,12 @@ pub struct Upscaler<B: Backend> {
     layers: Vec<Layer<B>>,
 }
 
-/// One batch of frames on the device: `[frames, 3·s², h, w]`.
+/// One batch of upscaled frames on the device, packed RGBA (one word per
+/// output pixel; download it and read it with [`UpChunk::rgba8`]).
 pub struct UpChunk<B: Backend> {
     pub out: B::Buf,
     /// Held until the caller has downloaded `out`.
-    _keep: [B::Buf; 3],
+    _keep: [B::Buf; 4],
     pub frames: usize,
     pub h: usize,
     pub w: usize,
@@ -155,9 +157,18 @@ impl<B: Backend> Upscaler<B> {
             be.conv2d(src, None, &s, &l.w, Some(&l.b), ep, dst);
         }
         let [f0, f1] = feat;
+        let shape = PackShape {
+            frames,
+            skip: 0,
+            h,
+            w,
+            p: self.cfg.scale,
+        };
+        let packed = be.alloc_words(shape.pixels());
+        be.pack_rgba8(&out, Some(&input), &shape, &packed);
         UpChunk {
-            out,
-            _keep: [input, f0, f1],
+            out: packed,
+            _keep: [input, f0, f1, out],
             frames,
             h,
             w,
@@ -166,41 +177,10 @@ impl<B: Backend> Upscaler<B> {
     }
 }
 
-/// `[frames, H·s, W·s, 3]` 8-bit RGB from the downloaded network output and
-/// the input frames: pixel-shuffle + nearest-upsampled input, clamped.
-pub fn rgb8(raw: &[f32], rgb: &[u8], frames: usize, h: usize, w: usize, s: usize) -> Vec<u8> {
-    let (oh, ow) = (h * s, w * s);
-    let mut out = vec![0u8; frames * oh * ow * 3];
-    let row = ow * 3;
-    let fill = |r0: usize, dst: &mut [u8]| {
-        for (ri, line) in dst.chunks_mut(row).enumerate() {
-            let (f, y) = ((r0 + ri) / oh, (r0 + ri) % oh);
-            let (sy, iy) = (y / s, y % s);
-            for x in 0..ow {
-                let (sx, ix) = (x / s, x % s);
-                let base = &rgb[((f * h + sy) * w + sx) * 3..][..3];
-                for c in 0..3 {
-                    let k = c * s * s + iy * s + ix;
-                    let v = raw[((f * 3 * s * s + k) * h + sy) * w + sx] + base[c] as f32 / 255.0;
-                    line[x * 3 + c] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                }
-            }
-        }
-    };
-    let rows = frames * oh;
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(16);
-    if threads <= 1 || rows < 64 || cfg!(target_arch = "wasm32") {
-        fill(0, &mut out);
-    } else {
-        let per = rows.div_ceil(threads);
-        std::thread::scope(|sc| {
-            for (i, part) in out.chunks_mut(per * row).enumerate() {
-                let fill = &fill;
-                sc.spawn(move || fill(i * per, part));
-            }
-        });
+impl<B: Backend> UpChunk<B> {
+    /// `[frames, H·s, W·s, 4]` RGBA bytes from the downloaded `out`.
+    pub fn rgba8(&self, words: &[f32]) -> Vec<u8> {
+        let n = self.frames * self.h * self.scale * self.w * self.scale;
+        rgba8_bytes(&words[..n])
     }
-    out
 }

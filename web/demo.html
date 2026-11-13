@@ -605,12 +605,8 @@ async function upscaleClip(s) {
       const d = clip.frames[f0 + f].data;
       for (let i = 0, j = 0, o = f * px * 3; i < px; i++, j += 4, o += 3) { rgb[o] = d[j]; rgb[o + 1] = d[j + 1]; rgb[o + 2] = d[j + 2]; }
     }
-    const big = await wasmCall(bw.eng.upscale(rgb, m, h, w)), W = w * k, H = h * k, P = W * H;
-    for (let f = 0; f < m; f++) {
-      const img = new ImageData(W, H), d = img.data;
-      for (let i = 0, j = 0, o = f * P * 3; i < P; i++, j += 4, o += 3) { d[j] = big[o]; d[j + 1] = big[o + 1]; d[j + 2] = big[o + 2]; d[j + 3] = 255; }
-      out.push(await createImageBitmap(img));
-    }
+    const big = await wasmCall(bw.eng.upscale(rgb, m, h, w));
+    for (let f = 0; f < m; f++) out.push(await createImageBitmap(rgbaFrame(big, f, w * k, h * k)));
     s.up_frames += m; renderStages(s);
   }
   s.up_s = (performance.now() - t) / 1000;
@@ -635,14 +631,15 @@ function wasmCall(p) {
     p.then((v) => { cleanup(); resolve(v); }, (e) => { cleanup(); reject(e); });
   });
 }
+// The engine sends RGBA packed on the GPU: each frame is one slice.
+function rgbaFrame(rgba, f, w, h) {
+  const n = w * h * 4;
+  return new ImageData(new Uint8ClampedArray(rgba.buffer.slice(rgba.byteOffset + f * n, rgba.byteOffset + (f + 1) * n)), w, h);
+}
 function pushFrames(ev) {
-  const { width: w, height: h, count, rgb } = ev, px = w * h;
+  const { width: w, height: h, count, rgba } = ev;
   if (w !== clip.width || h !== clip.height) { clip.width = w; clip.height = h; $("canvas").width = w; $("canvas").height = h; }
-  for (let f = 0; f < count; f++) {
-    const img = new ImageData(w, h), d = img.data, off = f * px * 3;
-    for (let i = 0, j = 0; i < px; i++, j += 4) { d[j] = rgb[off + 3 * i]; d[j + 1] = rgb[off + 3 * i + 1]; d[j + 2] = rgb[off + 3 * i + 2]; d[j + 3] = 255; }
-    clip.frames.push(img);
-  }
+  for (let f = 0; f < count; f++) clip.frames.push(rgbaFrame(rgba, f, w, h));
   $("empty").hidden = true; updateControls();
 }
 async function browserGenerate(width, height, frames) {

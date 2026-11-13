@@ -41,6 +41,49 @@ pub enum ConvEpilogue<'a, T> {
     Prelu(&'a T),
 }
 
+/// [`Backend::pack_rgba8`]: `src` is `[skip + frames, 3·p², h, w]` (a
+/// pixel-shuffled RGB map, as TAEHV and the upscaler end); the output is
+/// `frames` images of `h·p × w·p` packed pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackShape {
+    /// Frames written (the first `skip` source frames are dropped).
+    pub frames: usize,
+    pub skip: usize,
+    pub h: usize,
+    pub w: usize,
+    pub p: usize,
+}
+
+impl PackShape {
+    pub fn pixels(&self) -> usize {
+        self.frames * self.h * self.p * self.w * self.p
+    }
+}
+
+/// One packed pixel as [`Backend::pack_rgba8`] writes it: `R | G<<8 | B<<16
+/// | 255<<24` from values in `[0, 1]`, the same rounding as the host paths it
+/// replaced (`(clamp(v) · 255 + 0.5) as u8`).
+pub fn pack_pixel(r: f32, g: f32, b: f32) -> u32 {
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+    q(r) | q(g) << 8 | q(b) << 16 | 0xff00_0000
+}
+
+/// The bytes of a downloaded [`Backend::alloc_words`] buffer: each f32's bit
+/// pattern is one packed pixel, so this is RGBA, 4 bytes per pixel.
+pub fn rgba8_bytes(words: &[f32]) -> Vec<u8> {
+    words
+        .iter()
+        .flat_map(|w| w.to_bits().to_le_bytes())
+        .collect()
+}
+
+/// RGBA → RGB (drops alpha).
+pub fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    rgba.chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect()
+}
+
 /// A 2-D convolution over `frames` independent images, NCHW, stride 1,
 /// "same" padding (`k / 2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,4 +344,16 @@ pub trait Backend {
 
     /// In place: `x = tanh(x / s) · s` over the first `n` elements.
     fn tanh_clamp(&self, x: &Self::Buf, n: usize, s: f32);
+
+    // ---- frames out ------------------------------------------------------
+    /// A buffer of `n` 32-bit words that `download` returns bit-exactly (each
+    /// f32's bits are the word). Activations may be narrower (CUDA: bf16).
+    fn alloc_words(&self, n: usize) -> Self::Buf {
+        self.alloc(n)
+    }
+    /// Pixel-shuffle `src`, add `base` upsampled ×p (nearest; `[skip +
+    /// frames, 3, h, w]`) when given, clamp, round to 8 bits and pack as
+    /// [`pack_pixel`] into `out` (from [`Backend::alloc_words`], one word per
+    /// pixel). Frames leave the device at 4 bytes per pixel, ready to show.
+    fn pack_rgba8(&self, src: &Self::Buf, base: Option<&Self::Buf>, s: &PackShape, out: &Self::Buf);
 }

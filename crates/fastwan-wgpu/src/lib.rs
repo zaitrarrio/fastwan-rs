@@ -11,7 +11,7 @@
 //! a host write or read flushes first, so queue ordering always matches
 //! program order.
 
-use fastwan_core::backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind};
+use fastwan_core::backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind, PackShape};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
@@ -30,6 +30,7 @@ const ATTN: &str = include_str!("shaders/attention.wgsl");
 const NORM: &str = include_str!("shaders/norm.wgsl");
 const HEADS: &str = include_str!("shaders/head_split.wgsl");
 const ELEM: &str = include_str!("shaders/elementwise.wgsl");
+const PACK: &str = include_str!("shaders/pack.wgsl");
 const FLASH: &str = include_str!("shaders/flash.wgsl");
 const VSA_POOL: &str = include_str!("shaders/vsa_pool.wgsl");
 const VSA_COARSE: &str = include_str!("shaders/vsa_coarse.wgsl");
@@ -1266,6 +1267,30 @@ impl Backend for Wgpu {
                 out,
             ],
             groups,
+        );
+    }
+
+    fn pack_rgba8(&self, src: &GBuf, base: Option<&GBuf>, s: &PackShape, out: &GBuf) {
+        let n = s.pixels();
+        assert!(
+            out.len >= n,
+            "pack_rgba8: out holds {} words, needs {n}",
+            out.len
+        );
+        let pipe = self.pipeline("pack", || PACK.to_string());
+        let p = [
+            n as u32,
+            s.skip as u32,
+            s.h as u32,
+            s.w as u32,
+            s.p as u32,
+            base.is_some() as u32,
+        ];
+        self.dispatch(
+            &pipe,
+            &p,
+            &[out, src, base.unwrap_or(&self.dummy)],
+            Self::grid(n.div_ceil(256)),
         );
     }
 

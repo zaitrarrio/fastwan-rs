@@ -3,7 +3,9 @@
 //! clarity beats speed here — but it is fast enough to run the tiny graph in
 //! unit tests and a short low-resolution clip end to end.
 
-use fastwan_core::backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind};
+use fastwan_core::backend::{
+    Act, Backend, ConvEpilogue, ConvShape, NormKind, PackShape, pack_pixel,
+};
 use fastwan_core::vsa::{TILE_ELEMS, VsaSpec};
 use rayon::prelude::*;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -602,6 +604,33 @@ impl Backend for Cpu {
                             ConvEpilogue::Prelu(_) => acc,
                         };
                     }
+                }
+            });
+    }
+
+    fn pack_rgba8(&self, src: &CpuBuf, base: Option<&CpuBuf>, s: &PackShape, out: &CpuBuf) {
+        let (h, w, p) = (s.h, s.w, s.p);
+        let (oh, ow) = (h * p, w * p);
+        let src = src.r();
+        let base = base.map(|b| b.r());
+        let mut o = out.w();
+        o[..s.pixels()]
+            .par_chunks_mut(ow)
+            .enumerate()
+            .for_each(|(row, line)| {
+                let (f, y) = (row / oh + s.skip, row % oh);
+                let (sy, iy) = (y / p, y % p);
+                for (x, px) in line.iter_mut().enumerate() {
+                    let (sx, ix) = (x / p, x % p);
+                    let v = |c: usize| {
+                        let k = c * p * p + iy * p + ix;
+                        let mut v = src[((f * 3 * p * p + k) * h + sy) * w + sx];
+                        if let Some(b) = &base {
+                            v += b[((f * 3 + c) * h + sy) * w + sx];
+                        }
+                        v
+                    };
+                    *px = f32::from_bits(pack_pixel(v(0), v(1), v(2)));
                 }
             });
     }
