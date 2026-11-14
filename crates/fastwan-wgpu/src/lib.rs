@@ -94,6 +94,10 @@ pub struct WgpuOptions {
     /// flash.wgsl, 3 = flash3.wgsl; `None` = the default (3). In the browser,
     /// where there is no environment, the page passes these.
     pub flash: Option<u32>,
+    /// Submit after this many recorded dispatches (`None` = 64). Phones get
+    /// fewer per submission, so no one command buffer runs long enough for
+    /// the OS's GPU watchdog.
+    pub submit_every: Option<usize>,
 }
 
 impl WgpuOptions {
@@ -103,6 +107,7 @@ impl WgpuOptions {
             f16: std::env::var("FASTWAN_WGPU_F16").is_ok_and(|v| v == "1"),
             linear: num("FASTWAN_WGPU_LINEAR"),
             flash: num("FASTWAN_WGPU_FLASH"),
+            submit_every: None,
         }
     }
 }
@@ -148,6 +153,8 @@ pub struct Wgpu {
     flash_variant: u32,
     /// GEMM kernel variant (see `Backend::linear`).
     linear_variant: u32,
+    /// Dispatches per submission.
+    batch: usize,
     /// f16 math kernels (adapter has `shader-f16` and f16 mode is on).
     f16: bool,
     pipelines: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
@@ -279,6 +286,7 @@ impl Wgpu {
             flash_ok,
             flash_variant,
             linear_variant,
+            batch: opts.submit_every.unwrap_or(BATCH).max(1),
             f16,
             pipelines: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
@@ -511,7 +519,7 @@ impl Wgpu {
             pass.dispatch_workgroups(groups.0, groups.1, groups.2);
         }
         pend.n += 1;
-        if pend.n >= BATCH {
+        if pend.n >= self.batch {
             let enc = pend.enc.take().unwrap();
             pend.n = 0;
             drop(pend);

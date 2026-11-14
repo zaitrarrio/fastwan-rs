@@ -51,6 +51,8 @@ mod web {
         view: RefCell<Option<fastwan_wgpu::CanvasView>>,
         kept: RefCell<Vec<(fastwan_wgpu::GBuf, usize)>>,
         kept_dims: std::cell::Cell<(u32, u32)>,
+        /// Lower-memory settings for phones (see `create_engine`).
+        mobile: bool,
     }
 
     #[wasm_bindgen]
@@ -61,7 +63,11 @@ mod web {
     /// `model`: "fastwan" (FastWan2.1-T2V-1.3B + taew2_1) or "tiny" (the
     /// synthetic test model).
     #[wasm_bindgen(js_name = createEngine)]
-    pub async fn create_engine(model: String, kernels: Option<String>) -> Result<Engine, JsValue> {
+    pub async fn create_engine(
+        model: String,
+        kernels: Option<String>,
+        mobile: Option<bool>,
+    ) -> Result<Engine, JsValue> {
         console_error_panic_hook::set_once();
         let (cfg, tcfg) = match model.as_str() {
             "fastwan" => (WanConfig::fastwan_1_3b(), TaeConfig::taew2_1()),
@@ -76,6 +82,13 @@ mod web {
             opts.linear = it.next().flatten();
             opts.flash = it.next().flatten();
         }
+        // Phones: the tab's memory limit includes GPU memory, and iOS resets a
+        // tab whose GPU work runs too long. Smaller submissions here; smaller
+        // activation buffers in `run`.
+        let mobile = mobile.unwrap_or(false);
+        if mobile {
+            opts.submit_every = Some(8);
+        }
         let be = Wgpu::with_options_async(opts).await.map_err(err)?;
         Ok(Engine {
             inner: Rc::new(Inner {
@@ -89,6 +102,7 @@ mod web {
                 view: RefCell::new(None),
                 kept: RefCell::new(Vec::new()),
                 kept_dims: std::cell::Cell::new((0, 0)),
+                mobile,
             }),
         })
     }
@@ -385,7 +399,14 @@ mod web {
             .iter()
             .map(|&ts| dit.step_mods(be, ts as f32))
             .collect();
-        let ws = dit.workspace(be, g.latent(), p.ffn_chunk, None);
+        // On phones the FFN hidden state runs in chunks of 1024 tokens (36 MiB
+        // at f32) instead of all at once (384 MiB at 480×272×81).
+        let ffn_chunk = if inner.mobile {
+            p.ffn_chunk.min(1024)
+        } else {
+            p.ffn_chunk
+        };
+        let ws = dit.workspace(be, g.latent(), ffn_chunk, None);
         let fence = be.alloc(1);
         be.try_download_async(&fence).await.map_err(err)?;
         emit(Object::new().tap(|o| set(o, "type", "prepared")));
@@ -422,7 +443,7 @@ mod web {
         // 480×272 one latent frame at a time halves the decoder's peak memory
         // (818 → 409 MiB for its largest buffer at 832×480): browsers run on
         // laptop GPUs too. Chunking does not change the frames.
-        let chunk = if g.width * g.height > 480 * 272 {
+        let chunk = if inner.mobile || g.width * g.height > 480 * 272 {
             1
         } else {
             p.tae_chunk.clamp(1, 2)

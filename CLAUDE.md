@@ -148,6 +148,14 @@ State and invariants only; the reasoning is in `docs/design.md`.
   differ in whether they expose Vulkan; `fastwan check --backend wgpu` must
   name NVIDIA, not llvmpipe. `fastwan serve` marks its page
   (`fastwan-served` meta); only that page hides browser mode.
+- Phones (`MOBILE` in `web/demo.html`: iPhone / iPad / Android UA): the tab's
+  memory limit covers GPU memory and iOS resets the tab when it is crossed
+  (reported: reset during step 1 at the defaults, ~2 GB: 0.9 GB weights + 1 GB
+  activations + decode). There: 4-bit only, 480×272 only, ≤ 33 frames, no
+  upscale; the engine (`createEngine(…, mobile)`) runs the FFN in 1024-token
+  chunks, decodes one latent frame at a time and submits every 8 dispatches.
+  Not yet measured on a real phone. A `fastwan.run` breadcrumb in
+  localStorage names the stage if the tab dies; the next visit shows it.
 - Tests: `cargo test --workspace` (needs a Vulkan driver for the WebGPU suite:
   `mesa-vulkan-drivers`); NVRTC kernel compile needs libnvrtc on
   `LD_LIBRARY_PATH` (`pip install nvidia-cuda-nvrtc-cu12`).
