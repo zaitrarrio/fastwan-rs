@@ -455,12 +455,16 @@ fn main() -> Result<()> {
             let tensors = fastwan_core::export::quantize_dit(&src, &cfg, weights)?;
             let bytes: usize = tensors.iter().map(|t| t.3.len()).sum();
             fastwan_core::export::write(&out, &tensors, fastwan_core::export::metadata(weights))?;
-            let src_bytes: u64 = std::fs::read_dir(&transformer)?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
-                .filter_map(|e| e.metadata().ok())
-                .map(|m| m.len())
-                .sum();
+            let src_bytes: u64 = if transformer.is_file() {
+                std::fs::metadata(&transformer)?.len()
+            } else {
+                std::fs::read_dir(&transformer)?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            };
             println!(
                 "{weights}: {} tensors, {:.3} GB (source {:.3} GB) -> {} in {:.1}s",
                 tensors.len(),
