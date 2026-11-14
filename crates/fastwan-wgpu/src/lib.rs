@@ -26,6 +26,7 @@ const LINEAR: &str = include_str!("shaders/linear.wgsl");
 const LINEAR2: &str = include_str!("shaders/linear2.wgsl");
 const LINEAR3: &str = include_str!("shaders/linear3.wgsl");
 const LINEAR3H: &str = include_str!("shaders/linear3h.wgsl");
+const LINEAR4: &str = include_str!("shaders/linear4.wgsl");
 const FLASH_H: &str = include_str!("shaders/flash_h.wgsl");
 /// Token-sized GEMMs only take the f16 path: the 512-row text projections
 /// carry encoder activations that can exceed f16's ±65504.
@@ -37,6 +38,9 @@ const HEADS: &str = include_str!("shaders/head_split.wgsl");
 const ELEM: &str = include_str!("shaders/elementwise.wgsl");
 const PACK: &str = include_str!("shaders/pack.wgsl");
 const FLASH: &str = include_str!("shaders/flash.wgsl");
+const FLASH3: &str = include_str!("shaders/flash3.wgsl");
+/// Shared memory flash3 declares (vec4 panels, S tile, partials, row state).
+const FLASH3_SHARED: u32 = 512 * 16 + 4160 * 4 + 2 * 256 * 4 + 5 * 64 * 4;
 const VSA_POOL: &str = include_str!("shaders/vsa_pool.wgsl");
 const VSA_COARSE: &str = include_str!("shaders/vsa_coarse.wgsl");
 /// Shared memory the flash kernel declares (Q|K panel, S tile, row state).
@@ -83,12 +87,22 @@ pub struct WgpuOptions {
     /// Use the f16 math kernels where the adapter has `shader-f16`
     /// (`FASTWAN_WGPU_F16=1`).
     pub f16: bool,
+    /// GEMM kernel (`FASTWAN_WGPU_LINEAR`, see `Backend::linear`); `None` =
+    /// the default.
+    pub linear: Option<u32>,
+    /// Attention kernel (`FASTWAN_WGPU_FLASH`): 0 = the plain kernel, 1 =
+    /// flash.wgsl, 3 = flash3.wgsl; `None` = the default (3). In the browser,
+    /// where there is no environment, the page passes these.
+    pub flash: Option<u32>,
 }
 
 impl WgpuOptions {
     pub fn from_env() -> Self {
+        let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
         Self {
             f16: std::env::var("FASTWAN_WGPU_F16").is_ok_and(|v| v == "1"),
+            linear: num("FASTWAN_WGPU_LINEAR"),
+            flash: num("FASTWAN_WGPU_FLASH"),
         }
     }
 }
@@ -129,6 +143,11 @@ pub struct Wgpu {
     attn_bk: usize,
     /// The register-tiled flash kernel fits this adapter's shared memory.
     flash_ok: bool,
+    /// Attention kernel when `flash_ok`: 3 = flash3.wgsl (the default, if
+    /// shared memory fits), 1 = flash.wgsl (`FASTWAN_WGPU_FLASH=1`).
+    flash_variant: u32,
+    /// GEMM kernel variant (see `Backend::linear`).
+    linear_variant: u32,
     /// f16 math kernels (adapter has `shader-f16` and f16 mode is on).
     f16: bool,
     pipelines: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
@@ -218,8 +237,15 @@ impl Wgpu {
         // K and V tiles of BK keys × 128 dims, f32, must fit shared memory.
         let wgs = device.limits().max_compute_workgroup_storage_size as usize;
         let attn_bk = if wgs >= 2 * 32 * 128 * 4 { 32 } else { 16 };
-        let flash_ok = wgs >= FLASH_SHARED as usize
-            && std::env::var("FASTWAN_WGPU_FLASH").map_or(true, |v| v != "0");
+        let flash_ok = wgs >= FLASH_SHARED as usize && opts.flash != Some(0);
+        // Measured on an RTX 4090 (docs/runs/2026-11-14-vast-4090-webgpu-kernels):
+        // flash3 + linear4 halve the step in Chrome and cut it 1.6× natively.
+        let flash_variant = match opts.flash {
+            Some(1) => 1,
+            _ if wgs >= FLASH3_SHARED as usize => 3,
+            _ => 1,
+        };
+        let linear_variant = opts.linear.unwrap_or(4);
         let dummy = GBuf {
             buf: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("dummy"),
@@ -251,6 +277,8 @@ impl Wgpu {
             queue,
             attn_bk,
             flash_ok,
+            flash_variant,
+            linear_variant,
             f16,
             pipelines: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
@@ -660,7 +688,9 @@ impl Wgpu {
         scale: f32,
         vsa: Option<(&GVsa, &GBuf)>,
     ) {
-        let pipe = if self.f16 {
+        let pipe = if self.flash_variant == 3 && d <= 128 {
+            self.pipeline("flash3", || FLASH3.to_string())
+        } else if self.f16 {
             self.pipeline("flash_h", || FLASH_H.to_string())
         } else {
             self.pipeline("flash", || FLASH.to_string())
@@ -906,20 +936,21 @@ impl Backend for Wgpu {
         // FASTWAN_WGPU_LINEAR selects the GEMM kernel for A/B runs:
         // 1 = 64×64 array accumulators (linear.wgsl),
         // 2 = 128×128 (linear2.wgsl: measured 38% slower on an RTX 4090),
-        // 3 = 64×64 with hand-unrolled vec4 accumulators (linear3.wgsl, the
-        //     default: 5.75× faster than 1 on an RTX 4090, 446 → 77.5 ms per
-        //     FFN GEMM; the arrays of 1 and 2 were spilled to local memory).
-        let variant = std::env::var("FASTWAN_WGPU_LINEAR")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3);
-        let variant = if variant == 2 && rows < 128 {
-            1
-        } else {
-            variant
+        // 3 = 64×64 with hand-unrolled vec4 accumulators (linear3.wgsl:
+        //     5.75× faster than 1 on an RTX 4090, 446 → 77.5 ms per FFN
+        //     GEMM; the arrays of 1 and 2 were spilled to local memory),
+        // 4 = 128×128, 8×8 per thread in named vec4s, vec4 shared reads
+        //     (linear4.wgsl, the default: 1.75× faster than 3 on an RTX 4090,
+        //     same output bit for bit; rows < 128 fall back to 3).
+        let variant = self.linear_variant;
+        let variant = match variant {
+            2 if rows < 128 => 1,
+            4 if rows < 128 => 3,
+            v => v,
         };
         let (src, tile, name) = match variant {
             2 => (LINEAR2, 128, "linear2"),
+            4 => (LINEAR4, 128, "linear4"),
             1 => (LINEAR, 64, "linear"),
             _ => (LINEAR3, 64, "linear3"),
         };

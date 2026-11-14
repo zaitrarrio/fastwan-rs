@@ -8,7 +8,8 @@ State and invariants only; the reasoning is in `docs/design.md`.
 - The CPU backend is ground truth. GPU code is trusted only after
   `fastwan check --backend <b>` passes on that hardware. Both pass on an RTX
   4090: 480p step CUDA 1.35 s (VSA) / 2.48 s (dense); WebGPU 12.9 s (VSA),
-  clip 42.7 s (`docs/runs/2026-11-03-vast-4090-webgpu-perf`). Neither has run
+  clip 42.7 s (`docs/runs/2026-11-03-vast-4090-webgpu-perf`; 6.67 s/step
+  with the 2026-11-14 kernels). Neither has run
   on AMD. WebGPU speed varies by host Vulkan driver (152 vs 83 s/step on
   570.86 vs 595.99 with the old kernels): record the driver with every number.
 - CUDA speed on an RTX PRO 6000 Server Edition (600 W), 832×480×81 VSA:
@@ -45,6 +46,18 @@ State and invariants only; the reasoning is in `docs/design.md`.
   `kernels.cu`). Change both. `fw_` because `norm` collides with a CUDA builtin.
 - Shader change → `python3 web/build.py` (the test page inlines the shaders;
   `web_page_embeds_current_shaders` fails otherwise).
+- WebGPU kernel defaults (2026-11-14, RTX 4090): `linear4` (128×128 GEMM, 8×8
+  per thread, vec4 shared reads; bit-identical to linear3) + `flash3` (4
+  threads per softmax row, vec4 panels). Chrome 10.9 → 5.75 s/step at
+  832×480, native 10.7 → 6.67 s (`docs/runs/2026-11-14-vast-4090-webgpu-kernels`).
+  `FASTWAN_WGPU_LINEAR` / `FASTWAN_WGPU_FLASH` natively, `?kernels=L,F` in the
+  page, select others for A/B. Measure kernel changes in Chrome too: Dawn and
+  naga compile the same WGSL very differently (flash2 was 1.7× slower
+  natively, faster in Chrome).
+- WGSL: never index a vector dynamically (`v[j]` in a loop), not even small
+  vec4s: NVIDIA's Vulkan compiler moves them to local memory (flash2 → flash3:
+  119 → 47 ms by unrolling only that). Never store one component of a shared
+  vec4 (may compile to read-modify-write and race): store whole vec4s.
 - WGSL: write per-thread register blocks as named vec4 accumulators, never
   arrays indexed in loops. NVIDIA's Vulkan compiler kept those arrays in local
   memory: unrolling made the GEMM 5.75× and flash attention 7.8× faster.
@@ -123,8 +136,8 @@ State and invariants only; the reasoning is in `docs/design.md`.
   win is small (decode 0.36 → 0.33 s, upscale 0.99 → 0.87 s, output
   identical); the browser loses its per-pixel loops
   (`docs/runs/2026-11-13-vast-4090-gpu-pack-browser`).
-- In the browser on an RTX 4090 (Chrome, real GPU): 832×480×81 in 35.7 s
-  (10.9 s/step), 480×272×81 + ×4 upscale in ~11 s. Upscaled frames stay on
+- In the browser on an RTX 4090 (Chrome, real GPU): 832×480×81 in 18.9 s
+  (5.75 s/step; 35.7 s before the 2026-11-14 kernels), 480×272×81 in 5.2 s. Upscaled frames stay on
   the GPU and are drawn on a WebGPU canvas over the 2D one
   (`fastwan_wgpu::CanvasView`, wasm only): the low-res clip plays at once,
   first 1080p frame 0.5 s after the decode, all 81 in 1.4–1.7 s (was 2.4–2.6

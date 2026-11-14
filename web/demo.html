@@ -583,7 +583,8 @@ async function bwLoad() {
   bwStatus("wait", "Starting WebGPU…");
   if (!bw.mod) { bw.mod = await import("/pkg/fastwan_web.js"); await bw.mod.default(); }
   if (bw.eng) { bw.eng.free(); bw.eng = null; bw.loaded = null; }
-  bw.eng = await bw.mod.createEngine(bw.manifest.model); bw.upScale = 0; bw.upAttached = false;
+  // ?kernels=LINEAR,FLASH picks the WebGPU kernels (A/B runs); empty = defaults.
+  bw.eng = await bw.mod.createEngine(bw.manifest.model, new URLSearchParams(location.search).get("kernels") || ""); bw.upScale = 0; bw.upAttached = false;
   const url = `${WEIGHTS}/${v.file}`, { dataStart, groups } = await readGroups(url);
   const blocks = [...groups.keys()].filter((k) => k >= 0).sort((a, b) => a - b);
   if (blocks.length !== bw.eng.layers()) throw new Error(`${v.file} has ${blocks.length} blocks, the model ${bw.eng.layers()}`);

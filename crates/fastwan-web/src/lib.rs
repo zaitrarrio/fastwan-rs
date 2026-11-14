@@ -61,14 +61,22 @@ mod web {
     /// `model`: "fastwan" (FastWan2.1-T2V-1.3B + taew2_1) or "tiny" (the
     /// synthetic test model).
     #[wasm_bindgen(js_name = createEngine)]
-    pub async fn create_engine(model: String) -> Result<Engine, JsValue> {
+    pub async fn create_engine(model: String, kernels: Option<String>) -> Result<Engine, JsValue> {
         console_error_panic_hook::set_once();
         let (cfg, tcfg) = match model.as_str() {
             "fastwan" => (WanConfig::fastwan_1_3b(), TaeConfig::taew2_1()),
             "tiny" => (WanConfig::tiny_vsa(), TaeConfig::tiny()),
             m => return Err(err(format!("unknown model `{m}`"))),
         };
-        let be = Wgpu::new_async().await.map_err(err)?;
+        // `kernels`: "LINEAR,FLASH" (e.g. "4,2") picks the GEMM / attention
+        // kernels, for A/B runs from the page (?kernels=); empty = defaults.
+        let mut opts = fastwan_wgpu::WgpuOptions::default();
+        if let Some(k) = kernels.filter(|k| !k.is_empty()) {
+            let mut it = k.split(',').map(|v| v.trim().parse::<u32>().ok());
+            opts.linear = it.next().flatten();
+            opts.flash = it.next().flatten();
+        }
+        let be = Wgpu::with_options_async(opts).await.map_err(err)?;
         Ok(Engine {
             inner: Rc::new(Inner {
                 builder: RefCell::new(Some(DitBuilder::new(cfg.clone(), WeightQuant::Native))),

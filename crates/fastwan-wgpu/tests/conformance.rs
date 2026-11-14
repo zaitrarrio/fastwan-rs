@@ -31,7 +31,10 @@ fn wgpu_matches_cpu_reference() {
 /// reference, at f16 tolerance.
 #[test]
 fn wgpu_f16_matches_cpu_reference() {
-    let be = match fastwan_wgpu::Wgpu::with_options(fastwan_wgpu::WgpuOptions { f16: true }) {
+    let be = match fastwan_wgpu::Wgpu::with_options(fastwan_wgpu::WgpuOptions {
+        f16: true,
+        ..fastwan_wgpu::WgpuOptions::from_env()
+    }) {
         Ok(b) if b.f16() => b,
         Ok(_) => {
             eprintln!("skipping: adapter has no shader-f16");
