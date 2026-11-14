@@ -148,6 +148,11 @@ struct TimeEmbed {
     head_table: Vec<f32>,
 }
 
+/// `Attention` left to the default uses VSA only from this many latent frames
+/// (81 video frames, FastWan's training length): shorter clips decay at the
+/// end under VSA, so they get dense attention.
+pub const VSA_MIN_LATENT_FRAMES: usize = 21;
+
 pub struct WanDit<B: Backend> {
     pub cfg: WanConfig,
     patch: Linear<B>,
@@ -422,7 +427,7 @@ impl<B: Backend> WanDit<B> {
 
     /// `attention: None` picks VSA at the default sparsity on a VSA checkpoint
     /// (what it was distilled with) when the backend can run it, and dense
-    /// attention otherwise.
+    /// attention otherwise (and below [`VSA_MIN_LATENT_FRAMES`]).
     pub fn workspace(
         &self,
         be: &B,
@@ -436,14 +441,21 @@ impl<B: Backend> WanDit<B> {
         let d = c.dim();
         let chunk = ffn_chunk.clamp(1, s);
         let rope = rope_table(c, grid, 0);
-        let attention =
-            attention.unwrap_or(if self.has_vsa_gates() && be.vsa_supported(c.head_dim) {
+        // Auto: VSA only at the clip length FastWan was distilled at. Shorter
+        // clips under VSA lose their last frames to blocky noise (17 to 65
+        // frames, both sizes, CUDA and WebGPU alike) while dense attention
+        // stays clean, at about the same cost there
+        // (docs/runs/2026-11-14-vast-4090-short-clips-vsa).
+        let vsa_ok = grid.0 >= VSA_MIN_LATENT_FRAMES;
+        let attention = attention.unwrap_or(
+            if vsa_ok && self.has_vsa_gates() && be.vsa_supported(c.head_dim) {
                 Attention::Vsa {
                     sparsity: fastwan_core::vsa::DEFAULT_SPARSITY,
                 }
             } else {
                 Attention::Dense
-            });
+            },
+        );
         let vsa = match attention {
             Attention::Vsa { sparsity } => {
                 assert!(

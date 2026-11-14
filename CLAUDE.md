@@ -35,7 +35,11 @@ State and invariants only; the reasoning is in `docs/design.md`.
   architecture before defaulting it there. `examples/ptx.rs` + ptxas gives
   registers / spills / smem without a GPU.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
-  `to_gate_compress` (FastWan does); `--attention dense` to compare. The VSA
+  `to_gate_compress` (FastWan does) **and the clip has ≥ 21 latent frames
+  (81 frames)**; `--attention dense` to compare. Shorter clips under VSA
+  decay at the end into blocky noise (17–65 frames, CUDA and WebGPU) while
+  dense stays clean, so auto picks dense there
+  (`docs/runs/2026-11-14-vast-4090-short-clips-vsa`). The VSA
   CPU path is fastvideo-rs's host oracle; keep GPU kernels checked against it.
 - Rentals: `scripts/vast/` (no SSH; R2 command channel). Arm a destroy timer
   at rent time, `timeout` every command, run the decisive work first.

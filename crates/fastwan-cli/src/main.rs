@@ -42,7 +42,8 @@ enum BackendKind {
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
 enum AttnKind {
-    /// VSA on a checkpoint that carries to_gate_compress (FastWan), dense otherwise.
+    /// VSA on a checkpoint that carries to_gate_compress (FastWan) at 81+ frames
+    /// (shorter clips decay at the end under VSA), dense otherwise.
     Auto,
     Dense,
     Vsa,
