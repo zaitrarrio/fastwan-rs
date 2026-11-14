@@ -500,6 +500,49 @@ impl<B: Backend> WanDit<B> {
         prompt: &Prompt<B>,
         out: &B::Buf,
     ) {
+        self.forward_with(
+            be,
+            ws,
+            x,
+            mods,
+            prompt,
+            out,
+            (&ws.rope_cos, &ws.rope_sin),
+            None,
+        );
+    }
+
+    /// One block of a causal rollout (see [`crate::causal`]): `x` is the
+    /// block's latent, `rope` its RoPE table (offset by the block's first
+    /// frame), and self-attention writes the block's keys/values into `cache`
+    /// (whose slots `KvCache::begin_block` chose) and attends to the cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_causal(
+        &self,
+        be: &B,
+        ws: &Workspace<B>,
+        x: &B::Buf,
+        mods: &StepMods<B>,
+        prompt: &Prompt<B>,
+        out: &B::Buf,
+        rope: (&B::Buf, &B::Buf),
+        cache: &crate::causal::KvCache<B>,
+    ) {
+        self.forward_with(be, ws, x, mods, prompt, out, rope, Some(cache));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with(
+        &self,
+        be: &B,
+        ws: &Workspace<B>,
+        x: &B::Buf,
+        mods: &StepMods<B>,
+        prompt: &Prompt<B>,
+        out: &B::Buf,
+        rope: (&B::Buf, &B::Buf),
+        cache: Option<&crate::causal::KvCache<B>>,
+    ) {
         let c = &self.cfg;
         let (s, d, hd, nh, eps) = (ws.tokens, c.dim(), c.head_dim, c.heads, c.eps);
         let (t, lh, lw) = (ws.grid.0, ws.grid.1 * c.patch, ws.grid.2 * c.patch);
@@ -514,7 +557,7 @@ impl<B: Backend> WanDit<B> {
             &ws.h,
             0,
         );
-        let rope = Some((&ws.rope_cos, &ws.rope_sin));
+        let rope = Some(rope);
         for (li, (bl, m)) in self.blocks.iter().zip(&mods.blocks).enumerate() {
             // Self-attention.
             be.layer_norm(
@@ -565,6 +608,10 @@ impl<B: Backend> WanDit<B> {
             );
             be.head_split(&ws.qkv, s, 3 * d, 2 * d, nh, hd, None, None, eps, &ws.v);
             match (&ws.vsa, &bl.gate) {
+                _ if cache.is_some() => {
+                    let cache = cache.expect("checked");
+                    cache.attend(be, li, &ws.q, &ws.k, &ws.v, s, &ws.attn);
+                }
                 (Some(vsa), Some(gate)) => {
                     // The gate is to_gate_compress of the same normed input,
                     // split into heads with no norm and no RoPE.

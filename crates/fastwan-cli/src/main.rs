@@ -240,6 +240,17 @@ enum Cmd {
         /// (`realesr-animevideov3.safetensors`; scripts/upscale/convert_esrgan.py).
         #[arg(long)]
         upscale: Option<PathBuf>,
+        /// Causal rollout (a Self-Forcing checkpoint: scripts/convert_self_forcing.py):
+        /// 3-latent-frame blocks over a rolling K/V cache, any --frames, streamed
+        /// to --out as each block decodes.
+        #[arg(long, default_value_t = false)]
+        causal: bool,
+        /// Causal: latent frames the K/V cache holds (sink and block included).
+        #[arg(long, default_value_t = 12)]
+        cache_frames: usize,
+        /// Causal: first latent frames kept in the cache for the whole video.
+        #[arg(long, default_value_t = 3)]
+        sink_frames: usize,
     },
 }
 
@@ -475,6 +486,9 @@ fn main() -> Result<()> {
             ffn_chunk,
             tae_chunk,
             upscale,
+            causal,
+            cache_frames,
+            sink_frames,
         } => {
             let g = shape.geometry()?;
             let cfg = WanConfig::fastwan_1_3b();
@@ -499,6 +513,25 @@ fn main() -> Result<()> {
                 (None, Some(path)) => gallery::load_embeds(&path, &cfg)?,
                 (None, None) => bail!("give --prompt or --embeds"),
             };
+            if causal {
+                if upscale.is_some() || runs > 1 {
+                    bail!("--causal does not take --upscale or --runs yet");
+                }
+                let mut ccfg = fastwan_model::causal::CausalConfig::self_forcing();
+                ccfg.cache_frames(cache_frames, sink_frames);
+                return with_backend!(backend, |be| generate_causal(
+                    &be,
+                    &g,
+                    &transformer,
+                    &tae,
+                    &e,
+                    seed,
+                    &out,
+                    ffn_chunk,
+                    ccfg,
+                    attn.weights,
+                ));
+            }
             with_backend!(backend, |be| generate(
                 &be,
                 &g,
@@ -771,6 +804,140 @@ fn generate<B: Backend>(
         video.height
     );
     Ok(())
+}
+
+/// Causal generation: blocks are denoised one after another and each block's
+/// latent frames are decoded by the streaming TAEHV as soon as it is done, so
+/// frames reach --out while later blocks are still being generated.
+#[allow(clippy::too_many_arguments)]
+fn generate_causal<B: Backend>(
+    be: &B,
+    g: &Geometry,
+    transformer: &Path,
+    tae: &Path,
+    e: &[f32],
+    seed: u64,
+    out: &Path,
+    ffn_chunk: Option<usize>,
+    ccfg: fastwan_model::causal::CausalConfig,
+    quant: fastwan_core::quant::WeightQuant,
+) -> Result<()> {
+    use fastwan_model::causal::{CausalRollout, frame_major};
+    let cfg = WanConfig::fastwan_1_3b();
+    let tcfg = TaeConfig::taew2_1();
+    println!("{}", be.name());
+    let t0 = std::time::Instant::now();
+    let wsrc = SafetensorsDir::open(transformer)?;
+    let miss = missing(&wsrc, &wan_manifest(&cfg));
+    if !miss.is_empty() {
+        bail!(
+            "{} tensors missing from {}, e.g. {:?}",
+            miss.len(),
+            transformer.display(),
+            &miss[..miss.len().min(3)]
+        );
+    }
+    let tsrc = SafetensorsDir::open(tae)?;
+    let dit = WanDit::load_with(be, cfg.clone(), &wsrc, quant)?;
+    let taehv = TaeHv::load(be, tcfg, &tsrc)?;
+    be.sync();
+    println!("load {:.1}s", t0.elapsed().as_secs_f64());
+    let (lt, lh, lw) = g.latent();
+    let bf = ccfg.block_frames;
+    let blocks = lt.div_ceil(bf);
+    println!(
+        "causal: {blocks} blocks of {bf} latent frames, cache {} (sink {}), timesteps {:?}",
+        ccfg.cap_frames, ccfg.sink_frames, ccfg.timesteps
+    );
+    let t0 = std::time::Instant::now();
+    let prompt = dit.prepare_prompt(be, e);
+    let mut roll = CausalRollout::new(
+        be,
+        &dit,
+        ccfg,
+        (lh, lw),
+        ffn_chunk.unwrap_or(usize::MAX),
+        seed,
+    )?;
+    let mut st = taehv.state();
+    let mut y4m: Option<Y4m> = None;
+    let c = cfg.out_channels;
+    let mut frames = 0;
+    let mut first_frame = None;
+    for b in 0..blocks {
+        let tb = std::time::Instant::now();
+        let latent = be.download(roll.next_block(be, &prompt)?);
+        let den = tb.elapsed().as_secs_f64();
+        let z = frame_major(&latent, c, bf, lh * lw);
+        let chunk = taehv.launch_chunk(be, &mut st, &z, bf, lh, lw);
+        let packed = chunk.pack(be);
+        let raw = be.download_rgba8(&packed);
+        let (n, h, w) = chunk.dims();
+        let rgb = fastwan_core::backend::rgba_to_rgb(&raw[..n * h * w * 4]);
+        let y = match y4m.as_mut() {
+            Some(y) => y,
+            None => y4m.insert(Y4m::create(out, w, h, 16)?),
+        };
+        y.frames(&rgb)?;
+        frames += n;
+        first_frame.get_or_insert(t0.elapsed().as_secs_f64());
+        println!(
+            "block {b}: denoise {den:.2}s  decode {:.2}s  {n} frames ({frames} total, {:.1} fps so far)",
+            tb.elapsed().as_secs_f64() - den,
+            frames as f64 / t0.elapsed().as_secs_f64()
+        );
+    }
+    let total = t0.elapsed().as_secs_f64();
+    println!(
+        "causal: {frames} frames in {total:.2}s ({:.1} fps, first frames at {:.2}s)",
+        frames as f64 / total,
+        first_frame.unwrap_or(0.0)
+    );
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+/// A YUV4MPEG2 file written frame by frame (see [`write_y4m`]).
+struct Y4m {
+    f: std::io::BufWriter<std::fs::File>,
+    px: usize,
+}
+
+impl Y4m {
+    fn create(path: &Path, w: usize, h: usize, fps: u32) -> Result<Self> {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        writeln!(
+            f,
+            "YUV4MPEG2 W{w} H{h} F{fps}:1 Ip A1:1 C444 XCOLORRANGE=FULL"
+        )?;
+        Ok(Self { f, px: w * h })
+    }
+
+    /// Append frames given as packed RGB.
+    fn frames(&mut self, rgb: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let px = self.px;
+        let mut planes = vec![0u8; 3 * px];
+        for fr in rgb.chunks_exact(3 * px) {
+            for i in 0..px {
+                let (r, g, b) = (fr[3 * i] as f32, fr[3 * i + 1] as f32, fr[3 * i + 2] as f32);
+                planes[i] = (0.299 * r + 0.587 * g + 0.114 * b)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                planes[px + i] = (128.0 - 0.168_736 * r - 0.331_264 * g + 0.5 * b)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                planes[2 * px + i] = (128.0 + 0.5 * r - 0.418_688 * g - 0.081_312 * b)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+            self.f.write_all(b"FRAME\n")?;
+            self.f.write_all(&planes)?;
+        }
+        self.f.flush()?;
+        Ok(())
+    }
 }
 
 /// YUV4MPEG2, 4:4:4, BT.601 full range: plays in mpv/ffplay, converts with

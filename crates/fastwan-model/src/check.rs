@@ -86,6 +86,7 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     ops(&mut p, &mut rng);
     model(&mut p);
     upscaler(&mut p);
+    causal(&mut p);
     pack(&mut p, &mut rng);
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
@@ -703,6 +704,44 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             cpu.download(&co),
         );
     }
+}
+
+/// The causal rollout end to end on the tiny model: four 2-frame blocks
+/// through a 5-frame cache with a 1-frame sink (the third and fourth blocks
+/// evict), four DMD steps each plus the clean rewrite; the GPU's latents vs
+/// the CPU's, block by block (the cache carries any error forward).
+fn causal<B: Backend>(p: &mut Pair<'_, B>) {
+    use crate::causal::{CausalConfig, CausalRollout};
+    let (be, cpu) = (p.be, &Cpu);
+    let cfg = WanConfig::tiny();
+    let src = Synthetic { seed: 3 };
+    let embeds = Rng::new(5).normal(cfg.text_len * cfg.text_dim);
+    let ccfg = CausalConfig {
+        block_frames: 2,
+        cap_frames: 5,
+        sink_frames: 1,
+        timesteps: CausalConfig::self_forcing().timesteps,
+    };
+    let gd = WanDit::load(be, cfg.clone(), &src).unwrap();
+    let cd = WanDit::load(cpu, cfg, &src).unwrap();
+    let (gpr, cpr) = (
+        gd.prepare_prompt(be, &embeds),
+        cd.prepare_prompt(cpu, &embeds),
+    );
+    let mut g = CausalRollout::new(be, &gd, ccfg.clone(), (4, 6), 7, 21).unwrap();
+    let mut c = CausalRollout::new(cpu, &cd, ccfg, (4, 6), 7, 21).unwrap();
+    let (mut gl, mut cl) = (Vec::new(), Vec::new());
+    for _ in 0..4 {
+        let x = g.next_block(be, &gpr).unwrap();
+        gl.extend(be.download(x));
+        let x = c.next_block(cpu, &cpr).unwrap();
+        cl.extend(cpu.download(x));
+    }
+    p.record(
+        "tiny causal rollout, 4 blocks, rolling cache (latent)",
+        gl,
+        cl,
+    );
 }
 
 /// The tiny ×2 upscaler on two noise frames (raw network output, before the
