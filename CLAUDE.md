@@ -106,13 +106,13 @@ State and invariants only; the reasoning is in `docs/design.md`.
   foreign `Origin`s (a cross-site form POST skips the preflight). Keep both.
   `web/demo.html` is compiled into the binary (`include_str!`); rebuild after
   editing it.
-- Site: https://fastwan.pages.dev (Cloudflare Pages project `fastwan`, account
+- Site: https://fastwan.dev (also https://fastwan.pages.dev; Cloudflare Pages project `fastwan`, account
   "Maximal"), built by `web/build.py` into `web/site/` and deployed with
   `scripts/deploy-pages.sh`. Classic Pages, not Workers: no `--force` needed now.
 - In-browser mode (`crates/fastwan-web`, wasm via `scripts/build-web.sh` →
   `web/pkg`, wasm-bindgen pinned `=0.2.127` to match wgpu 30): weights stream
   from the public bucket `fastwan-public/v1/` (`manifest.json`, served at
-  `PUBLIC_WEIGHTS` in `web/demo.html`, r2.dev for now; fv-weights stays
+  `PUBLIC_WEIGHTS` in `web/demo.html` = `https://weights.fastwan.dev/v1`, the bucket's custom domain; fv-weights stays
   private; CORS is an origin allowlist, add new site domains to it), one block per Range request, so DiT files must be block-ordered
   (`export::write` keeps the given order; `quantize_dit` sorts head first, then
   `blocks.N`). Blocking `download` panics on wasm: use `download_async`; no
