@@ -1,6 +1,15 @@
 # Cargo. Cargo.lock stays: this workspace builds the `fastwan` binary.
-/target/
+# Unanchored so a crate built outside the workspace (`crates/* /target`)
+# is ignored too. Profiles live under target/, including debug and release.
+target/
 **/*.rs.bk
+*.pdb
+
+# rust-analyzer, sccache, nextest, and a vendored crate tree.
+.ra-x/
+.sccache/
+.nextest/
+/vendor/
 
 # Downloaded checkpoints (`huggingface-cli download … --local-dir fastwan`)
 # and a local checkout of the TAEHV reference. Weights live in R2, not git.
@@ -8,40 +17,94 @@
 /taehv/
 /fastwan-runs/
 .cache/
+.huggingface/
 
-# Generated checkpoints, quantized exports, and prompt-gallery embeddings.
-# The tiny transformers/diffusers fixtures under tests/fixtures/ are checked in.
+# Generated checkpoints, quantized exports, prompt embeddings, and other
+# weight formats. The tiny transformers/diffusers fixtures under
+# crates/*/tests/fixtures/ are checked in.
 *.safetensors
 !crates/**/fixtures/*.safetensors
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.onnx
+*.pb
+*.gguf
+*.tflite
+*.npy
+*.npz
+*.msgpack
+*.h5
+*.hdf5
+*.part
+*.incomplete
 
 # CLI frame dump (`--out` defaults to out.y4m) and clips written at the repo
 # root. Measurement clips and stills under docs/runs/ stay tracked.
 *.y4m
+*.yuv
+/out/
 /*.mp4
 /*.webm
+/*.mov
+/*.mkv
+/*.avi
 /*.png
+/*.jpg
+/*.jpeg
+/*.webp
 /*.gif
+/*.wav
+/*.flac
 
-# `python3 web/build.py` output. The sources are web/*.html and the shaders.
+# `python3 web/build.py` output. The sources are web/*.html, the shaders,
+# and web/fastwan-webgpu-bench.html (regenerated, but checked in: the
+# `web_page_embeds_current_shaders` test fails when it is stale).
 /web/dist/
 /web/site/
 
 # Cloudflare (wrangler cache, Pages local state, Worker secrets).
 .wrangler/
 .dev.vars
+.dev.vars.*
+.mf/
 
-# Python (scripts/, web/build.py).
+# Python (scripts/, web/build.py, scripts/reference/make_fixtures.py).
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
 venv/
+.pyenv-version
+.envrc
+.direnv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 .ipynb_checkpoints/
-*.egg-info/
 .python-version
+*.egg
+*.egg-info/
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+__pypackages__/
+
+# Playwright (scripts/vast/page_test.py). Screenshot paths passed on the
+# command line are not ignored; the tool's own report dirs are.
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
 
 # Hand-built CUDA objects and NVRTC / profiler dumps. Kernels ship as source
 # (`kernels.cu`); NVRTC compiles them at runtime.
@@ -53,26 +116,39 @@ venv/
 *.dylib
 *.dll
 *.exe
-*.pdb
+*.exp
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.dSYM/
 *.cubin
 *.ptx
 *.fatbin
 *.nsys-rep
 *.ncu-rep
 *.qdrep
+*.nvprof
+nsys_*.sqlite
+compile_commands.json
 CMakeCache.txt
 CMakeFiles/
 cmake-build-*/
+CMakeUserPresets.json
 
-# Profiles and coverage (cargo-flamegraph, llvm-cov, tarpaulin).
+# Profiles and coverage (cargo-flamegraph, llvm-cov, tarpaulin, criterion).
 perf.data
 perf.data.old
 flamegraph.svg
+perf-*.svg
 *.profraw
 *.profdata
 lcov.info
 tarpaulin-report.html
 cobertura.xml
+*.gcda
+*.gcno
+*.gcov
 
 # Secrets. Rental and R2 credentials come from the environment.
 .env
@@ -80,37 +156,95 @@ cobertura.xml
 !.env.example
 *.pem
 *.key
+*.p12
+*.pfx
+*.cer
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
 credentials.json
 secrets.json
+auth.json
+.netrc
+*.token
 
-# Editor and OS junk.
+# Editor and OS junk. Shared editor config is not part of this repo.
 .DS_Store
 .AppleDouble
 .LSOverride
 ._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+Icon?
 Thumbs.db
+Thumbs.db:encryptable
 ehthumbs.db
+ehthumbs_vista.db
 Desktop.ini
+$RECYCLE.BIN/
+*.stackdump
+*.lnk
+.directory
+.Trash-*
 *~
 *.swp
 *.swo
+*.swn
+*.bak
 *.orig
 *.rej
+\#*\#
+.\#*
 .idea/
+*.iml
 .vscode/
 *.code-workspace
+.zed/
+.fleet/
+*.sublime-workspace
+*.sublime-project
 
-# Logs, cores, scratch.
+# Cursor local state. Rules can still be committed.
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
+.claude/settings.local.json
+
+# Logs, cores, scratch. A root core dump is `core` or `core.<pid>`;
+# `core.rs` stays tracked.
 *.log
-core
-core.*
+/core
+/core.*
+!/core.rs
 /tmp/
 *.tmp
+*.temp
 
-# If a JS toolchain shows up next to wrangler.
+# If a JS toolchain shows up next to wrangler. Lockfiles stay tracked.
 node_modules/
+.npm/
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
-.direnv/
+.turbo/
+.parcel-cache/
+.eslintcache
+*.tsbuildinfo
