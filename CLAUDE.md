@@ -34,6 +34,18 @@ State and invariants only; the reasoning is in `docs/design.md`.
   step there (`docs/runs/2026-11-07-attention-variants`). Check v2 on another
   architecture before defaulting it there. `examples/ptx.rs` + ptxas gives
   registers / spills / smem without a GPU.
+- Long videos: `generate --causal` runs a Self-Forcing checkpoint block by
+  block (`causal.rs`: 3 latent frames per block, 4 steps, K/V ring cache of
+  `--cache-frames` 12 with a `--sink-frames` 3 sink, dense attention). Weights:
+  `scripts/convert_self_forcing.py` (torch-free) then `quantize --weights
+  native`; public as `v1/self-forcing-1.3b-f16.safetensors` (Apache-2.0). The
+  FastWan checkpoint is not causal: use it only for fixed 81-frame clips.
+  Checked against strobe's PyTorch causal forward (`hf_parity`). RTX 4090
+  CUDA 832×480: 12.9 fps whatever the length (0.84 s denoise + 0.10 s decode
+  per 12 frames), first frames at 0.75 s; WebGPU 480×272 ~1.75 s/block
+  (`docs/runs/2026-11-14-vast-4090-self-forcing-long`). Below ~320×192 the
+  model gives noise (out of distribution, not a bug). A 60 s video drifts
+  (a subject leaves and returns) but stays one scene.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does) **and the clip has ≥ 21 latent frames
   (81 frames)**; `--attention dense` to compare. Shorter clips under VSA
