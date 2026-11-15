@@ -46,6 +46,15 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (`docs/runs/2026-11-14-vast-4090-self-forcing-long`). Below ~320×192 the
   model gives noise (out of distribution, not a bug). A 60 s video drifts
   (a subject leaves and returns) but stays one scene.
+- Browser long videos (`Engine.generateLong` / `stop`; Prompt Studio offers
+  them for manifest variants with `"causal": true`, 480×272 and 640×352,
+  desktop only: the f32 K/V cache is ~2.3 GB at 480×272). Correct in Chrome
+  (SwiftShader parity 99.93%, max 1 level), but headless Chrome on an RTX 4090
+  stalls some blocks for 4-41 s while native wgpu stays at 1.6 s/block
+  (`docs/runs/2026-11-15-vast-4090-chrome-long-video`). wgpu's web backend
+  never frees a dropped buffer: `Owned` / `retire` destroy them after the next
+  submit; `KeepAlive` submits an empty batch every 20 ms during readbacks
+  (halves the stalls). Cause of the rest unknown.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does) **and the clip has ≥ 21 latent frames
   (81 frames)**; `--attention dense` to compare. Shorter clips under VSA

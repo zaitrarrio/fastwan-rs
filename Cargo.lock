@@ -578,6 +578,7 @@ dependencies = [
  "fastwan-model",
  "half",
  "pollster",
+ "wasm-bindgen",
  "web-sys",
  "wgpu",
 ]

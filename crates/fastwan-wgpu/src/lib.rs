@@ -225,6 +225,8 @@ pub struct Wgpu {
     /// reason. wgpu's default handler panics, which inside a JS callback
     /// leaves the caller's promise pending forever (a silent hang).
     fault: Arc<Mutex<Option<String>>>,
+    /// Browser: tick the device while a readback is pending (see `KeepAlive`).
+    keepalive: std::sync::atomic::AtomicBool,
     dummy: GBuf,
     pub allow_f16_weights: bool,
 }
@@ -350,6 +352,7 @@ impl Wgpu {
             prof,
             pending: Mutex::new(Pending { enc: None, n: 0 }),
             fault,
+            keepalive: std::sync::atomic::AtomicBool::new(true),
             dummy,
             allow_f16_weights: true,
         })
@@ -1425,6 +1428,7 @@ impl Wgpu {
         let out = f(&data);
         drop(data);
         staging.unmap();
+        retire(staging);
         out
     }
 
@@ -1474,6 +1478,12 @@ impl Wgpu {
             submission_index: None,
             timeout: None,
         });
+        #[cfg(target_arch = "wasm32")]
+        let _tick = self
+            .keepalive
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| KeepAlive::start(self.queue.clone()))
+            .flatten();
         if let Err(e) = rx.await {
             return Err(self
                 .fault()
@@ -1489,6 +1499,7 @@ impl Wgpu {
         let out = bytemuck::cast_slice::<u8, f32>(&data)[..buf.len].to_vec();
         drop(data);
         staging.unmap();
+        retire(staging);
         Ok(out)
     }
 
@@ -1523,11 +1534,53 @@ impl Wgpu {
         let out = bytemuck::cast_slice::<u8, f32>(&data)[..buf.len].to_vec();
         drop(data);
         staging.unmap();
+        retire(staging);
         out
     }
 }
 
 /// A minimal one-shot channel future (no executor dependency).
+/// While a browser readback is pending, submit an empty batch every 20 ms.
+/// Chrome delivered `mapAsync` callbacks for long videos up to ~40 s late
+/// (blocks of 1.5 s took 16-41 s in runs, natively flat): an empty submit makes
+/// its GPU process tick the device, which is when callbacks are delivered.
+#[cfg(target_arch = "wasm32")]
+struct KeepAlive {
+    id: i32,
+    _cb: wasm_bindgen::closure::Closure<dyn FnMut()>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl KeepAlive {
+    fn start(queue: wgpu::Queue) -> Option<Self> {
+        use wasm_bindgen::JsCast;
+        let cb = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+            queue.submit(std::iter::empty());
+        });
+        let id = web_sys::window()?
+            .set_interval_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), 20)
+            .ok()?;
+        Some(Self { id, _cb: cb })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        if let Some(w) = web_sys::window() {
+            w.clear_interval_with_handle(self.id);
+        }
+    }
+}
+
+impl Wgpu {
+    /// Browser: whether readbacks keep the device ticking (default on).
+    pub fn set_keepalive(&self, on: bool) {
+        self.keepalive
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn futures_oneshot<T>() -> (OneTx<T>, OneRx<T>) {
     let s = Arc::new(Mutex::new((None, None::<std::task::Waker>)));
     (OneTx(s.clone()), OneRx(s))

@@ -622,6 +622,7 @@ async function bwLoad() {
   if (bw.eng) { bw.eng.free(); bw.eng = null; bw.loaded = null; }
   // ?kernels=LINEAR,FLASH picks the WebGPU kernels (A/B runs); empty = defaults.
   bw.eng = await bw.mod.createEngine(bw.manifest.model, new URLSearchParams(location.search).get("kernels") || "", MOBILE); bw.upScale = 0; bw.upAttached = false;
+  if (new URLSearchParams(location.search).has("nokeep")) bw.eng.setKeepAlive(false); // diagnostics
   const url = `${WEIGHTS}/${v.file}`, { dataStart, groups } = await readGroups(url);
   const blocks = [...groups.keys()].filter((k) => k >= 0).sort((a, b) => a - b);
   if (blocks.length !== bw.eng.layers()) throw new Error(`${v.file} has ${blocks.length} blocks, the model ${bw.eng.layers()}`);
@@ -748,6 +749,8 @@ async function browserGenerateLong(width, height, frames, entry, seed) {
   job = { id, prompt, seed, long: true };
   $("go").disabled = false; $("go").textContent = "Stop";
   startClip(id, width, height, frames); clip.streaming = true;
+  // Diagnostics: ?noplay=1 keeps playback paused while a long video is made.
+  if (new URLSearchParams(location.search).has("noplay")) playing = false;
   const s = { id, prompt, seed, long: true, stage: "encoding", blocks: [], frames: 0, total_frames: frames, width, height, tokens: entry.tokens, first_s: 0, total_s: 0 };
   renderStages(s);
   const t0 = performance.now();
@@ -758,7 +761,7 @@ async function browserGenerateLong(width, height, frames, entry, seed) {
     await wasmCall(bw.eng.generateLong(emb, width, height, frames, seed, LONG_CACHE, LONG_SINK, (ev) => {
       if (ev.type === "prepared") { s.stage = "generating"; crumb(null, "block 1"); }
       else if (ev.type === "block") {
-        s.blocks.push(ev.ms / 1000); s.total_blocks = ev.total; clip.blockMs = s.blocks; crumb(null, `block ${ev.index + 2}`);
+        s.blocks.push(ev.ms / 1000); s.total_blocks = ev.total; clip.blockMs = s.blocks; (clip.denoiseMs ||= []).push(ev.denoise_ms / 1000); crumb(null, `block ${ev.index + 2}`);
         // Diagnostics: Chrome started with --js-flags=--expose-gc collects after every block.
         if (typeof gc === "function" && new URLSearchParams(location.search).has("gc")) gc();
       }

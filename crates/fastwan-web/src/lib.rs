@@ -377,6 +377,12 @@ mod web {
         pub fn stop(&self) {
             self.inner.stop.set(true);
         }
+
+        /// Diagnostics: turn off the device keep-alive during readbacks.
+        #[wasm_bindgen(js_name = setKeepAlive)]
+        pub fn set_keep_alive(&self, on: bool) {
+            self.inner.be.set_keepalive(on);
+        }
     }
 
     /// `prompt_embeds` from a gallery file, zero-padded to `[text_len, text_dim]`.
