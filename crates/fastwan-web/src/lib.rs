@@ -55,6 +55,8 @@ mod web {
         mobile: bool,
         /// Set by `stop()`: a long video ends after the block in progress.
         stop: std::cell::Cell<bool>,
+        /// Clip attention: `None` = the model's default (VSA from 81 frames).
+        attention: std::cell::Cell<Option<fastwan_model::Attention>>,
     }
 
     #[wasm_bindgen]
@@ -106,6 +108,7 @@ mod web {
                 kept_dims: std::cell::Cell::new((0, 0)),
                 mobile,
                 stop: std::cell::Cell::new(false),
+                attention: std::cell::Cell::new(None),
             }),
         })
     }
@@ -378,6 +381,20 @@ mod web {
             self.inner.stop.set(true);
         }
 
+        /// Clip attention: "dense", "vsa", or "" / "auto" for the default
+        /// (VSA from 81 frames on a VSA checkpoint, dense below).
+        #[wasm_bindgen(js_name = setAttention)]
+        pub fn set_attention(&self, mode: &str) -> Result<(), JsValue> {
+            let a = match mode {
+                "" | "auto" => None,
+                "dense" => Some(fastwan_model::Attention::Dense),
+                "vsa" => Some(fastwan_model::Attention::Vsa { sparsity: 0.8 }),
+                m => return Err(err(format!("unknown attention `{m}`"))),
+            };
+            self.inner.attention.set(a);
+            Ok(())
+        }
+
         /// Diagnostics: turn off the device keep-alive during readbacks.
         #[wasm_bindgen(js_name = setKeepAlive)]
         pub fn set_keep_alive(&self, on: bool) {
@@ -571,7 +588,7 @@ mod web {
         } else {
             p.ffn_chunk
         };
-        let ws = dit.workspace(be, g.latent(), ffn_chunk, None);
+        let ws = dit.workspace(be, g.latent(), ffn_chunk, inner.attention.get());
         let fence = be.alloc(1);
         be.try_download_async(&fence).await.map_err(err)?;
         emit(Object::new().tap(|o| set(o, "type", "prepared")));

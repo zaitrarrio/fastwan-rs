@@ -623,6 +623,8 @@ async function bwLoad() {
   // ?kernels=LINEAR,FLASH picks the WebGPU kernels (A/B runs); empty = defaults.
   bw.eng = await bw.mod.createEngine(bw.manifest.model, new URLSearchParams(location.search).get("kernels") || "", MOBILE); bw.upScale = 0; bw.upAttached = false;
   if (new URLSearchParams(location.search).has("nokeep")) bw.eng.setKeepAlive(false); // diagnostics
+  // ?attention=dense|vsa forces the clip attention (default: VSA from 81 frames).
+  bw.eng.setAttention(new URLSearchParams(location.search).get("attention") || "");
   const url = `${WEIGHTS}/${v.file}`, { dataStart, groups } = await readGroups(url);
   const blocks = [...groups.keys()].filter((k) => k >= 0).sort((a, b) => a - b);
   if (blocks.length !== bw.eng.layers()) throw new Error(`${v.file} has ${blocks.length} blocks, the model ${bw.eng.layers()}`);
