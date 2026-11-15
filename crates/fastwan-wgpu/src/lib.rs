@@ -53,8 +53,64 @@ const MAX_DIM: u32 = 65535;
 
 #[derive(Clone)]
 pub struct GBuf {
-    buf: Arc<wgpu::Buffer>,
+    buf: Arc<Owned>,
     len: usize,
+}
+
+/// A device buffer that is freed when the last [`GBuf`] handle goes. Native
+/// wgpu frees on drop. wgpu's WebGPU backend does not: a dropped buffer lives
+/// until the JS garbage collector finds its handle, which a wasm program that
+/// makes little JS garbage rarely triggers. A long video drops thousands of
+/// buffers and dispatch uniforms per block, and Chrome slowed from 1.7 s to
+/// 10-16 s per block as they piled up. So in the browser a dropped buffer is
+/// queued and `destroy()`ed right after the next submission of the pending
+/// encoder (every command that could use it is then submitted, and WebGPU
+/// lets submitted work finish before freeing).
+pub(crate) struct Owned(Option<wgpu::Buffer>);
+
+impl Owned {
+    fn new(b: wgpu::Buffer) -> Self {
+        Self(Some(b))
+    }
+}
+
+impl std::ops::Deref for Owned {
+    type Target = wgpu::Buffer;
+    fn deref(&self) -> &wgpu::Buffer {
+        self.0.as_ref().expect("live buffer")
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if let Some(b) = self.0.take() {
+            retire(b);
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static RETIRED: std::cell::RefCell<Vec<wgpu::Buffer>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Free `b` once it can no longer be in an unsubmitted command (see [`Owned`]).
+fn retire(b: wgpu::Buffer) {
+    #[cfg(target_arch = "wasm32")]
+    RETIRED.with(|r| r.borrow_mut().push(b));
+    #[cfg(not(target_arch = "wasm32"))]
+    drop(b);
+}
+
+/// Destroy the retired buffers; call only right after the pending encoder was
+/// submitted (nothing unsubmitted can refer to them then).
+fn destroy_retired() {
+    #[cfg(target_arch = "wasm32")]
+    RETIRED.with(|r| {
+        for b in r.borrow_mut().drain(..) {
+            b.destroy();
+        }
+    });
 }
 
 /// VSA state for one token grid.
@@ -254,12 +310,12 @@ impl Wgpu {
         };
         let linear_variant = opts.linear.unwrap_or(4);
         let dummy = GBuf {
-            buf: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            buf: Arc::new(Owned::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("dummy"),
                 size: 16,
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
-            })),
+            }))),
             len: 4,
         };
         let prof = profile.then(|| {
@@ -518,12 +574,14 @@ impl Wgpu {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, groups.2);
         }
+        retire(ubuf);
         pend.n += 1;
         if pend.n >= self.batch {
             let enc = pend.enc.take().unwrap();
             pend.n = 0;
             drop(pend);
             self.queue.submit([enc.finish()]);
+            destroy_retired();
         }
     }
 
@@ -561,6 +619,7 @@ impl Wgpu {
         if let Some(enc) = enc {
             self.queue.submit([enc.finish()]);
         }
+        destroy_retired();
         #[cfg(not(target_arch = "wasm32"))]
         if let (Some(read), Some(prof)) = (readback, &self.prof) {
             let slice = read.slice(..);
@@ -666,16 +725,15 @@ impl Wgpu {
     fn upload_u32(&self, data: &[u32]) -> GBuf {
         let data = if data.is_empty() { &[0u32][..] } else { data };
         GBuf {
-            buf: Arc::new(
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: None,
-                        contents: bytemuck::cast_slice(data),
-                        usage: wgpu::BufferUsages::STORAGE
-                            | wgpu::BufferUsages::COPY_SRC
-                            | wgpu::BufferUsages::COPY_DST,
-                    }),
-            ),
+            buf: Arc::new(Owned::new(self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                },
+            ))),
             len: data.len(),
         }
     }
@@ -750,14 +808,16 @@ impl Backend for Wgpu {
 
     fn alloc(&self, len: usize) -> GBuf {
         GBuf {
-            buf: Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: (len.max(1) * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })),
+            buf: Arc::new(Owned::new(self.device.create_buffer(
+                &wgpu::BufferDescriptor {
+                    label: None,
+                    size: (len.max(1) * 4) as u64,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+            ))),
             len,
         }
     }
@@ -771,16 +831,15 @@ impl Backend for Wgpu {
             bytemuck::cast_slice(data)
         };
         GBuf {
-            buf: Arc::new(
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: None,
-                        contents: bytes,
-                        usage: wgpu::BufferUsages::STORAGE
-                            | wgpu::BufferUsages::COPY_SRC
-                            | wgpu::BufferUsages::COPY_DST,
-                    }),
-            ),
+            buf: Arc::new(Owned::new(self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                },
+            ))),
             len: data.len(),
         }
     }
@@ -842,14 +901,13 @@ impl Backend for Wgpu {
                 })
                 .collect();
             let buf = GBuf {
-                buf: Arc::new(
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: None,
-                            contents: bytemuck::cast_slice(&packed),
-                            usage: wgpu::BufferUsages::STORAGE,
-                        }),
-                ),
+                buf: Arc::new(Owned::new(self.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(&packed),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    },
+                ))),
                 len: packed.len(),
             };
             GWeight {

@@ -757,7 +757,11 @@ async function browserGenerateLong(width, height, frames, entry, seed) {
     const emb = await cached(eurl, () => fetchBytes(eurl, null));
     await wasmCall(bw.eng.generateLong(emb, width, height, frames, seed, LONG_CACHE, LONG_SINK, (ev) => {
       if (ev.type === "prepared") { s.stage = "generating"; crumb(null, "block 1"); }
-      else if (ev.type === "block") { s.blocks.push(ev.ms / 1000); s.total_blocks = ev.total; crumb(null, `block ${ev.index + 2}`); }
+      else if (ev.type === "block") {
+        s.blocks.push(ev.ms / 1000); s.total_blocks = ev.total; clip.blockMs = s.blocks; crumb(null, `block ${ev.index + 2}`);
+        // Diagnostics: Chrome started with --js-flags=--expose-gc collects after every block.
+        if (typeof gc === "function" && new URLSearchParams(location.search).has("gc")) gc();
+      }
       else if (ev.type === "frames") { pushFrames(ev); s.frames += ev.count; if (!s.first_s) s.first_s = (performance.now() - t0) / 1000; }
       renderStages(s);
     }));

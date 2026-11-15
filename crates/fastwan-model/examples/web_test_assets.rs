@@ -138,7 +138,10 @@ fn main() {
             let (n, h, w) = ck.dims();
             rgb.extend(fastwan_core::backend::rgba_to_rgb(&raw[..n * h * w * 4]));
         }
-        println!("tiny-f16 long: {} frames 480x272", rgb.len() / (480 * 272 * 3));
+        println!(
+            "tiny-f16 long: {} frames 480x272",
+            rgb.len() / (480 * 272 * 3)
+        );
         std::fs::write(out.join("tiny-f16.long.rgb"), &rgb).unwrap();
     }
 
