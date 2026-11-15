@@ -46,6 +46,9 @@ if (root / "pkg/fastwan_web_bg.wasm").exists():
     demo.write_text(text.replace('const PKG_V = "dev";', f'const PKG_V = "{h}";'))
 else:
     print("note: web/pkg missing; run scripts/build-web.sh for the in-browser mode")
+# Older engine builds for bisecting (web/pkg-<commit>/, not in git): ?engine=<commit>.
+for old in sorted(root.glob("pkg-*")):
+    shutil.copytree(old, site / old.name)
 (site / "_headers").write_text("/*\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: strict-origin-when-cross-origin\n"
-                                "/pkg/*\n  Cache-Control: no-cache\n/demo/*\n  Cache-Control: no-cache\n")
+                                "/pkg/*\n  Cache-Control: no-cache\n/pkg-*\n  Cache-Control: no-cache\n/demo/*\n  Cache-Control: no-cache\n")
 print("wrote", site)

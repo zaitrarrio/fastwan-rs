@@ -3,4 +3,5 @@
 /web/dist
 /web/site
 /web/pkg
+/web/pkg-*
 scripts/vast/__pycache__/
