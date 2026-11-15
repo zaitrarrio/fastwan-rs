@@ -395,6 +395,41 @@ mod web {
             Ok(())
         }
 
+        /// Every op check (`fastwan check`'s op suite plus VSA at the model's
+        /// token grids) on this GPU against the CPU reference compiled into
+        /// this module. The CPU side runs first, on the main thread, and takes
+        /// a minute or two. Events: `{type: "check", index, total, name,
+        /// rel, ok}`; resolves to the number of failures.
+        #[wasm_bindgen(js_name = selfTest)]
+        pub fn self_test(&self, on_event: Function) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            wasm_bindgen_futures::future_to_promise(async move {
+                let be = &inner.be;
+                let tol = if be.name().ends_with("+f16") {
+                    1e-2
+                } else {
+                    2e-3
+                };
+                let d = fastwan_model::check::ops_deferred(be, tol);
+                let total = d.pending.len();
+                let mut bad = 0u32;
+                for (i, p) in d.pending.iter().enumerate() {
+                    let got = be.try_download_async(&p.buf).await.map_err(err)?;
+                    let r = p.finish(&got, tol);
+                    bad += (!r.ok) as u32;
+                    let o = Object::new();
+                    set(&o, "type", "check");
+                    set(&o, "index", i as u32);
+                    set(&o, "total", total as u32);
+                    set(&o, "name", r.name.as_str());
+                    set(&o, "rel", r.rel_err as f64);
+                    set(&o, "ok", r.ok);
+                    let _ = on_event.call1(&JsValue::NULL, &o);
+                }
+                Ok(JsValue::from(bad))
+            })
+        }
+
         /// Diagnostics: turn off the device keep-alive during readbacks.
         #[wasm_bindgen(js_name = setKeepAlive)]
         pub fn set_keep_alive(&self, on: bool) {

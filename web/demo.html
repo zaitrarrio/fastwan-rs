@@ -120,6 +120,11 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
         <div class="progress" id="bw-progress" hidden><div id="bw-bar"></div></div>
         <p class="hint" id="bw-status"></p>
         <p class="msg bad" id="bw-crash" hidden></p>
+        <div id="selftest" hidden>
+          <p class="hint">GPU self-test: every kernel the model uses, at the model's shapes, on this GPU against a CPU reference in this tab. The CPU part takes a minute or two and the tab may look frozen meanwhile. No model download needed.</p>
+          <button type="button" class="ghost" id="st-run">Run GPU self-test</button>
+          <pre class="cmd" id="st-out" style="max-height:24em;overflow:auto;white-space:pre-wrap"></pre>
+        </div>
         <label class="check" id="bw-up-row" hidden><input type="checkbox" id="bw-up"><span>Upscale ×4 after decoding <span class="hint" id="bw-up-hint">(480×272 → 1920×1088; Real-ESRGAN compact video model, 2.5 MB more)</span></span></label>
       </div>
       <div class="connect" id="connect" hidden>
@@ -836,6 +841,34 @@ async function browserGenerate(width, height, frames) {
   resetButton();
 }
 
+// ---- GPU self-test (?selftest=1) -------------------------------------------------
+async function selfTest() {
+  const out = $("st-out"), log = (t) => { out.textContent += t + "\n"; out.scrollTop = out.scrollHeight; };
+  $("st-run").disabled = true; out.textContent = "";
+  try {
+    if (!bw.mod) {
+      const ENG = new URLSearchParams(location.search).get("engine"), PKG = ENG && /^[0-9a-f]{7}$/.test(ENG) ? `/pkg-${ENG}` : "/pkg";
+      bw.mod = await import(`${PKG}/fastwan_web.js?v=${PKG_V}`); await bw.mod.default({ module_or_path: `${PKG}/fastwan_web_bg.wasm?v=${PKG_V}` });
+    }
+    const eng = bw.eng || await bw.mod.createEngine("fastwan", new URLSearchParams(location.search).get("kernels") || "", MOBILE);
+    log(`adapter: ${eng.adapter()} | ${eng.limits()}`);
+    log(`browser: ${navigator.userAgent}`);
+    try { const a = await navigator.gpu.requestAdapter(); const i = a?.info || {}; log(`gpu: vendor=${i.vendor || "?"} arch=${i.architecture || "?"} device=${i.device || "?"} desc=${i.description || "?"}`); } catch {}
+    log("running the CPU reference (the tab may freeze for a minute or two)…");
+    await new Promise((r) => setTimeout(r, 50));
+    const t0 = performance.now(), fails = [];
+    const bad = await wasmCall(eng.selfTest((ev) => {
+      const line = `${ev.ok ? "ok  " : "FAIL"} ${ev.name}  rel ${ev.rel.toExponential(2)}`;
+      if (!ev.ok) fails.push(line);
+      log(line);
+    }));
+    log(`\n${bad} failed (${((performance.now() - t0) / 1000).toFixed(0)} s)` + (fails.length ? ":\n" + fails.join("\n") : ""));
+  } catch (err) {
+    log("self-test error: " + (err?.message || err));
+  }
+  $("st-run").disabled = false;
+}
+
 // ---- boot -----------------------------------------------------------------------
 renderChips();
 $("examples").onclick = (e) => {
@@ -852,6 +885,8 @@ $("engine-url").value = ENGINE || location.origin;
 $("engine-go").onclick = () => { ENGINE = $("engine-url").value.replace(/\/+$/, ""); store("fastwan.engine", ENGINE); setEngine("wait", "Connecting…"); refreshInfo(); };
 $("modes").hidden = !CAN_BROWSER;
 $("modes").onclick = (e) => { const m = e.target.dataset?.mode; if (m && !job) setMode(m); };
+$("selftest").hidden = !new URLSearchParams(location.search).has("selftest");
+$("st-run").onclick = selfTest;
 $("bw-load").onclick = () => bwLoad().catch((err) => { crumb(false); bwStatus("bad", "Loading failed: " + err.message); $("bw-load").disabled = false; });
 setMode(MODE);
 showCrash();

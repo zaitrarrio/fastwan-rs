@@ -44,35 +44,129 @@ struct Pair<'a, B: Backend> {
     be: &'a B,
     tol: f32,
     out: Vec<CheckResult>,
+    /// Browser: keep GPU outputs on the device and compare them after an
+    /// async readback ([`ops_deferred`]); a blocking download is impossible there.
+    defer: bool,
+    pending: Vec<Pending<B>>,
+}
+
+/// A backend output not read yet.
+pub enum Got<B: Backend> {
+    Now(Vec<f32>),
+    Dev(B::Buf),
+}
+
+trait IntoGot<B: Backend> {
+    fn into_got(self) -> Got<B>;
+}
+impl<B: Backend> IntoGot<B> for Vec<f32> {
+    fn into_got(self) -> Got<B> {
+        Got::Now(self)
+    }
+}
+impl<B: Backend> IntoGot<B> for Got<B> {
+    fn into_got(self) -> Got<B> {
+        self
+    }
+}
+
+/// One check whose backend output is still on the device.
+pub struct Pending<B: Backend> {
+    pub name: String,
+    /// Read this back (e.g. `Wgpu::try_download_async`) and pass it to [`Pending::finish`].
+    pub buf: B::Buf,
+    want: Vec<f32>,
+    rgba: bool,
+}
+
+impl<B: Backend> Pending<B> {
+    /// Compare the read-back output (`f32` words; packed RGBA for pack checks).
+    pub fn finish(&self, got: &[f32], tol: f32) -> CheckResult {
+        let got = &got[..self.want.len().min(got.len())];
+        if self.rgba {
+            result_rgba8(self.name.clone(), got, &self.want)
+        } else {
+            result(self.name.clone(), got, &self.want, tol)
+        }
+    }
+}
+
+fn result(name: String, got: &[f32], want: &[f32], tol: f32) -> CheckResult {
+    let e = rel(got, want);
+    CheckResult {
+        name,
+        rel_err: e,
+        ok: e <= tol,
+    }
+}
+
+/// Packed RGBA words: ok when no byte differs by more than one 8-bit level.
+fn result_rgba8(name: String, got: &[f32], want: &[f32]) -> CheckResult {
+    let (g, w) = (rgba8_bytes(got), rgba8_bytes(want));
+    let max = g
+        .iter()
+        .zip(&w)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    let lv = |v: &[u8]| v.iter().map(|&b| b as f32).collect::<Vec<_>>();
+    CheckResult {
+        name,
+        rel_err: rel(&lv(&g), &lv(&w)),
+        ok: g.len() == w.len() && max <= 1,
+    }
+}
+
+/// Ops whose GPU outputs are left on the device: compare after reading back.
+pub struct Deferred<B: Backend> {
+    /// Checks that needed no readback (none today).
+    pub done: Vec<CheckResult>,
+    pub pending: Vec<Pending<B>>,
 }
 
 impl<'a, B: Backend> Pair<'a, B> {
+    /// The backend's copy of `b`: downloaded now, or left on the device.
+    fn dl(&self, b: B::Buf) -> Got<B> {
+        if self.defer {
+            Got::Dev(b)
+        } else {
+            Got::Now(self.be.download(&b))
+        }
+    }
+
     /// Packed RGBA words (`pack_rgba8`): ok when no byte differs by more than
     /// one 8-bit level (a ~1e-4 difference upstream may flip a rounding);
     /// the reported error is the relative error of the levels.
-    fn record_rgba8(&mut self, name: impl Into<String>, got: Vec<f32>, want: Vec<f32>) {
-        let (g, w) = (rgba8_bytes(&got), rgba8_bytes(&want));
-        let max = g
-            .iter()
-            .zip(&w)
-            .map(|(a, b)| a.abs_diff(*b))
-            .max()
-            .unwrap_or(0);
-        let lv = |v: &[u8]| v.iter().map(|&b| b as f32).collect::<Vec<_>>();
-        self.out.push(CheckResult {
-            name: name.into(),
-            rel_err: rel(&lv(&g), &lv(&w)),
-            ok: g.len() == w.len() && max <= 1,
-        });
+    fn record_rgba8(&mut self, name: impl Into<String>, got: impl IntoGot<B>, want: Vec<f32>) {
+        match got.into_got() {
+            Got::Now(g) => self.record_rgba8_now(name, g, want),
+            Got::Dev(buf) => self.pending.push(Pending {
+                name: name.into(),
+                buf,
+                want,
+                rgba: true,
+            }),
+        }
     }
 
-    fn record(&mut self, name: impl Into<String>, got: Vec<f32>, want: Vec<f32>) {
-        let e = rel(&got, &want);
-        self.out.push(CheckResult {
-            name: name.into(),
-            rel_err: e,
-            ok: e <= self.tol,
-        });
+    fn record_rgba8_now(&mut self, name: impl Into<String>, got: Vec<f32>, want: Vec<f32>) {
+        self.out.push(result_rgba8(name.into(), &got, &want));
+    }
+
+    fn record(&mut self, name: impl Into<String>, got: impl IntoGot<B>, want: Vec<f32>) {
+        match got.into_got() {
+            Got::Now(g) => self.record_now(name, g, want),
+            Got::Dev(buf) => self.pending.push(Pending {
+                name: name.into(),
+                buf,
+                want,
+                rgba: false,
+            }),
+        }
+    }
+
+    fn record_now(&mut self, name: impl Into<String>, got: Vec<f32>, want: Vec<f32>) {
+        self.out.push(result(name.into(), &got, &want, self.tol));
     }
 }
 
@@ -81,9 +175,12 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
         be,
         tol,
         out: Vec::new(),
+        defer: false,
+        pending: Vec::new(),
     };
     let mut rng = Rng::new(42);
     ops(&mut p, &mut rng);
+    vsa_real(&mut p, &mut rng);
     model(&mut p);
     upscaler(&mut p);
     causal(&mut p);
@@ -101,6 +198,75 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     p.out
 }
 
+/// The op checks with the backend's outputs left on the device, for the
+/// browser (Prompt Studio `?selftest=1`): read each `pending` buffer back
+/// asynchronously and call [`Pending::finish`]. The model-level checks need
+/// blocking readbacks and are not included; the clip itself is the browser's
+/// model-level check.
+pub fn ops_deferred<B: Backend>(be: &B, tol: f32) -> Deferred<B> {
+    let mut p = Pair {
+        be,
+        tol,
+        out: Vec::new(),
+        defer: true,
+        pending: Vec::new(),
+    };
+    let mut rng = Rng::new(42);
+    ops(&mut p, &mut rng);
+    vsa_real(&mut p, &mut rng);
+    pack(&mut p, &mut rng);
+    Deferred {
+        done: p.out,
+        pending: p.pending,
+    }
+}
+
+/// VSA at the token grids the browser runs (480×272×81 and 832×480×81 after
+/// the 2×2 patch), d = 128 like the model, few heads to keep the CPU
+/// reference cheap. The small cases in `ops` never exceed 256 key tiles.
+fn vsa_real<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
+    let (be, cpu) = (p.be, &Cpu);
+    for &(grid, heads) in &[((21, 17, 30), 2), ((21, 30, 52), 1)] {
+        let (d, sparsity) = (128, 0.8);
+        let spec = fastwan_core::vsa::VsaSpec::new(grid, heads, d, sparsity);
+        let s = spec.plan.seq;
+        let (q, k, v, g) = (
+            rng.normal(heads * s * d),
+            rng.normal(heads * s * d),
+            rng.normal(heads * s * d),
+            rng.normal(heads * s * d),
+        );
+        let (gq, gk, gv, gg, go) = (
+            be.upload(&q),
+            be.upload(&k),
+            be.upload(&v),
+            be.upload(&g),
+            be.alloc(s * heads * d),
+        );
+        let st = be.vsa_prepare(&spec);
+        be.vsa_attention(&gq, &gk, &gv, &gg, &st, &go);
+        let (cq, ck, cv, cg, co) = (
+            cpu.upload(&q),
+            cpu.upload(&k),
+            cpu.upload(&v),
+            cpu.upload(&g),
+            cpu.alloc(s * heads * d),
+        );
+        let cs = cpu.vsa_prepare(&spec);
+        cpu.vsa_attention(&cq, &ck, &cv, &cg, &cs, &co);
+        let want = cpu.download(&co);
+        p.record(
+            format!(
+                "vsa {grid:?} h{heads} d{d} topk {}/{} (model grid)",
+                spec.topk,
+                spec.plan.num_tiles()
+            ),
+            p.dl(go),
+            want,
+        );
+    }
+}
+
 fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
     let (be, cpu) = (p.be, &Cpu);
     // linear: odd M/N/K, row offsets, both activations.
@@ -116,7 +282,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         let x = rng.normal((m + 3) * k);
         let w = rng.uniform(n * k, 0.2);
         let b = rng.normal(n);
-        let run = |x0: &[f32]| -> (Vec<f32>, Vec<f32>) {
+        let run = |x0: &[f32]| -> (B::Buf, Vec<f32>) {
             let gx = be.upload(x0);
             let gw = be.weight(&w, n, k);
             let gb = be.upload(&b);
@@ -127,10 +293,10 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             let cb = cpu.upload(&b);
             let cy = cpu.alloc((m + 2) * n);
             cpu.linear(&cx, 3, m, &cw, Some(&cb), act, &cy, 2);
-            (be.download(&gy), cpu.download(&cy))
+            (gy, cpu.download(&cy))
         };
         let (g, c) = run(&x);
-        p.record(format!("linear {m}x{k}x{n} {act:?}"), g, c);
+        p.record(format!("linear {m}x{k}x{n} {act:?}"), p.dl(g), c);
         if k % 2 == 0 && m > 1 {
             // int8 weight-only: grouped when k is a multiple of 128, per row
             // otherwise; the CPU dequantizes, so this checks the kernels'
@@ -146,7 +312,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             cpu.linear(&cx, 3, m, &cpu.weight_q8(&q), Some(&cb), act, &cy, 2);
             p.record(
                 format!("linear int8/{} {m}x{k}x{n} {act:?}", q.group),
-                be.download(&gy),
+                p.dl(gy),
                 cpu.download(&cy),
             );
             // 4-bit: group 64 (per row when k is not a multiple), HQQ on the
@@ -158,7 +324,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             cpu.linear(&cx, 3, m, &cpu.weight_q4(&q), Some(&cb), act, &cy, 2);
             p.record(
                 format!("linear int4/{} {m}x{k}x{n} {act:?}", q.group),
-                be.download(&gy),
+                p.dl(gy),
                 cpu.download(&cy),
             );
         }
@@ -196,7 +362,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             1e-6,
             &co,
         );
-        let (g, c) = (be.download(&go), cpu.download(&co));
+        let (g, c) = (p.dl(go), cpu.download(&co));
         p.record("layer_norm mod", g, c);
     }
     for gated in [true, false] {
@@ -269,12 +435,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         } else {
             "residual_norm add+mod"
         };
-        let (g1, c1, g2, c2) = (
-            be.download(&gh),
-            cpu.download(&ch),
-            be.download(&go),
-            cpu.download(&co),
-        );
+        let (g1, c1, g2, c2) = (p.dl(gh), cpu.download(&ch), p.dl(go), cpu.download(&co));
         p.record(format!("{name} (h)"), g1, c1);
         p.record(format!("{name} (normed)"), g2, c2);
     }
@@ -283,7 +444,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         be.gate_residual(&gh, &ga, rows, dim, &gm, 5);
         let (ch, ca, cm) = (cpu.upload(&h), cpu.upload(&a), cpu.upload(&mods));
         cpu.gate_residual(&ch, &ca, rows, dim, &cm, 5);
-        let (g, c) = (be.download(&gh), cpu.download(&ch));
+        let (g, c) = (p.dl(gh), cpu.download(&ch));
         p.record("gate_residual", g, c);
     }
 
@@ -340,7 +501,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             1e-6,
             &xo,
         );
-        let (g, c) = (be.download(&go), cpu.download(&xo));
+        let (g, c) = (p.dl(go), cpu.download(&xo));
         p.record(name, g, c);
     }
 
@@ -370,7 +531,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             cpu.alloc(sq * heads * d),
         );
         cpu.attention(&cq, &ck, &cv, heads, sq, sk, d, &co);
-        let (g, c) = (be.download(&go), cpu.download(&co));
+        let (g, c) = (p.dl(go), cpu.download(&co));
         p.record(format!("attention h{heads} {sq}x{sk} d{d}"), g, c);
     }
 
@@ -406,7 +567,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         );
         let cs = cpu.vsa_prepare(&spec);
         cpu.vsa_attention(&cq, &ck, &cv, &cg, &cs, &co);
-        let (gout, cout) = (be.download(&go), cpu.download(&co));
+        let (gout, cout) = (p.dl(go), cpu.download(&co));
         p.record(
             format!(
                 "vsa {grid:?} h{heads} d{d} topk {}/{}",
@@ -426,12 +587,12 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         be.patchify(&gl, c, t, hh, ww, pp, &go);
         let (cl, co) = (cpu.upload(&lat), cpu.alloc(lat.len()));
         cpu.patchify(&cl, c, t, hh, ww, pp, &co);
-        let (g, cc) = (be.download(&go), cpu.download(&co));
+        let (g, cc) = (p.dl(go), cpu.download(&co));
         p.record("patchify", g, cc);
         let (gu, cu) = (be.alloc(lat.len()), cpu.alloc(lat.len()));
         be.unpatchify(&gl, c, t, hh, ww, pp, &gu);
         cpu.unpatchify(&cl, c, t, hh, ww, pp, &cu);
-        let (g, cc) = (be.download(&gu), cpu.download(&cu));
+        let (g, cc) = (p.dl(gu), cpu.download(&cu));
         p.record("unpatchify", g, cc);
     }
     {
@@ -443,7 +604,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         let (cx, cv, ce) = (cpu.upload(&x), cpu.upload(&v), cpu.upload(&e));
         cpu.dmd_step(&cx, &cv, Some(&ce), 0.757, 0.522, n);
         cpu.tanh_clamp(&cx, n, 3.0);
-        let (g, c) = (be.download(&gx), cpu.download(&cx));
+        let (g, c) = (p.dl(gx), cpu.download(&cx));
         p.record("dmd_step + tanh_clamp", g, c);
     }
 
@@ -575,7 +736,7 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         let has_b = s.cin_b > 0;
         be.conv2d(&ga, has_b.then_some(&gb), &s, &gw, Some(&gbias), gep, &go);
         cpu.conv2d(&ca, has_b.then_some(&cb), &s, &cw, Some(&cbias), cep, &co);
-        let (g, c) = (be.download(&go), cpu.download(&co));
+        let (g, c) = (p.dl(go), cpu.download(&co));
         p.record(
             format!(
                 "conv2d k{} cin {}+{} up={} ep={ep}",
@@ -700,7 +861,7 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
                 "pack_rgba8 p{} skip {} base {with_base} (≤1 level)",
                 s.p, s.skip
             ),
-            be.download(&go),
+            p.dl(go),
             cpu.download(&co),
         );
     }
