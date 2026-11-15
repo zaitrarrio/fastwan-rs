@@ -143,6 +143,27 @@ fn main() {
             rgb.len() / (480 * 272 * 3)
         );
         std::fs::write(out.join("tiny-f16.long.rgb"), &rgb).unwrap();
+        drop(roll);
+        // Clip mode at Prompt Studio's 5 s length (21 latent frames: VSA).
+        let pipe = Pipeline {
+            dit,
+            tae,
+            schedule: fastwan_core::DmdSchedule::fastwan_1_3b(),
+        };
+        let opt = Options {
+            geometry: Geometry {
+                width: 480,
+                height: 272,
+                frames: 81,
+            },
+            seed: 7,
+            ffn_chunk: usize::MAX,
+            tae_chunk: 2,
+            attention: None,
+        };
+        let (video, _) = pipe.generate(&cpu, &padded, &opt).unwrap();
+        std::fs::write(out.join("tiny-f16.clip81.rgb"), &video.rgb).unwrap();
+        println!("tiny-f16 clip: {} frames 480x272", video.frames);
     }
 
     // The tiny ×2 upscaler, and its CPU output on the f16 reference clip.
