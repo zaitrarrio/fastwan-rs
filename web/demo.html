@@ -215,6 +215,8 @@ const LONG_CACHE = 12, LONG_SINK = 3, FRAME_BUDGET = 700e6;
 // The public copy of the browser weights (R2 bucket fastwan-public, prefix v1/);
 // empty until it is published. ?weights=<base URL> points the page elsewhere.
 const PUBLIC_WEIGHTS = "https://weights.fastwan.dev/v1";
+// The in-browser engine's build hash; web/build.py stamps it into the site copy.
+const PKG_V = "dev";
 const WEIGHTS = (new URLSearchParams(location.search).get("weights") || PUBLIC_WEIGHTS).replace(/\/+$/, "");
 const CAN_BROWSER = !SAME && "gpu" in navigator;
 // Hosted page with WebGPU: run in the tab unless the visitor chose their engine.
@@ -618,7 +620,8 @@ async function bwLoad() {
   crumb(MOBILE ? "phone" : "this device", "loading the model");
   store("fastwan.variant", key);
   bwStatus("wait", "Starting WebGPU…");
-  if (!bw.mod) { bw.mod = await import("/pkg/fastwan_web.js"); await bw.mod.default(); }
+  // Versioned URLs: a cached engine from an older deploy must not meet a newer page.
+  if (!bw.mod) { bw.mod = await import(`/pkg/fastwan_web.js?v=${PKG_V}`); await bw.mod.default({ module_or_path: `/pkg/fastwan_web_bg.wasm?v=${PKG_V}` }); }
   if (bw.eng) { bw.eng.free(); bw.eng = null; bw.loaded = null; }
   // ?kernels=LINEAR,FLASH picks the WebGPU kernels (A/B runs); empty = defaults.
   bw.eng = await bw.mod.createEngine(bw.manifest.model, new URLSearchParams(location.search).get("kernels") || "", MOBILE); bw.upScale = 0; bw.upAttached = false;

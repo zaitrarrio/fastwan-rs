@@ -36,7 +36,16 @@ shutil.copy(root.parent / "docs/runs/2026-11-03-vast-4090/fox-832x480.mp4", site
 # The in-browser engine (scripts/build-web.sh), served at /pkg/.
 if (root / "pkg/fastwan_web_bg.wasm").exists():
     shutil.copytree(root / "pkg", site / "pkg")
+    # Stamp the engine's hash into the page's /pkg/ URLs so a browser never
+    # pairs a new page with a cached old engine ("setAttention is not a function").
+    import hashlib
+    h = hashlib.sha256((root / "pkg/fastwan_web_bg.wasm").read_bytes() + (root / "pkg/fastwan_web.js").read_bytes()).hexdigest()[:12]
+    demo = site / "demo/index.html"
+    text = demo.read_text()
+    assert 'const PKG_V = "dev";' in text, "demo.html lost its PKG_V line"
+    demo.write_text(text.replace('const PKG_V = "dev";', f'const PKG_V = "{h}";'))
 else:
     print("note: web/pkg missing; run scripts/build-web.sh for the in-browser mode")
-(site / "_headers").write_text("/*\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: strict-origin-when-cross-origin\n")
+(site / "_headers").write_text("/*\n  X-Content-Type-Options: nosniff\n  Referrer-Policy: strict-origin-when-cross-origin\n"
+                                "/pkg/*\n  Cache-Control: no-cache\n/demo/*\n  Cache-Control: no-cache\n")
 print("wrote", site)
