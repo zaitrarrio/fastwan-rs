@@ -53,6 +53,8 @@ mod web {
         kept_dims: std::cell::Cell<(u32, u32)>,
         /// Lower-memory settings for phones (see `create_engine`).
         mobile: bool,
+        /// Set by `stop()`: a long video ends after the block in progress.
+        stop: std::cell::Cell<bool>,
     }
 
     #[wasm_bindgen]
@@ -103,6 +105,7 @@ mod web {
                 kept: RefCell::new(Vec::new()),
                 kept_dims: std::cell::Cell::new((0, 0)),
                 mobile,
+                stop: std::cell::Cell::new(false),
             }),
         })
     }
@@ -332,6 +335,177 @@ mod web {
                 .map(|()| JsValue::UNDEFINED)
             })
         }
+
+        /// A long video from a causal (Self-Forcing) checkpoint, streamed
+        /// block by block: events `prepared`, then per block `block`
+        /// `{index, total, ms, denoise_ms}` and `frames` (as in `generate`).
+        /// `cache_frames` / `sink_frames` are latent frames (12 / 3).
+        #[wasm_bindgen(js_name = generateLong)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn generate_long(
+            &self,
+            embeds: Vec<u8>,
+            width: usize,
+            height: usize,
+            frames: usize,
+            seed: f64,
+            cache_frames: usize,
+            sink_frames: usize,
+            on_event: Function,
+        ) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            wasm_bindgen_futures::future_to_promise(async move {
+                run_long(
+                    &inner,
+                    embeds,
+                    Geometry {
+                        width,
+                        height,
+                        frames,
+                    },
+                    seed as u64,
+                    cache_frames,
+                    sink_frames,
+                    &on_event,
+                )
+                .await
+                .map(|()| JsValue::UNDEFINED)
+            })
+        }
+
+        /// End a long video after the block in progress.
+        pub fn stop(&self) {
+            self.inner.stop.set(true);
+        }
+    }
+
+    /// `prompt_embeds` from a gallery file, zero-padded to `[text_len, text_dim]`.
+    fn read_embeds(cfg: &WanConfig, embeds: Vec<u8>) -> Result<Vec<f32>, JsValue> {
+        let src = SafetensorsDir::from_bytes(embeds).map_err(err)?;
+        let name = src
+            .names()
+            .find(|n| n.contains("embed"))
+            .map(str::to_string)
+            .ok_or_else(|| err("no prompt_embeds tensor"))?;
+        let (_, shape, _) = src.raw(&name).map_err(err)?;
+        let mut e = src.get(&name, &shape).map_err(err)?;
+        if e.len() % cfg.text_dim != 0 || e.len() > cfg.text_len * cfg.text_dim {
+            return Err(err(format!(
+                "prompt_embeds {shape:?} is not [L, {}]",
+                cfg.text_dim
+            )));
+        }
+        e.resize(cfg.text_len * cfg.text_dim, 0.0);
+        Ok(e)
+    }
+
+    /// A long video from a causal (Self-Forcing) checkpoint: blocks of three
+    /// latent frames over a rolling K/V cache, each block decoded and sent as
+    /// soon as it is denoised. Stops early on `stop()`.
+    async fn run_long(
+        inner: &Inner,
+        embeds: Vec<u8>,
+        g: Geometry,
+        seed: u64,
+        cache_frames: usize,
+        sink_frames: usize,
+        on: &Function,
+    ) -> Result<(), JsValue> {
+        use fastwan_model::causal::{CausalConfig, CausalRollout, frame_major};
+        let emit = |o: Object| {
+            let _ = on.call1(&JsValue::NULL, &o);
+        };
+        let (be, cfg) = (&inner.be, &inner.cfg);
+        let dit = inner.dit.borrow();
+        let dit = dit.as_ref().ok_or_else(|| err("the model is not loaded"))?;
+        let tae = inner.tae.borrow();
+        let tae = tae
+            .as_ref()
+            .ok_or_else(|| err("the decoder is not loaded"))?;
+        g.validate(cfg).map_err(err)?;
+        let e = read_embeds(cfg, embeds)?;
+        let mut ccfg = CausalConfig::self_forcing();
+        ccfg.cache_frames(cache_frames, sink_frames);
+        let bf = ccfg.block_frames;
+        // One block's activations: plan a clip of one block's length.
+        let block = Geometry {
+            frames: (bf - 1) * 4 + 1,
+            ..g
+        };
+        let p = plan(
+            cfg,
+            &inner.tcfg,
+            &block,
+            &Device {
+                budget_bytes: u64::MAX,
+                max_binding_bytes: be.max_binding(),
+                weight_bytes: 2,
+                act_bytes: 4,
+            },
+        );
+        let (lt, lh, lw) = g.latent();
+        let tpf = (lh / cfg.patch) * (lw / cfg.patch);
+        let cache_layer = (cache_frames * tpf * cfg.dim() * 4) as u64;
+        let largest = p.largest_binding.max(cache_layer);
+        if largest > be.max_binding() {
+            return Err(err(format!(
+                "{}×{} needs a {} MiB GPU buffer; this browser's GPU allows {} ({}). Pick a smaller size.",
+                g.width,
+                g.height,
+                largest >> 20,
+                be.max_binding() >> 20,
+                be.limits_text()
+            )));
+        }
+        let ffn_chunk = if inner.mobile {
+            p.ffn_chunk.min(1024)
+        } else {
+            p.ffn_chunk
+        };
+        inner.stop.set(false);
+        let prompt = dit.prepare_prompt(be, &e);
+        let mut roll = CausalRollout::new(be, dit, ccfg, (lh, lw), ffn_chunk, seed).map_err(err)?;
+        let fence = be.alloc(1);
+        be.try_download_async(&fence).await.map_err(err)?;
+        emit(Object::new().tap(|o| set(o, "type", "prepared")));
+        let blocks = lt.div_ceil(bf);
+        let c = tae.cfg.latent_channels;
+        let mut st = tae.state();
+        let mut done = 0usize;
+        for b in 0..blocks {
+            if inner.stop.get() {
+                break;
+            }
+            let t0 = now_ms();
+            let x = roll.next_block(be, &prompt).map_err(err)?;
+            let latent = be.try_download_async(x).await.map_err(err)?;
+            let denoise_ms = now_ms() - t0;
+            let z = frame_major(&latent, c, bf, lh * lw);
+            let ck = tae.launch_chunk(be, &mut st, &z, bf, lh, lw);
+            let packed = ck.pack(be);
+            let raw = be
+                .try_download_async(&packed)
+                .await
+                .map_err(|e| err(format!("decode failed: {e} ({})", be.limits_text())))?;
+            let (count, h, w, rgba) = ck.rgba8(&raw);
+            let o = Object::new();
+            set(&o, "type", "block");
+            set(&o, "index", b as u32);
+            set(&o, "total", blocks as u32);
+            set(&o, "ms", now_ms() - t0);
+            set(&o, "denoise_ms", denoise_ms);
+            emit(o);
+            let o = Object::new();
+            set(&o, "type", "frames");
+            set(&o, "first", done as u32);
+            set(&o, "count", count as u32);
+            set(&o, "width", w as u32);
+            set(&o, "height", h as u32);
+            set(&o, "rgba", Uint8Array::from(&rgba[..]));
+            emit(o);
+            done += count;
+        }
+        Ok(())
     }
 
     async fn run(
@@ -353,22 +527,7 @@ mod web {
             .ok_or_else(|| err("the decoder is not loaded"))?;
         g.validate(cfg).map_err(err)?;
 
-        // Prompt embeddings: [L ≤ text_len, text_dim], zero-padded.
-        let src = SafetensorsDir::from_bytes(embeds).map_err(err)?;
-        let name = src
-            .names()
-            .find(|n| n.contains("embed"))
-            .map(str::to_string)
-            .ok_or_else(|| err("no prompt_embeds tensor"))?;
-        let (_, shape, _) = src.raw(&name).map_err(err)?;
-        let mut e = src.get(&name, &shape).map_err(err)?;
-        if e.len() % cfg.text_dim != 0 || e.len() > cfg.text_len * cfg.text_dim {
-            return Err(err(format!(
-                "prompt_embeds {shape:?} is not [L, {}]",
-                cfg.text_dim
-            )));
-        }
-        e.resize(cfg.text_len * cfg.text_dim, 0.0);
+        let e = read_embeds(cfg, embeds)?;
 
         let p = plan(
             cfg,

@@ -3,7 +3,10 @@
 //! writes the synthetic tiny DiT block-ordered as `tiny-f16.safetensors` and
 //! `tiny-f4.safetensors` (the formats Prompt Studio streams), the tiny TAEHV,
 //! one prompt-embeddings file, and the CPU reference clip for each DiT file
-//! (`tiny-<fmt>.ref.rgb`, 8-bit RGB frames) at 128×64×17, seed 7.
+//! (`tiny-<fmt>.ref.rgb`, 8-bit RGB frames) at 128×64×17, seed 7, and the
+//! long-video (causal) reference of `tiny-f16` at 480×272×165, seed 7, cache 12
+//! with a 3-frame sink (`tiny-f16.long.rgb`, what Prompt Studio's 10 s option
+//! makes).
 use fastwan_core::{
     Geometry,
     config::{TaeConfig, WanConfig},
@@ -105,6 +108,39 @@ fn main() {
         );
     }
     std::fs::remove_file(&src_path).ok();
+
+    // The causal rollout, block by block with the streaming decoder.
+    {
+        use fastwan_core::Backend;
+        use fastwan_model::causal::{CausalConfig, CausalRollout, frame_major};
+        let cpu = Cpu;
+        let file = SafetensorsDir::open(&out.join("tiny-f16.safetensors")).unwrap();
+        let dit = WanDit::load_with(&cpu, cfg.clone(), &file, WeightQuant::Native).unwrap();
+        let tae = TaeHv::load(&cpu, tcfg.clone(), &tsrc).unwrap();
+        let g = Geometry {
+            width: 480,
+            height: 272,
+            frames: 165,
+        };
+        let (lt, lh, lw) = g.latent();
+        let mut ccfg = CausalConfig::self_forcing();
+        ccfg.cache_frames(12, 3);
+        let bf = ccfg.block_frames;
+        let prompt = dit.prepare_prompt(&cpu, &padded);
+        let mut roll = CausalRollout::new(&cpu, &dit, ccfg, (lh, lw), usize::MAX, 7).unwrap();
+        let mut st = tae.state();
+        let mut rgb = Vec::new();
+        for _ in 0..lt.div_ceil(bf) {
+            let latent = cpu.download(roll.next_block(&cpu, &prompt).unwrap());
+            let z = frame_major(&latent, tcfg.latent_channels, bf, lh * lw);
+            let ck = tae.launch_chunk(&cpu, &mut st, &z, bf, lh, lw);
+            let raw = cpu.download_rgba8(&ck.pack(&cpu));
+            let (n, h, w) = ck.dims();
+            rgb.extend(fastwan_core::backend::rgba_to_rgb(&raw[..n * h * w * 4]));
+        }
+        println!("tiny-f16 long: {} frames 480x272", rgb.len() / (480 * 272 * 3));
+        std::fs::write(out.join("tiny-f16.long.rgb"), &rgb).unwrap();
+    }
 
     // The tiny ×2 upscaler, and its CPU output on the f16 reference clip.
     use fastwan_model::upscale::{UpConfig, Upscaler, up_manifest};

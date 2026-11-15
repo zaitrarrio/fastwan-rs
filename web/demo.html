@@ -201,6 +201,13 @@ const EXAMPLES = [
 ];
 const SIZES = [[832, 480, "832×480 · landscape"], [480, 832, "480×832 · portrait"], [640, 352, "640×352"], [480, 272, "480×272 · fastest"]];
 const LENGTHS = [[81, "5 s · 81 frames"], [49, "3 s · 49 frames"], [33, "2 s · 33 frames"], [17, "1 s · 17 frames"]];
+// Long videos (a causal "Self-Forcing" variant): generated and shown block by
+// block (12 frames each). The K/V cache (12 latent frames, f32) is ~2.3 GB at
+// 480×272 and grows with the frame size, so only the two smaller sizes; the
+// decoded frames stay in the tab, so the length is capped at ~700 MB of them.
+const LONG_SIZES = [[480, 272, "480×272"], [640, 352, "640×352"]];
+const LONG_LENGTHS = [[165, "10 s"], [321, "20 s"], [477, "30 s"], [969, "60 s"]]; // 9 + 12k: whole blocks
+const LONG_CACHE = 12, LONG_SINK = 3, FRAME_BUDGET = 700e6;
 
 // In-browser mode: the WebGPU engine compiled to wasm (/pkg/), weights
 // streamed from a public bucket block by block (HTTP ranges) and cached.
@@ -276,8 +283,13 @@ function applyGallery(list) {
 function setEngine(kind, text) { $("eng-dot").className = "dot " + kind; $("eng-text").textContent = text; }
 function fillOptions() {
   const keep = [$("size").value, $("length").value];
-  $("size").innerHTML = SIZES.filter(([w, h]) => w * h <= info.max_pixels).map(([w, h, l]) => `<option value="${w}x${h}">${l}</option>`).join("");
-  $("length").innerHTML = LENGTHS.filter(([f]) => f <= info.max_frames).map(([f, l]) => `<option value="${f}">${l}</option>`).join("");
+  $("size").innerHTML = (info.long ? LONG_SIZES : SIZES).filter(([w, h]) => w * h <= info.max_pixels).map(([w, h, l]) => `<option value="${w}x${h}">${l}</option>`).join("");
+  if (keep[0]) $("size").value = keep[0];
+  if (!$("size").value) $("size").selectedIndex = 0;
+  const [sw, sh] = $("size").value.split("x").map(Number);
+  $("length").innerHTML = info.long
+    ? LONG_LENGTHS.filter(([f]) => f * sw * sh * 4 <= FRAME_BUDGET).map(([f, l]) => `<option value="${f}">${l} · ${f} frames</option>`).join("")
+    : LENGTHS.filter(([f]) => f <= info.max_frames).map(([f, l]) => `<option value="${f}">${l}</option>`).join("");
   if (keep[0]) $("size").value = keep[0];
   if (keep[1]) $("length").value = keep[1];
   if (!$("size").value) $("size").selectedIndex = 0;
@@ -286,7 +298,19 @@ function fillOptions() {
 
 // ---- stages -----------------------------------------------------------------
 const STAGES = [["encoding", "Prompt"], ["step0", "Step 1"], ["step1", "Step 2"], ["step2", "Step 3"], ["decoding", "Decode"]];
+function renderLongStages(s) {
+  const fmt = (x) => x.toFixed(x < 10 ? 2 : 1) + " s", st = s.stage, n = s.blocks.length;
+  const gen = n ? s.blocks.reduce((a, b) => a + b, 0) : 0;
+  const cells = [
+    ["Prompt", st === "encoding" ? "active" : "done", st === "encoding" ? "loading…" : `${s.tokens} tok`],
+    ["Blocks", st === "generating" ? "active" : n ? "done" : "", `${n} / ${s.total_blocks || "…"}`],
+    ["First frames", s.first_s ? "done" : st === "generating" ? "active" : "", s.first_s ? fmt(s.first_s) : "–"],
+    ["Speed", n ? "done" : "", n ? `${(s.frames / gen).toFixed(1)} fps · ${(1000 * gen / n).toFixed(0)} ms/block` : "–"],
+  ];
+  $("stages").innerHTML = cells.map(([l, c, d]) => `<div class="stage ${c}"><b>${l}</b><span>${st === "failed" && c === "active" ? "failed" : d}</span></div>`).join("");
+}
 function renderStages(s) {
+  if (s?.long) return renderLongStages(s);
   const st = s ? s.stage : null, steps = s ? s.steps : [];
   const fmt = (x) => x.toFixed(x < 10 ? 2 : 1) + " s";
   const stages = s?.upscale ? [...STAGES, ["upscaling", "Upscale ×" + s.upscale]] : STAGES;
@@ -318,6 +342,7 @@ function renderStages(s) {
 // ---- generation -----------------------------------------------------------------
 async function generate(e) {
   e?.preventDefault();
+  if (job?.long) { try { bw.eng?.stop(); } catch {} $("go").disabled = true; $("go").textContent = "Stopping…"; return; }
   if (!info?.ready || job) return;
   $("err").hidden = true;
   const [width, height] = $("size").value.split("x").map(Number);
@@ -336,7 +361,7 @@ async function generate(e) {
     showError(err.message); resetButton();
   }
 }
-function resetButton() { job = null; $("go").textContent = "Generate clip"; $("go").disabled = !info?.ready; }
+function resetButton() { job = null; $("go").textContent = info?.long ? "Generate video" : "Generate clip"; $("go").disabled = !info?.ready; }
 function showError(m) { $("err").textContent = m; $("err").hidden = false; }
 
 function startClip(id, w, h, total) {
@@ -388,6 +413,10 @@ async function pollJob() {
 }
 
 function finishClip(s) {
+  if (s.long) {
+    $("summary").textContent = `${s.frames} frames (${(s.frames / FPS).toFixed(1)} s) · ${s.width}×${s.height} · seed ${s.seed} · ${s.blocks.length} blocks · first frames ${s.first_s.toFixed(1)} s · total ${s.total_s.toFixed(1)} s${s.stopped ? " · stopped" : ""}`;
+    addHistory(s); return;
+  }
   const steps = s.steps.reduce((a, b) => a + b, 0);
   $("summary").textContent = `${s.frames} frames · ${s.width}×${s.height} · seed ${s.seed} · prompt ${s.encode_s.toFixed(1)} s · denoise ${steps.toFixed(1)} s · decode ${s.decode_s.toFixed(1)} s${s.upscale ? ` · ×${s.upscale} to ${s.width * s.upscale}×${s.height * s.upscale} ${s.up_s.toFixed(1)} s` : ""} · total ${s.total_s.toFixed(1)} s`;
   addHistory(s);
@@ -411,7 +440,7 @@ function draw() {
 function tick(t) {
   if (playing && clip.frames.length && t - lastTick >= 1000 / FPS) {
     lastTick = t;
-    frame = frame + 1 < clip.frames.length ? frame + 1 : (recording ? frame : 0);
+    frame = frame + 1 < clip.frames.length ? frame + 1 : (recording || clip.streaming ? frame : 0);
     draw();
   }
   requestAnimationFrame(tick);
@@ -482,7 +511,7 @@ async function reopen(s) {
   if (job) return;
   if (bw.clips.has(s.id)) {
     const c = bw.clips.get(s.id);
-    startClip(s.id, c.s.width, c.s.height, c.s.total_frames);
+    startClip(s.id, c.s.width, c.s.height, c.s.long ? c.s.frames : c.s.total_frames);
     clip.frames = c.frames.slice(); $("empty").hidden = true; updateControls();
     $("prompt").value = c.s.prompt; $("seed").value = c.s.seed; markChip();
     renderStages(c.s); finishClip(c.s); document.querySelector(`.clip[data-id="${s.id}"]`)?.remove(); addHistory(c.s);
@@ -493,6 +522,7 @@ async function reopen(s) {
     }
     return;
   }
+  if (MODE === "browser") { showError(s.long ? "Only the latest long video is kept in memory." : "That clip is no longer in memory."); return; }
   const r = await fetch(api(`/api/jobs/${s.id}`), { cache: "no-store" });
   if (!r.ok) { showError("The engine no longer holds that clip (it keeps the last eight)."); return; }
   const cur = await r.json();
@@ -516,7 +546,7 @@ function bwStatus(kind, text) { $("bw-status").textContent = text; if (MODE === 
 function mb(n) { return n >= 1e9 ? (n / 1e9).toFixed(2) + " GB" : (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + " MB"; }
 async function showBrowserInfo() {
   if (bw.loaded) {
-    info = { ready: true, model: bw.loaded, backend: bw.eng.adapter(), gallery: bw.entries.map((e) => e.prompt), max_pixels: MOBILE ? 480 * 272 : 832 * 480, max_frames: MOBILE ? 33 : 81, synthetic: bw.manifest.model === "tiny" };
+    info = { ready: true, model: bw.loaded, backend: bw.eng.adapter(), gallery: bw.entries.map((e) => e.prompt), max_pixels: MOBILE ? 480 * 272 : 832 * 480, max_frames: MOBILE ? 33 : 81, synthetic: bw.manifest.model === "tiny", long: !!bw.long };
     setEngine("ok", `${info.model} · ${info.backend}`);
     $("synthetic").hidden = true;
     applyGallery(info.gallery); fillOptions(); $("go").disabled = !!job;
@@ -528,7 +558,7 @@ async function showBrowserInfo() {
   if (!bw.manifest) {
     try { bw.manifest = await (await fetch(`${WEIGHTS}/manifest.json`, { cache: "no-store" })).json(); }
     catch { bwStatus("bad", `Cannot reach the weights at ${WEIGHTS}.`); return; }
-    $("bw-variant").innerHTML = Object.entries(bw.manifest.variants).filter(([k]) => !MOBILE || k === "f4").map(([k, v]) => `<option value="${k}">${escHtml(v.label)} · ${mb(v.bytes)}</option>`).join("");
+    $("bw-variant").innerHTML = Object.entries(bw.manifest.variants).filter(([k, v]) => !MOBILE || (k === "f4" && !v.causal)).map(([k, v]) => `<option value="${k}">${escHtml(v.label)} · ${mb(v.bytes)}</option>`).join("");
     const pref = store("fastwan.variant"); if (pref && bw.manifest.variants[pref]) $("bw-variant").value = pref;
     if (bw.manifest.upscaler && !MOBILE) {
       $("bw-up-row").hidden = false; $("bw-up").checked = store("fastwan.upscale") === "1";
@@ -584,7 +614,7 @@ function groupBlob(g, bytes) {
 async function bwLoad() {
   $("bw-load").disabled = true;
   const key = $("bw-variant").value, v = bw.manifest.variants[key];
-  bw.variant = v.label;
+  bw.variant = v.label; bw.long = false;
   crumb(MOBILE ? "phone" : "this device", "loading the model");
   store("fastwan.variant", key);
   bwStatus("wait", "Starting WebGPU…");
@@ -620,13 +650,17 @@ async function bwLoad() {
   const gurl = `${WEIGHTS}/${bw.manifest.gallery}`;
   bw.entries = (await (await fetch(gurl, { cache: "no-store" })).json()).prompts;
   bw.galleryBase = gurl.slice(0, gurl.lastIndexOf("/") + 1);
-  bw.loaded = `${bw.manifest.name || "FastWan2.1-T2V-1.3B"} · ${v.label} · in this browser`;
+  bw.long = !!v.causal;
+  bw.loaded = `${v.name || bw.manifest.name || "FastWan2.1-T2V-1.3B"} · ${v.label} · in this browser`;
+  $("go").textContent = bw.long ? "Generate video" : "Generate clip";
+  $("bw-up-row").hidden = bw.long || !bw.manifest.upscaler || MOBILE;
   console.info("fastwan: WebGPU", bw.eng.adapter(), "|", bw.eng.limits());
   $("bw-load").disabled = false; $("bw-load").textContent = "Reload";
   bwStatus("ok", `Model ready in ${((performance.now() - t0) / 1000).toFixed(1)} s.`);
   crumb(false);
   showBrowserInfo();
   if ($("size").querySelector('option[value="480x272"]')) $("size").value = "480x272";
+  fillOptions();
 }
 // The upscaler loads on first use (it is small).
 // Upscaled frames never leave the GPU: each batch is kept there and drawn
@@ -707,10 +741,46 @@ function showCrash() {
   $("bw-crash").textContent = `The last run here (${c.what}${c.variant ? ", " + c.variant : ""}) stopped during ${c.where} and the page was reset: the browser most likely ran out of memory. ${tip}`;
   $("bw-crash").hidden = false;
 }
+// Long video: blocks stream in and play as they arrive; the button stops it.
+async function browserGenerateLong(width, height, frames, entry, seed) {
+  const prompt = entry.prompt, id = Date.now();
+  job = { id, prompt, seed, long: true };
+  $("go").disabled = false; $("go").textContent = "Stop";
+  startClip(id, width, height, frames); clip.streaming = true;
+  const s = { id, prompt, seed, long: true, stage: "encoding", blocks: [], frames: 0, total_frames: frames, width, height, tokens: entry.tokens, first_s: 0, total_s: 0 };
+  renderStages(s);
+  const t0 = performance.now();
+  crumb(`long video, ${width}×${height}, ${frames} frames`, "starting");
+  try {
+    const eurl = bw.galleryBase + entry.file;
+    const emb = await cached(eurl, () => fetchBytes(eurl, null));
+    await wasmCall(bw.eng.generateLong(emb, width, height, frames, seed, LONG_CACHE, LONG_SINK, (ev) => {
+      if (ev.type === "prepared") { s.stage = "generating"; crumb(null, "block 1"); }
+      else if (ev.type === "block") { s.blocks.push(ev.ms / 1000); s.total_blocks = ev.total; crumb(null, `block ${ev.index + 2}`); }
+      else if (ev.type === "frames") { pushFrames(ev); s.frames += ev.count; if (!s.first_s) s.first_s = (performance.now() - t0) / 1000; }
+      renderStages(s);
+    }));
+    s.stopped = s.frames < frames;
+    clip.total = s.frames;
+    s.total_s = (performance.now() - t0) / 1000; s.stage = "done";
+    clip.streaming = false; renderStages(s); updateControls();
+    // Long videos are hundreds of MB of frames: keep only the latest one.
+    for (const [k, c] of bw.clips) if (c.s.long) bw.clips.delete(k);
+    bw.clips.set(id, { s, frames: clip.frames.slice() });
+    finishClip(s);
+    crumb(false);
+  } catch (err) {
+    crumb(false); clip.streaming = false;
+    s.stage = "failed"; renderStages(s);
+    showError("Generation failed: " + (err?.message || err));
+  }
+  resetButton();
+}
 async function browserGenerate(width, height, frames) {
   const prompt = $("prompt").value, entry = bw.entries.find((e) => norm(e.prompt) === norm(prompt));
   if (!entry) { showError("Pick one of the gallery prompts: the browser engine has no text encoder."); return; }
   const seed = $("seed").value !== "" ? Math.max(0, Math.floor(+$("seed").value)) : Math.floor(Math.random() * 1e9);
+  if (bw.long) return browserGenerateLong(width, height, frames, entry, seed);
   const id = Date.now();
   job = { id, prompt, seed };
   $("go").disabled = true; $("go").textContent = "Generating…";
@@ -759,6 +829,7 @@ $("examples").onclick = (e) => {
 };
 $("dice").onclick = () => { $("seed").value = Math.floor(Math.random() * 1e9); };
 $("form").addEventListener("submit", generate);
+$("size").addEventListener("change", () => { if (info?.long) fillOptions(); });
 $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) generate(e); });
 $("start-cmd").textContent = START;
 $("engine-url").value = ENGINE || location.origin;
