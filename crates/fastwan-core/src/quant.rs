@@ -220,62 +220,74 @@ impl Q4 {
         let mut sz = vec![(0.0f32, 0.0f32); n];
         // Groups are independent: split them across threads (HQQ is ~50 flops
         // per weight per iteration; single-threaded it adds minutes to a load).
-        let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+        // wasm has no threads: `available_parallelism` errs there and a
+        // spawn panics, so one chunk runs inline.
+        let threads = if cfg!(target_arch = "wasm32") {
+            1
+        } else {
+            std::thread::available_parallelism().map_or(1, |t| t.get())
+        };
         let per = n.div_ceil(threads).max(1);
-        std::thread::scope(|sc| {
-            for ((w, qc), szc) in data
-                .chunks(per * group)
-                .zip(q.chunks_mut(per * group))
-                .zip(sz.chunks_mut(per))
-            {
-                sc.spawn(move || {
-                    for ((w, qg), sz) in w.chunks(group).zip(qc.chunks_mut(group)).zip(szc) {
-                        let (lo, hi) = w
-                            .iter()
-                            .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
-                        // HQQ's convention: inverse scale `is`, codes = round(w·is + z).
-                        let is = if hi > lo { 15.0 / (hi - lo) } else { 1.0 };
-                        let mut z = -lo * is;
-                        let code = |v: f32, z: f32| (v * is + z).round().clamp(0.0, 15.0);
-                        if hqq {
-                            let (p, mut beta, kappa) = (0.7f32, 10.0f32, 1.01f32);
-                            let (mut best, mut best_z) = (f32::MAX, z);
-                            for _ in 0..20 {
-                                let mut err = 0.0;
-                                let mut zsum = 0.0;
-                                for &v in w {
-                                    let c = code(v, z);
-                                    let r = (c - z) / is;
-                                    let e = v - r;
-                                    err += e.abs();
-                                    // shrink: sign(e)·relu(|e| − |e|^(p−1) / β)
-                                    let a = e.abs();
-                                    let sh = if a > 0.0 {
-                                        e.signum() * (a - a.powf(p - 1.0) / beta).max(0.0)
-                                    } else {
-                                        0.0
-                                    };
-                                    zsum += c - (v - sh) * is;
-                                }
-                                let err = err / w.len() as f32;
-                                if err >= best {
-                                    break;
-                                }
-                                (best, best_z) = (err, z);
-                                z = zsum / w.len() as f32;
-                                beta *= kappa;
-                            }
-                            z = best_z;
+        let work = |w: &[f32], qc: &mut [u8], szc: &mut [(f32, f32)]| {
+            for ((w, qg), sz) in w.chunks(group).zip(qc.chunks_mut(group)).zip(szc) {
+                let (lo, hi) = w
+                    .iter()
+                    .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                // HQQ's convention: inverse scale `is`, codes = round(w·is + z).
+                let is = if hi > lo { 15.0 / (hi - lo) } else { 1.0 };
+                let mut z = -lo * is;
+                let code = |v: f32, z: f32| (v * is + z).round().clamp(0.0, 15.0);
+                if hqq {
+                    let (p, mut beta, kappa) = (0.7f32, 10.0f32, 1.01f32);
+                    let (mut best, mut best_z) = (f32::MAX, z);
+                    for _ in 0..20 {
+                        let mut err = 0.0;
+                        let mut zsum = 0.0;
+                        for &v in w {
+                            let c = code(v, z);
+                            let r = (c - z) / is;
+                            let e = v - r;
+                            err += e.abs();
+                            // shrink: sign(e)·relu(|e| − |e|^(p−1) / β)
+                            let a = e.abs();
+                            let sh = if a > 0.0 {
+                                e.signum() * (a - a.powf(p - 1.0) / beta).max(0.0)
+                            } else {
+                                0.0
+                            };
+                            zsum += c - (v - sh) * is;
                         }
-                        for (d, &v) in qg.iter_mut().zip(w) {
-                            *d = code(v, z) as u8;
+                        let err = err / w.len() as f32;
+                        if err >= best {
+                            break;
                         }
-                        let f = |v: f32| half::f16::from_f32(v).to_f32();
-                        *sz = (f(1.0 / is), f(z));
+                        (best, best_z) = (err, z);
+                        z = zsum / w.len() as f32;
+                        beta *= kappa;
                     }
-                });
+                    z = best_z;
+                }
+                for (d, &v) in qg.iter_mut().zip(w) {
+                    *d = code(v, z) as u8;
+                }
+                let f = |v: f32| half::f16::from_f32(v).to_f32();
+                *sz = (f(1.0 / is), f(z));
             }
-        });
+        };
+        if threads <= 1 {
+            work(data, &mut q, &mut sz);
+        } else {
+            let work = &work;
+            std::thread::scope(|sc| {
+                for ((w, qc), szc) in data
+                    .chunks(per * group)
+                    .zip(q.chunks_mut(per * group))
+                    .zip(sz.chunks_mut(per))
+                {
+                    sc.spawn(move || work(w, qc, szc));
+                }
+            });
+        }
         let (scales, zeros) = sz.into_iter().unzip();
         Self {
             q,
