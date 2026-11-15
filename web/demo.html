@@ -146,7 +146,7 @@ code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 
         <button type="button" class="ghost" id="dice" style="flex:0 0 auto">New seed</button>
       </div>
       <button type="submit" class="primary" id="go" disabled>Generate clip</button>
-      <p class="hint">3 denoising steps, 16 fps. Ctrl/⌘ + Enter generates. <span id="where-engine">Clips stay on your machine: the engine runs on your GPU, and this page only talks to it.</span><span id="where-browser" hidden>Clips stay on your machine: the model runs on your GPU inside this tab.</span></p>
+      <p class="hint"><span id="steps-hint">3 denoising steps, 16 fps.</span> Ctrl/⌘ + Enter generates. <span id="where-engine">Clips stay on your machine: the engine runs on your GPU, and this page only talks to it.</span><span id="where-browser" hidden>Clips stay on your machine: the model runs on your GPU inside this tab.</span></p>
       <p class="msg bad" id="err" hidden></p>
       <p class="msg note" id="synthetic" hidden>The engine is running the tiny synthetic model (<code>--synthetic</code>), so clips are coloured noise. Start it with <code>--model-dir</code> for real video.</p>
     </form>
@@ -653,6 +653,7 @@ async function bwLoad() {
   bw.long = !!v.causal;
   bw.loaded = `${v.name || bw.manifest.name || "FastWan2.1-T2V-1.3B"} · ${v.label} · in this browser`;
   $("go").textContent = bw.long ? "Generate video" : "Generate clip";
+  $("steps-hint").textContent = bw.long ? "Long video: 4 denoising steps per block of 12 frames, shown as each block is done; Stop ends it early. 16 fps." : "3 denoising steps, 16 fps.";
   $("bw-up-row").hidden = bw.long || !bw.manifest.upscaler || MOBILE;
   console.info("fastwan: WebGPU", bw.eng.adapter(), "|", bw.eng.limits());
   $("bw-load").disabled = false; $("bw-load").textContent = "Reload";
