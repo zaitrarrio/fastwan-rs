@@ -19,6 +19,12 @@ target/
 .cache/
 .huggingface/
 
+# Taskfile.yml checksums.
+.task/
+
+# `task embed` writes gallery.json here; the safetensors are already ignored.
+/gallery/
+
 # Generated checkpoints, quantized exports, prompt embeddings, and other
 # weight formats. The tiny transformers/diffusers fixtures under
 # crates/*/tests/fixtures/ are checked in.

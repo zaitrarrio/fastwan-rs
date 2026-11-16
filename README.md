@@ -49,6 +49,19 @@ cargo build --release --features cuda      # + CUDA (no CUDA toolkit needed to b
 ./target/release/fastwan bench --layers 4  # synthetic weights, real 480p geometry
 ```
 
+### Tasks
+
+[`Taskfile.yml`](Taskfile.yml) runs this workflow (`task --list`). It needs [Task](https://taskfile.dev).
+
+```bash
+task setup            # cargo fetch and a toolchain check
+task weights          # checkpoint + TAEHV into ./fastwan
+task build            # WebGPU + CPU; task build:cuda on NVIDIA
+task clip             # UMT5 embed, then out/<prompt>-832x480x81-s7.mp4
+```
+
+`task clip PROMPT="a crowded night market in the rain" SEED=3 BACKEND=wgpu` reuses `./gallery` when that prompt was encoded before. `task embed:gallery` encodes `web/gallery-prompts.txt`. `task serve` is the local studio.
+
 ### Prompt-to-clip demo
 
 ```bash

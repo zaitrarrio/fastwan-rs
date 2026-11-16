@@ -1,0 +1,326 @@
+# fastwan-rs local automation. `task --list` prints these.
+#
+#   task setup
+#   task weights
+#   task build            # task build:cuda on NVIDIA
+#   task embed            # native UMT5 → ./gallery
+#   task clip             # embed when missing, then out/*.y4m and .mp4
+#
+# Pass knobs as variables:
+#   task clip PROMPT="a crowded night market in the rain" SEED=3 BACKEND=wgpu
+#   task clip:preview
+#   task generate EMBEDS=gallery/01-a-fox.safetensors
+# Cargo filters and build flags use -- : `task test -- hf_parity`, `task build -- -j 8`.
+
+version: "3"
+
+dir: "{{.TASKFILE_DIR}}"
+
+set: [errexit, pipefail]
+
+vars:
+  MODEL_DIR: fastwan
+  DIT_REPO: FastVideo/FastWan2.1-T2V-1.3B-Diffusers
+  TAE_REPO: madebyollin/taehv
+  TAE_FILE: taew2_1.safetensors
+  BIN: ""
+  PROFILE: release
+  FEATURES: ""
+  BACKEND: auto
+  WIDTH: "832"
+  HEIGHT: "480"
+  FRAMES: "81"
+  SEED: "7"
+  WEIGHTS: native
+  ATTENTION: auto
+  VSA_SPARSITY: ""
+  PROMPT: "a fox running through snow"
+  PROMPT_FILE: ""
+  GALLERY: gallery
+  OUT_DIR: out
+  OUT: ""
+  EMBEDS: ""
+  TAE: ""
+  TRANSFORMER: ""
+  UPSCALE: ""
+  RUNS: "1"
+  TAE_CHUNK: "2"
+  FFN_CHUNK: ""
+  MP4: auto
+  ENCODE: auto
+  CAUSAL: "0"
+  CACHE_FRAMES: "12"
+  SINK_FRAMES: "3"
+  QUANT: int4-hqq-g64
+  QUANT_OUT: ""
+  ADDR: "127.0.0.1:7860"
+  ALLOW_ORIGIN: ""
+  MAX_PIXELS: ""
+  MAX_FRAMES: ""
+  LAYERS: "4"
+  DECODE: "0"
+  VRAM_GIB: "12"
+  MAX_BINDING_MIB: ""
+  SYNTHETIC: "0"
+  SERVE_GALLERY: ""
+  WEB_PORT: "8765"
+
+env:
+  MODEL_DIR: "{{.MODEL_DIR}}"
+  DIT_REPO: "{{.DIT_REPO}}"
+  TAE_REPO: "{{.TAE_REPO}}"
+  TAE_FILE: "{{.TAE_FILE}}"
+  BIN: "{{.BIN}}"
+  PROFILE: "{{.PROFILE}}"
+  FEATURES: "{{.FEATURES}}"
+  BACKEND: "{{.BACKEND}}"
+  WIDTH: "{{.WIDTH}}"
+  HEIGHT: "{{.HEIGHT}}"
+  FRAMES: "{{.FRAMES}}"
+  SEED: "{{.SEED}}"
+  WEIGHTS: "{{.WEIGHTS}}"
+  ATTENTION: "{{.ATTENTION}}"
+  VSA_SPARSITY: "{{.VSA_SPARSITY}}"
+  PROMPT: "{{.PROMPT}}"
+  PROMPT_FILE: "{{.PROMPT_FILE}}"
+  GALLERY: "{{.GALLERY}}"
+  OUT_DIR: "{{.OUT_DIR}}"
+  OUT: "{{.OUT}}"
+  EMBEDS: "{{.EMBEDS}}"
+  TAE: "{{.TAE}}"
+  TRANSFORMER: "{{.TRANSFORMER}}"
+  UPSCALE: "{{.UPSCALE}}"
+  RUNS: "{{.RUNS}}"
+  TAE_CHUNK: "{{.TAE_CHUNK}}"
+  FFN_CHUNK: "{{.FFN_CHUNK}}"
+  MP4: "{{.MP4}}"
+  ENCODE: "{{.ENCODE}}"
+  CAUSAL: "{{.CAUSAL}}"
+  CACHE_FRAMES: "{{.CACHE_FRAMES}}"
+  SINK_FRAMES: "{{.SINK_FRAMES}}"
+  QUANT: "{{.QUANT}}"
+  QUANT_OUT: "{{.QUANT_OUT}}"
+  ADDR: "{{.ADDR}}"
+  ALLOW_ORIGIN: "{{.ALLOW_ORIGIN}}"
+  MAX_PIXELS: "{{.MAX_PIXELS}}"
+  MAX_FRAMES: "{{.MAX_FRAMES}}"
+  LAYERS: "{{.LAYERS}}"
+  DECODE: "{{.DECODE}}"
+  VRAM_GIB: "{{.VRAM_GIB}}"
+  MAX_BINDING_MIB: "{{.MAX_BINDING_MIB}}"
+  SYNTHETIC: "{{.SYNTHETIC}}"
+  SERVE_GALLERY: "{{.SERVE_GALLERY}}"
+  WEB_PORT: "{{.WEB_PORT}}"
+
+tasks:
+  default:
+    desc: List tasks
+    cmds:
+      - task --list
+
+  setup:
+    desc: Fetch crates and check the toolchain
+    cmds:
+      - cargo fetch
+      - task: doctor
+
+  doctor:
+    desc: Check the toolchain, weights, and binary
+    cmds:
+      - bash scripts/doctor.sh
+
+  bootstrap:
+    desc: setup, then download FastWan and TAEHV
+    cmds:
+      - task: setup
+      - task: weights
+
+  build:
+    desc: Release build (WebGPU and CPU). FEATURES=cuda selects CUDA.
+    cmds:
+      - bash scripts/build.sh {{.CLI_ARGS}}
+
+  build:cuda:
+    desc: Release build with CUDA, in target/feat-cuda
+    vars:
+      FEATURES: cuda
+    cmds:
+      - bash scripts/build.sh {{.CLI_ARGS}}
+
+  build:debug:
+    desc: Debug build
+    vars:
+      PROFILE: debug
+    cmds:
+      - bash scripts/build.sh {{.CLI_ARGS}}
+
+  test:
+    desc: Run the workspace tests
+    cmds:
+      - cargo test --workspace -- {{.CLI_ARGS}}
+
+  verify:
+    desc: Tool check and workspace tests
+    cmds:
+      - task: doctor
+      - task: test
+
+  fmt:
+    desc: Format Rust sources
+    cmds:
+      - cargo fmt --all
+
+  fmt:check:
+    desc: Fail if rustfmt would change sources
+    cmds:
+      - cargo fmt --all -- --check
+
+  check:
+    desc: GPU kernels against the CPU reference
+    deps: [build]
+    cmds:
+      - bash scripts/check.sh
+
+  bench:
+    desc: Time DMD steps (LAYERS=30 is the full model; DECODE=1 includes TAEHV)
+    deps: [build]
+    cmds:
+      - bash scripts/bench.sh
+
+  plan:
+    desc: Memory plan for VRAM_GIB at WIDTH x HEIGHT x FRAMES
+    deps: [build]
+    cmds:
+      - bash scripts/plan.sh
+
+  weights:
+    desc: Download FastWan and TAEHV into ./fastwan (skipped when complete)
+    status:
+      - test -d "{{.MODEL_DIR}}/transformer"
+      - test -d "{{.MODEL_DIR}}/text_encoder"
+      - test -f "{{.MODEL_DIR}}/tokenizer/tokenizer.json"
+      - test -f "{{.MODEL_DIR}}/{{.TAE_FILE}}"
+    cmds:
+      - bash scripts/weights/download.sh
+
+  embed:
+    desc: Encode PROMPT with the native UMT5 into ./gallery
+    aliases: [encode]
+    deps: [build]
+    cmds:
+      - bash scripts/embed/encode.sh
+
+  embed:gallery:
+    desc: Encode web/gallery-prompts.txt into ./gallery
+    deps: [build]
+    vars:
+      PROMPT: ""
+      PROMPT_FILE: web/gallery-prompts.txt
+    cmds:
+      - bash scripts/embed/encode.sh
+
+  embed:python:
+    desc: Encode PROMPT with torch into one safetensors file
+    cmds:
+      - bash scripts/embed/encode-python.sh
+
+  clip:
+    desc: Encode PROMPT when the gallery lacks it, then write a clip
+    deps: [build]
+    cmds:
+      - bash scripts/clip/generate.sh
+
+  clip:preview:
+    desc: 480x272x33 clip of PROMPT
+    deps: [build]
+    vars:
+      WIDTH: "480"
+      HEIGHT: "272"
+      FRAMES: "33"
+    cmds:
+      - bash scripts/clip/generate.sh
+
+  clip:causal:
+    desc: Causal rollout; TRANSFORMER must be a Self-Forcing checkpoint
+    deps: [build]
+    vars:
+      CAUSAL: "1"
+    cmds:
+      - bash scripts/clip/generate.sh
+
+  generate:
+    desc: Write a clip from an embedding already in the gallery or EMBEDS
+    deps: [build]
+    vars:
+      ENCODE: never
+    cmds:
+      - bash scripts/clip/generate.sh
+
+  quantize:
+    desc: Quantize the DiT (default int4-hqq-g64) into ./out
+    deps: [build]
+    cmds:
+      - bash scripts/quantize.sh
+
+  serve:
+    desc: Local prompt-to-clip page at 127.0.0.1:7860
+    aliases: [dev]
+    deps: [build]
+    interactive: true
+    cmds:
+      - bash scripts/serve.sh
+
+  serve:gallery:
+    desc: Studio that only accepts prompts already in the gallery
+    deps: [build]
+    interactive: true
+    vars:
+      SERVE_GALLERY: "{{.GALLERY}}"
+    cmds:
+      - bash scripts/serve.sh
+
+  serve:synthetic:
+    desc: Studio with a tiny random model and no weight download
+    deps: [build]
+    interactive: true
+    vars:
+      SYNTHETIC: "1"
+    cmds:
+      - bash scripts/serve.sh
+
+  web:shaders:
+    desc: Inline WGSL into the WebGPU bench page and web/site
+    cmds:
+      - python3 web/build.py
+
+  web:wasm:
+    desc: Build the in-browser engine into web/pkg
+    cmds:
+      - bash scripts/build-web.sh
+
+  web:
+    desc: Browser engine, shader page, and web/site
+    cmds:
+      - task: web:wasm
+      - task: web:shaders
+
+  web:bench:
+    desc: Serve the WebGPU bench page
+    interactive: true
+    cmds:
+      - python3 -m http.server {{.WEB_PORT}} -d web
+
+  pages:
+    desc: Build the site and deploy it to Cloudflare Pages
+    cmds:
+      - bash scripts/deploy-pages.sh
+
+  clean:
+    desc: Remove cargo build output (keeps weights, gallery, and clips)
+    cmds:
+      - cargo clean
+
+  clean:clips:
+    desc: Delete generated clips under ./out
+    cmds:
+      - rm -rf out
