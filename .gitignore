@@ -63,6 +63,8 @@ target/
 # `web_page_embeds_current_shaders` test fails when it is stale).
 /web/dist/
 /web/site/
+/web/pkg/
+/web/pkg-*/
 
 # Cloudflare (wrangler cache, Pages local state, Worker secrets).
 .wrangler/
