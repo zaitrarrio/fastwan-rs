@@ -426,6 +426,95 @@ mod web {
                     set(&o, "ok", r.ok);
                     let _ = on_event.call1(&JsValue::NULL, &o);
                 }
+                // VSA stage by stage (the op checks above only see the
+                // result): tile means, coarse output, selected tiles.
+                for &(grid, heads, d) in &[
+                    ((5usize, 6usize, 9usize), 2usize, 128usize),
+                    ((21, 17, 30), 2, 128),
+                ] {
+                    use fastwan_core::Backend as _;
+                    let spec = fastwan_core::vsa::VsaSpec::new(grid, heads, d, 0.8);
+                    let n = heads * spec.plan.seq * d;
+                    let mut rng = fastwan_core::rng::Rng::new(7);
+                    let (q, k, v, g) = (rng.normal(n), rng.normal(n), rng.normal(n), rng.normal(n));
+                    let (gq, gk, gv, gg, go) = (
+                        be.upload(&q),
+                        be.upload(&k),
+                        be.upload(&v),
+                        be.upload(&g),
+                        be.alloc(n),
+                    );
+                    let st = be.vsa_prepare(&spec);
+                    be.vsa_attention(&gq, &gk, &gv, &gg, &st, &go);
+                    let (want_p, want_c, want_s) =
+                        fastwan_core::vsa::coarse_reference(&spec, &q, &k, &v);
+                    let (bp, bc, bs) = st.stages();
+                    let got_p = be.try_download_async(bp).await.map_err(err)?;
+                    let got_c = be.try_download_async(bc).await.map_err(err)?;
+                    let got_s = be.try_download_async(bs).await.map_err(err)?;
+                    let relf = |a: &[f32], b: &[f32]| {
+                        let scale = b.iter().fold(0f32, |m, x| m.max(x.abs())) + 1e-6;
+                        a.iter().zip(b).fold(0f32, |m, (x, y)| {
+                            let e = (x - y).abs();
+                            if e.is_nan() { f32::INFINITY } else { m.max(e) }
+                        }) / scale
+                    };
+                    // Selection: tiles the GPU picked that the host did not, as a set per query tile.
+                    let topk = spec.topk;
+                    let got_s: Vec<u32> = got_s.iter().map(|x| x.to_bits()).collect();
+                    let mut wrong = 0usize;
+                    for (gr, wr) in got_s.chunks(topk).zip(want_s.chunks(topk)) {
+                        wrong += gr.iter().filter(|t| !wr.contains(t)).count();
+                    }
+                    let total_sel = want_s.len();
+                    let tag = format!(
+                        "vsa stages {grid:?} h{heads} d{d} topk {topk}/{}",
+                        spec.plan.num_tiles()
+                    );
+                    let rows = [
+                        (
+                            format!("{tag}: pool (tile means)"),
+                            relf(&got_p, &want_p),
+                            None,
+                        ),
+                        (
+                            format!("{tag}: coarse (tile attention)"),
+                            relf(&got_c, &want_c),
+                            None,
+                        ),
+                        (
+                            format!("{tag}: select ({wrong} of {total_sel} picks differ)"),
+                            wrong as f32 / total_sel as f32,
+                            Some(wrong),
+                        ),
+                    ];
+                    for (name, rel, wrong) in rows {
+                        // A near-tie can flip a pick between float orders: allow 1%.
+                        let ok = match wrong {
+                            Some(w) => w * 100 <= total_sel,
+                            None => rel <= tol,
+                        };
+                        bad += (!ok) as u32;
+                        let o = Object::new();
+                        set(&o, "type", "check");
+                        set(&o, "name", name.as_str());
+                        set(&o, "rel", rel as f64);
+                        set(&o, "ok", ok);
+                        let _ = on_event.call1(&JsValue::NULL, &o);
+                    }
+                    if got_s.iter().take(topk * 4).all(|&x| x == 0) {
+                        let o = Object::new();
+                        set(&o, "type", "check");
+                        set(
+                            &o,
+                            "name",
+                            "note: the first query tiles selected only tile 0 (sel never written?)",
+                        );
+                        set(&o, "rel", 0.0);
+                        set(&o, "ok", false);
+                        let _ = on_event.call1(&JsValue::NULL, &o);
+                    }
+                }
                 Ok(JsValue::from(bad))
             })
         }

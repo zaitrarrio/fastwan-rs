@@ -105,6 +105,93 @@ impl VsaSpec {
     }
 }
 
+/// The coarse half of VSA on the host, laid out like the WebGPU kernels'
+/// intermediates (`vsa_pool.wgsl` / `vsa_coarse.wgsl`), for checking those
+/// stages one at a time. `q`, `k`, `v` are head-major `[heads, seq, d]`.
+/// Returns `(pooled [3][heads][nb][d], coarse [heads][nb][d],
+/// sel [heads][nb][topk])`; `sel` lists the tiles scoring above the k-th
+/// largest by index, then ties at it by index.
+pub fn coarse_reference(
+    spec: &VsaSpec,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+) -> (Vec<f32>, Vec<f32>, Vec<u32>) {
+    let (h, d, nb, s) = (
+        spec.heads,
+        spec.head_dim,
+        spec.plan.num_tiles(),
+        spec.plan.seq,
+    );
+    let plane = h * nb * d;
+    let mut pooled = vec![0f32; 3 * plane];
+    for hh in 0..h {
+        for t in 0..nb {
+            let n = spec.plan.block_sizes[t] as usize;
+            let inv = 1.0 / n.max(1) as f32;
+            for c in 0..d {
+                let (mut sq, mut sk, mut sv) = (0f32, 0f32, 0f32);
+                for i in 0..n {
+                    let idx = (hh * s + spec.plan.slot_src[t * TILE_ELEMS + i] as usize) * d + c;
+                    sq += q[idx];
+                    sk += k[idx];
+                    sv += v[idx];
+                }
+                let o = (hh * nb + t) * d + c;
+                pooled[o] = sq * inv;
+                pooled[plane + o] = sk * inv;
+                pooled[2 * plane + o] = sv * inv;
+            }
+        }
+    }
+    let mut coarse = vec![0f32; plane];
+    let mut sel = vec![0u32; h * nb * spec.topk];
+    for hh in 0..h {
+        for qt in 0..nb {
+            let qb = (hh * nb + qt) * d;
+            let sc: Vec<f32> = (0..nb)
+                .map(|kt| {
+                    let kb = plane + (hh * nb + kt) * d;
+                    let mut dot = 0f32;
+                    for c in 0..d {
+                        dot = pooled[qb + c].mul_add(pooled[kb + c], dot);
+                    }
+                    dot * spec.scale
+                })
+                .collect();
+            let m = sc.iter().fold(f32::MIN, |a, &b| a.max(b));
+            let z: f32 = sc.iter().map(|&x| (x - m).exp()).sum();
+            for c in 0..d {
+                let mut o = 0f32;
+                for (kt, &x) in sc.iter().enumerate() {
+                    o = (x - m)
+                        .exp()
+                        .mul_add(pooled[2 * plane + (hh * nb + kt) * d + c], o);
+                }
+                coarse[qb + c] = o / z;
+            }
+            let mut order: Vec<usize> = (0..nb).collect();
+            order.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]).then(a.cmp(&b)));
+            let kth = sc[order[spec.topk - 1]];
+            let out = &mut sel[(hh * nb + qt) * spec.topk..][..spec.topk];
+            let mut n = 0;
+            for kt in 0..nb {
+                if sc[kt] > kth {
+                    out[n] = kt as u32;
+                    n += 1;
+                }
+            }
+            for kt in 0..nb {
+                if n < spec.topk && sc[kt] == kth {
+                    out[n] = kt as u32;
+                    n += 1;
+                }
+            }
+        }
+    }
+    (pooled, coarse, sel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

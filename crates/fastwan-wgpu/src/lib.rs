@@ -128,6 +128,15 @@ pub struct GVsa {
     scale: f32,
 }
 
+impl GVsa {
+    /// The intermediates of the last `vsa_attention` with this state:
+    /// `(pooled, coarse, sel)`, as `fastwan_core::vsa::coarse_reference`
+    /// lays them out (`sel` holds u32 words). For the browser self-test.
+    pub fn stages(&self) -> (&GBuf, &GBuf, &GBuf) {
+        (&self.pooled, &self.coarse, &self.sel)
+    }
+}
+
 /// GPU timestamps around every dispatch, summed per kernel.
 struct Prof {
     qs: wgpu::QuerySet,
