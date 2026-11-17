@@ -114,8 +114,12 @@ State and invariants only; the reasoning is in `docs/design.md`.
 - WGSL: no workgroup atomics. `vsa_coarse`'s top-k counted with
   `atomic<u32>` (store / add / load across barriers) and picked the wrong
   tiles for 74% of queries on an AMD RDNA1 Mac (Chrome → Metal) while Apple,
-  NVIDIA and SwiftShader were exact: every 5 s clip was noise there. It now
-  sums per-thread counts with a tree reduction. The browser self-test
+  NVIDIA and SwiftShader were exact: every 5 s clip was noise there. It is now
+  a radix select (4-bit passes, byte counters packed per thread, two-level
+  sums), with the picks written by all threads after a prefix scan and one
+  exp per tile. lavapipe, 832×480 grid, 6 heads: 459 ms/call vs 445 (atomic)
+  and 619 (a 32-pass tree search); 0.8% of a VSA call, flash3 is the rest
+  (`examples/vsa_bench.rs`). The browser self-test
   (`?selftest=1`: `check::ops_deferred` + VSA stage by stage against
   `vsa::coarse_reference`) finds such per-GPU failures; ask for its output.
 - WGSL auto layouts drop unused bindings, so every declared binding must be
