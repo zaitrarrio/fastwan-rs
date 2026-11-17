@@ -403,6 +403,15 @@ impl Wgpu {
             return p.clone();
         }
         // `enable f16;` must open the module, before the shared helpers.
+        // Kernel A/B without a rebuild (native only):
+        // FASTWAN_WGPU_SHADER_<key>=file.wgsl replaces the kernel's source.
+        #[cfg(not(target_arch = "wasm32"))]
+        let body = match std::env::var(format!("FASTWAN_WGPU_SHADER_{key}")) {
+            Ok(path) => std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("FASTWAN_WGPU_SHADER_{key}={path}: {e}")),
+            Err(_) => src(),
+        };
+        #[cfg(target_arch = "wasm32")]
         let body = src();
         let code = if body.contains("vec4<f16>") {
             format!("enable f16;\n{COMMON}\n{body}")
