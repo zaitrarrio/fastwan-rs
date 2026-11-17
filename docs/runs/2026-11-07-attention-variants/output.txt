@@ -1,0 +1,43 @@
+NVIDIA RTX PRO 6000 Blackwell Server Edition, 580.178.04, 600.00 W
+--- check v0
+attention h12 200x200 d128                       rel 5.97e-3  ok
+attention h3 130x512 d128                        rel 4.45e-3  ok
+vsa (5, 6, 9) h2 d128 topk 3/12                  rel 4.69e-3  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps (latent)      rel 4.58e-3  ok
+all 50 checks pass (tolerance 3e-2)
+--- check v1
+attention h12 200x200 d128                       rel 5.97e-3  ok
+attention h3 130x512 d128                        rel 4.45e-3  ok
+vsa (5, 6, 9) h2 d128 topk 3/12                  rel 4.69e-3  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps (latent)      rel 4.58e-3  ok
+all 50 checks pass (tolerance 3e-2)
+--- check v2
+attention h12 200x200 d128                       rel 5.97e-3  ok
+attention h3 130x512 d128                        rel 4.45e-3  ok
+vsa (5, 6, 9) h2 d128 topk 3/12                  rel 4.69e-3  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps (latent)      rel 4.58e-3  ok
+all 50 checks pass (tolerance 3e-2)
+--- VSA v0 (round 1): denoise 1.615s; scaled to 30 layers ≈ 1.61s
+--- VSA v1 (round 1): denoise 1.630s; scaled to 30 layers ≈ 1.63s
+--- VSA v2 (round 1): denoise 1.585s; scaled to 30 layers ≈ 1.58s
+--- VSA v0 (round 2): denoise 1.610s; scaled to 30 layers ≈ 1.61s
+--- VSA v1 (round 2): denoise 1.628s; scaled to 30 layers ≈ 1.63s
+--- VSA v2 (round 2): denoise 1.582s; scaled to 30 layers ≈ 1.58s
+--- dense v0: denoise 2.935s; scaled to 30 layers ≈ 2.94s
+--- dense v1: denoise 2.993s; scaled to 30 layers ≈ 2.99s
+--- dense v2: denoise 2.868s; scaled to 30 layers ≈ 2.87s
+--- profiled v0:   vsa fine (mma)                               640.5 ms  39.1%      90 calls     7.117 ms/call
+--- profiled v1:   vsa fine (mma v1)                            663.1 ms  40.1%      90 calls     7.367 ms/call
+--- profiled v2:   vsa fine (mma v2)                            620.5 ms  38.5%      90 calls     6.894 ms/call
+--- generate v0
+run 0: total 2.40s  prompt 0.20s  denoise 1.61s (["0.54", "0.54", "0.54"])  decode 0.54s
+run 1: total 2.40s  prompt 0.14s  denoise 1.61s (["0.53", "0.54", "0.54"])  decode 0.61s
+--- generate v1
+run 0: total 2.42s  prompt 0.21s  denoise 1.63s (["0.54", "0.54", "0.54"])  decode 0.53s
+run 1: total 2.32s  prompt 0.14s  denoise 1.63s (["0.54", "0.54", "0.54"])  decode 0.52s
+--- generate v2
+run 0: total 2.36s  prompt 0.21s  denoise 1.58s (["0.53", "0.53", "0.53"])  decode 0.52s
+run 1: total 2.26s  prompt 0.13s  denoise 1.58s (["0.52", "0.53", "0.53"])  decode 0.51s
+PSNR v1 vs v0: PSNR y:36.379553 u:44.806744 v:46.773778 average:40.234222 min:35.616374 max:41.723250
+PSNR v2 vs v0: PSNR y:36.379553 u:44.806744 v:46.773778 average:40.234222 min:35.616374 max:41.723250
+exit 0

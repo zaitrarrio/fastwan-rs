@@ -1,0 +1,9 @@
+[package]
+name = "fastwan-cuda"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cublas", "cublaslt", "nvrtc", "dynamic-loading", "cuda-12080", "f16"] }
+fastwan-core = { version = "0.1.0", path = "../fastwan-core" }
+half = "2.7.1"

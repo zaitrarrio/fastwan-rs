@@ -1,0 +1,56 @@
+{
+ "bicubic_x2": {
+  "scale": 2,
+  "seconds": 0.002,
+  "fps": 32573.2,
+  "size": "960x544",
+  "flicker": 1.615
+ },
+ "bicubic_x4": {
+  "scale": 4,
+  "seconds": 0.009,
+  "fps": 8886.5,
+  "size": "1920x1088",
+  "flicker": 0.615
+ },
+ "esrgan_general_x4v3": {
+  "scale": 4,
+  "seconds": 0.414,
+  "fps": 195.5,
+  "size": "1920x1088",
+  "flicker": 1.168
+ },
+ "esrgan_animevideov3_x4": {
+  "scale": 4,
+  "seconds": 0.224,
+  "fps": 361.7,
+  "size": "1920x1088",
+  "flicker": 1.106
+ },
+ "esrgan_x4plus": {
+  "scale": 4,
+  "seconds": 7.338,
+  "fps": 11.0,
+  "size": "1920x1088",
+  "flicker": 1.377
+ },
+ "esrgan_x2plus": {
+  "scale": 2,
+  "seconds": 2.3,
+  "fps": 35.2,
+  "size": "960x544",
+  "flicker": 2.21
+ },
+ "realbasicvsr_x4": {
+  "scale": 4,
+  "seconds": 2.639,
+  "fps": 30.7,
+  "size": "1920x1088",
+  "flicker": 2.655
+ },
+ "_input": {
+  "frames": 81,
+  "size": "480x272",
+  "flicker": 3.404
+ }
+}

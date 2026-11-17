@@ -1,0 +1,8 @@
+[package]
+name = "fastwan-cpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastwan-core = { version = "0.1.0", path = "../fastwan-core" }
+rayon = "1.12.0"

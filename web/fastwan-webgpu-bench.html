@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+</head>
+<body>
+<title>FastWan WebGPU Bench</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+/* Layout: one instrument column; device readout, then conformance, throughput and the 480p estimate as stacked panels. */
+:root {
+  --bg: #f3f4f1; --panel: #ffffff; --ink: #1d2320; --muted: #5d6762; --rule: #d6dbd6;
+  --accent: #9a5b00; --accent-soft: #f3e6cf; --ok: #1f7a46; --ok-soft: #dcefe3; --bad: #b42318; --bad-soft: #f8dedb; --warn: #8a6100;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #121614; --panel: #1a1f1c; --ink: #e4e9e5; --muted: #9aa59f; --rule: #2d3530;
+  --accent: #f0a640; --accent-soft: #3a2c15; --ok: #5cc98a; --ok-soft: #173325; --bad: #ff7b6e; --bad-soft: #3d1c19; --warn: #e8c15a; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #121614; --panel: #1a1f1c; --ink: #e4e9e5; --muted: #9aa59f; --rule: #2d3530;
+  --accent: #f0a640; --accent-soft: #3a2c15; --ok: #5cc98a; --ok-soft: #173325; --bad: #ff7b6e; --bad-soft: #3d1c19; --warn: #e8c15a; color-scheme: dark }
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--f-body); }
+.wrap { max-width: 980px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 28px 56px; display: grid; gap: 22px; }
+header { display: grid; gap: 6px; }
+h1 { font: 600 2rem/1.1 var(--f-display); letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
+h2 { font: 600 1.15rem/1.2 var(--f-display); margin: 0; letter-spacing: 0.01em; }
+.lede { color: var(--muted); max-width: 68ch; margin: 0; }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 18px; display: grid; gap: 14px; min-width: 0; }
+.row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+.label { font: 500 0.72rem/1 var(--f-mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px 20px; }
+.kv div { display: grid; gap: 4px; min-width: 0; }
+.kv b { font: 500 0.95rem/1.3 var(--f-mono); overflow-wrap: anywhere; }
+button { font: 500 0.9rem var(--f-body); padding: 8px 14px; border-radius: 4px; border: 1px solid var(--accent); background: var(--accent); color: var(--panel); cursor: pointer; }
+button.ghost { background: transparent; color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: progress; }
+button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font: 0.86rem/1.4 var(--f-mono); font-variant-numeric: tabular-nums; }
+th { text-align: left; font: 500 0.7rem/1 var(--f-mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); padding: 8px 10px 8px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+td { padding: 7px 10px 7px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+td.num, th.num { text-align: right; }
+.pill { display: inline-block; font: 500 0.72rem/1 var(--f-mono); padding: 4px 8px; border-radius: 99px; letter-spacing: 0.04em; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.bad { background: var(--bad-soft); color: var(--bad); }
+.pill.wait { background: var(--accent-soft); color: var(--accent); }
+.summary { font: 500 0.95rem var(--f-mono); }
+.note { color: var(--muted); font-size: 0.86rem; max-width: 72ch; margin: 0; }
+.err { color: var(--bad); font: 0.9rem var(--f-mono); white-space: pre-wrap; }
+code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 5px; border-radius: 3px; }
+@media (prefers-reduced-motion: no-preference) { .pill.wait { animation: pulse 1.2s ease-in-out infinite; } }
+@keyframes pulse { 50% { opacity: 0.55; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="label">fastwan-rs · WebGPU backend</span>
+    <h1>FastWan WebGPU Bench</h1>
+    <p class="lede">Runs the WGSL kernels of the fastwan-rs WebGPU backend on this machine's GPU, including video sparse attention (VSA), checks each one against an f32 JavaScript reference, measures throughput at Wan 2.1 1.3B shapes, and estimates how long a 3-step DMD clip would take here.</p>
+  </header>
+
+  <section class="panel" aria-labelledby="dev-h">
+    <div class="row"><h2 id="dev-h">Device</h2><span id="dev-state" class="pill wait">detecting</span></div>
+    <div class="kv" id="dev-kv"></div>
+    <p class="err" id="dev-err" hidden></p>
+  </section>
+
+  <section class="panel" aria-labelledby="chk-h">
+    <div class="row"><h2 id="chk-h">Kernel conformance</h2>
+      <div class="row"><span class="summary" id="chk-sum">waiting for the GPU</span><button id="chk-run" class="ghost" disabled>Run again</button></div></div>
+    <div class="scroll"><table><thead><tr><th>Kernel</th><th>Case</th><th class="num">Rel. error</th><th>Result</th></tr></thead><tbody id="chk-body"></tbody></table></div>
+    <p class="note">Pass means max |GPU − reference| / max |reference| ≤ 2·10⁻³. Weights go to the GPU as f16 pairs packed in u32, as the Rust backend stores them; the reference uses the unrounded f32 weights, so the f16 cases measure the real storage error.</p>
+  </section>
+
+  <section class="panel" aria-labelledby="bench-h">
+    <div class="row"><h2 id="bench-h">Throughput</h2><button id="bench-run" disabled>Run benchmarks</button></div>
+    <div class="scroll"><table><thead><tr><th>Kernel</th><th>Shape</th><th class="num">ms / call</th><th class="num">TFLOP/s</th></tr></thead><tbody id="bench-body">
+      <tr><td colspan="4" class="note">Not run yet. Takes 10–60 s on a desktop GPU; the tab may stutter while it runs. On a weak or software GPU, add <code>#quick</code> to the address for small shapes.</td></tr></tbody></table></div>
+  </section>
+
+  <section class="panel" aria-labelledby="est-h">
+    <div class="row"><h2 id="est-h">Clip estimate on this GPU</h2><span class="label">3 DMD steps · 30 layers · VSA 0.8</span></div>
+    <div class="scroll"><table><thead><tr><th>Geometry</th><th class="num">Tokens</th><th class="num">Largest buffer</th><th>Fits binding</th><th class="num">Per step, VSA</th><th class="num">Denoise, VSA</th><th class="num">Denoise, dense</th></tr></thead><tbody id="est-body"></tbody></table></div>
+    <p class="note">FastWan runs video sparse attention: each 4×4×4 tile of tokens attends to the 20% of tiles its coarse scores rank highest, plus a gated coarse term. Per-step time is the FLOP count of one DiT forward split into GEMM work and attention work, each divided by the rate measured above (VSA's measured at the 480p grid). It leaves out the norms, the decoder and dispatch overhead, so treat it as a lower bound. On an RTX 4090 the native engine measured about 65 s per 480p VSA step through Vulkan.</p>
+  </section>
+</div>
+
+<script>
+const SHADERS = {
+ "common": "// Shared by every kernel. `{W_DECL}` / `{W_LOAD}` are filled per weight\n// storage: f16 pairs packed in u32 (core WGSL `unpack2x16float`, so no\n// `shader-f16` extension is needed) or plain f32.\nfn gelu_tanh(x: f32) -> f32 {\n    let c = 0.7978845608;\n    let u = c * (x + 0.044715 * x * x * x);\n    // tanh via exp, clamped: WGSL tanh overflows to NaN on some drivers.\n    let e = exp(-2.0 * abs(u));\n    let t = sign(u) * (1.0 - e) / (1.0 + e);\n    return 0.5 * x * (1.0 + t);\n}\nfn tanh_safe(u: f32) -> f32 {\n    let e = exp(-2.0 * abs(u));\n    return sign(u) * (1.0 - e) / (1.0 + e);\n}\n// Linear workgroup index of a (possibly 2-D folded) dispatch.\nfn wg_index(wid: vec3<u32>, nwg: vec3<u32>) -> u32 {\n    return wid.x + wid.y * nwg.x;\n}\n",
+ "linear": "// y[y_row + m, n] = act(Σ_k x[x_row + m, k] · W[n, k] + b[n])\n// 64×64 output tile per workgroup, 16×16 threads, 4×4 outputs per thread at\n// stride 16 (coalesced stores, conflict-free shared reads), K step 16.\nstruct P { m: u32, n: u32, k: u32, x_row: u32, y_row: u32, has_bias: u32, act: u32, _p: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> x: array<f32>;\n@group(0) @binding(2) var<storage, read> w: array<{W_TYPE}>;\n@group(0) @binding(3) var<storage, read> bias: array<f32>;\n@group(0) @binding(4) var<storage, read_write> y: array<f32>;\n\nfn load_w(i: u32) -> f32 { {W_LOAD} }\n\nvar<workgroup> xs: array<array<f32, 64>, 16>;\nvar<workgroup> ws: array<array<f32, 64>, 16>;\n\n@compute @workgroup_size(16, 16)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {\n    let m0 = wid.y * 64u;\n    let n0 = wid.x * 64u;\n    let tid = lid.y * 16u + lid.x;\n    var acc: array<array<f32, 4>, 4>;\n    for (var k0 = 0u; k0 < p.k; k0 = k0 + 16u) {\n        for (var i = 0u; i < 4u; i = i + 1u) {\n            let e = tid + i * 256u;\n            let r = e / 16u;\n            let kk = e % 16u;\n            let gk = k0 + kk;\n            var xv = 0.0;\n            if (m0 + r < p.m && gk < p.k) { xv = x[(p.x_row + m0 + r) * p.k + gk]; }\n            xs[kk][r] = xv;\n            var wv = 0.0;\n            if (n0 + r < p.n && gk < p.k) { wv = load_w((n0 + r) * p.k + gk); }\n            ws[kk][r] = wv;\n        }\n        workgroupBarrier();\n        for (var kk = 0u; kk < 16u; kk = kk + 1u) {\n            var a: array<f32, 4>;\n            var b: array<f32, 4>;\n            for (var i = 0u; i < 4u; i = i + 1u) {\n                a[i] = xs[kk][lid.y + 16u * i];\n                b[i] = ws[kk][lid.x + 16u * i];\n            }\n            for (var i = 0u; i < 4u; i = i + 1u) {\n                for (var j = 0u; j < 4u; j = j + 1u) {\n                    acc[i][j] = fma(a[i], b[j], acc[i][j]);\n                }\n            }\n        }\n        workgroupBarrier();\n    }\n    for (var i = 0u; i < 4u; i = i + 1u) {\n        let m = m0 + lid.y + 16u * i;\n        if (m >= p.m) { continue; }\n        for (var j = 0u; j < 4u; j = j + 1u) {\n            let n = n0 + lid.x + 16u * j;\n            if (n >= p.n) { continue; }\n            var v = acc[i][j];\n            if (p.has_bias != 0u) { v = v + bias[n]; }\n            if (p.act == 1u) { v = gelu_tanh(v); }\n            y[(p.y_row + m) * p.n + n] = v;\n        }\n    }\n}\n",
+ "conv": "// Implicit-GEMM conv2d, NCHW, stride 1, pad k/2: M = frames·OH·OW output\n// pixels, N = cout, K = cin·k². The im2col happens in the tile loader, which\n// also reads the concat (`cin_a` channels from `a`, then `cin_b` from `b`)\n// and the nearest ×2 upsample (`up = 2`) by address — neither is stored.\nstruct P { frames: u32, cin_a: u32, cin_b: u32, cout: u32, h: u32, w: u32, up: u32, k: u32,\n           has_b: u32, has_bias: u32, ep: u32, _p: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> a: array<f32>;\n@group(0) @binding(2) var<storage, read> b: array<f32>;\n@group(0) @binding(3) var<storage, read> w: array<{W_TYPE}>;\n@group(0) @binding(4) var<storage, read> bias: array<f32>;\n@group(0) @binding(5) var<storage, read> res: array<f32>;\n@group(0) @binding(6) var<storage, read_write> out: array<f32>;\n\nfn load_w(i: u32) -> f32 { {W_LOAD} }\n\nvar<workgroup> xs: array<array<f32, 64>, 16>;\nvar<workgroup> ws: array<array<f32, 64>, 16>;\n\nfn load_x(m: u32, kidx: u32, oh: u32, ow: u32, kk2: u32) -> f32 {\n    let plane = oh * ow;\n    let f = m / plane;\n    let r = m % plane;\n    let oy = r / ow;\n    let ox = r % ow;\n    let ci = kidx / kk2;\n    let rr = kidx % kk2;\n    let ky = rr / p.k;\n    let kx = rr % p.k;\n    let pad = i32(p.k / 2u);\n    let yy = i32(oy) + i32(ky) - pad;\n    let xx = i32(ox) + i32(kx) - pad;\n    if (yy < 0 || xx < 0 || yy >= i32(oh) || xx >= i32(ow)) { return 0.0; }\n    let sy = u32(yy) / p.up;\n    let sx = u32(xx) / p.up;\n    if (ci < p.cin_a) {\n        return a[((f * p.cin_a + ci) * p.h + sy) * p.w + sx];\n    }\n    return b[((f * p.cin_b + (ci - p.cin_a)) * p.h + sy) * p.w + sx];\n}\n\n@compute @workgroup_size(16, 16)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n    let oh = p.h * p.up;\n    let ow = p.w * p.up;\n    let mt = p.frames * oh * ow;\n    let kk2 = p.k * p.k;\n    let kt = (p.cin_a + p.cin_b) * kk2;\n    let m0 = (wid.y + wid.z * nwg.y) * 64u;\n    let n0 = wid.x * 64u;\n    let tid = lid.y * 16u + lid.x;\n    // 4×4 block as named vec4 (rows ty + 16i, cols tx + 16j): arrays here are\n    // kept in local memory by NVIDIA's Vulkan compiler (see linear3.wgsl).\n    var c0 = vec4<f32>(0.0);\n    var c1 = vec4<f32>(0.0);\n    var c2 = vec4<f32>(0.0);\n    var c3 = vec4<f32>(0.0);\n    for (var k0 = 0u; k0 < kt; k0 = k0 + 16u) {\n        for (var i = 0u; i < 4u; i = i + 1u) {\n            let e = tid + i * 256u;\n            let r = e / 16u;\n            let kk = e % 16u;\n            let gk = k0 + kk;\n            var xv = 0.0;\n            if (m0 + r < mt && gk < kt) { xv = load_x(m0 + r, gk, oh, ow, kk2); }\n            xs[kk][r] = xv;\n            var wv = 0.0;\n            if (n0 + r < p.cout && gk < kt) { wv = load_w((n0 + r) * kt + gk); }\n            ws[kk][r] = wv;\n        }\n        workgroupBarrier();\n        for (var kk = 0u; kk < 16u; kk = kk + 1u) {\n            let b = vec4<f32>(ws[kk][lid.x], ws[kk][lid.x + 16u], ws[kk][lid.x + 32u], ws[kk][lid.x + 48u]);\n            c0 = fma(vec4<f32>(xs[kk][lid.y]), b, c0);\n            c1 = fma(vec4<f32>(xs[kk][lid.y + 16u]), b, c1);\n            c2 = fma(vec4<f32>(xs[kk][lid.y + 32u]), b, c2);\n            c3 = fma(vec4<f32>(xs[kk][lid.y + 48u]), b, c3);\n        }\n        workgroupBarrier();\n    }\n    let plane = oh * ow;\n    let accs = array<vec4<f32>, 4>(c0, c1, c2, c3);\n    for (var i = 0u; i < 4u; i = i + 1u) {\n        let m = m0 + lid.y + 16u * i;\n        if (m >= mt) { continue; }\n        let f = m / plane;\n        let px = m % plane;\n        for (var j = 0u; j < 4u; j = j + 1u) {\n            let n = n0 + lid.x + 16u * j;\n            if (n >= p.cout) { continue; }\n            var v = accs[i][j];\n            if (p.has_bias != 0u) { v = v + bias[n]; }\n            let o = (f * p.cout + n) * plane + px;\n            if (p.ep == 1u) { v = max(v, 0.0); }\n            if (p.ep == 2u) { v = max(v + res[o], 0.0); }\n            if (p.ep == 3u && v < 0.0) { v = v * res[n]; }\n            out[o] = v;\n        }\n    }\n    // Keep every binding statically used (auto layouts drop unused ones).\n    if (p.has_b == 7777u) { out[0] = b[0] + res[0] + bias[0]; }\n}\n",
+ "attention": "// Flash attention: one workgroup = 64 query rows of one head, one thread per\n// row; K/V stream through shared memory {BK} keys at a time with an online\n// softmax, so the [sq, sk] score matrix never exists. Output is written with\n// heads merged ([sq, heads·d]).\nstruct P { heads: u32, sq: u32, sk: u32, d: u32, scale: f32, _a: u32, _b: u32, _c: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> q: array<f32>;\n@group(0) @binding(2) var<storage, read> k: array<f32>;\n@group(0) @binding(3) var<storage, read> v: array<f32>;\n@group(0) @binding(4) var<storage, read_write> out: array<f32>;\n\nconst BK: u32 = {BK}u;\nconst DMAX: u32 = 128u;\nvar<workgroup> ks: array<f32, {BK_D}>;\nvar<workgroup> vs: array<f32, {BK_D}>;\n\n@compute @workgroup_size(64)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {\n    let h = wid.y;\n    let i = wid.x * 64u + lid.x;\n    let live = i < p.sq;\n    let d = p.d;\n    var qr: array<f32, 128>;\n    var acc: array<f32, 128>;\n    if (live) {\n        for (var c = 0u; c < d; c = c + 1u) { qr[c] = q[(h * p.sq + i) * d + c] * p.scale; }\n    }\n    var m = -3.0e38;\n    var l = 0.0;\n    var s: array<f32, {BK}>;\n    for (var j0 = 0u; j0 < p.sk; j0 = j0 + BK) {\n        let nk = min(BK, p.sk - j0);\n        for (var e = lid.x; e < BK * d; e = e + 64u) {\n            let jj = e / d;\n            var kv = 0.0;\n            var vv = 0.0;\n            if (jj < nk) {\n                let g = (h * p.sk + j0 + jj) * d + (e % d);\n                kv = k[g];\n                vv = v[g];\n            }\n            ks[e] = kv;\n            vs[e] = vv;\n        }\n        workgroupBarrier();\n        if (live) {\n            var mt = m;\n            for (var jj = 0u; jj < nk; jj = jj + 1u) {\n                var dot = 0.0;\n                for (var c = 0u; c < d; c = c + 1u) { dot = fma(qr[c], ks[jj * d + c], dot); }\n                s[jj] = dot;\n                mt = max(mt, dot);\n            }\n            let corr = exp(m - mt);\n            l = l * corr;\n            for (var c = 0u; c < d; c = c + 1u) { acc[c] = acc[c] * corr; }\n            for (var jj = 0u; jj < nk; jj = jj + 1u) {\n                let pj = exp(s[jj] - mt);\n                l = l + pj;\n                for (var c = 0u; c < d; c = c + 1u) { acc[c] = fma(pj, vs[jj * d + c], acc[c]); }\n            }\n            m = mt;\n        }\n        workgroupBarrier();\n    }\n    if (live) {\n        let inv = 1.0 / l;\n        for (var c = 0u; c < d; c = c + 1u) { out[(i * p.heads + h) * d + c] = acc[c] * inv; }\n    }\n}\n",
+ "norm": "// Row kernels: one 256-thread workgroup per row.\n//   mode 0: out = LN(x)                    (layer_norm)\n//   mode 1: h += a·gate | h += a; out = LN(h)   (residual_norm)\n// then the norm: affine (w, b) or modulated (1 + mods[scale], mods[shift]).\nstruct P { rows: u32, dim: u32, mode: u32, gate: u32, has_gate: u32, affine: u32, scale: u32, shift: u32, eps: f32, _a: u32, _b: u32, _c: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read_write> h: array<f32>;\n@group(0) @binding(2) var<storage, read> a: array<f32>;\n@group(0) @binding(3) var<storage, read> mods: array<f32>;\n@group(0) @binding(4) var<storage, read> nw: array<f32>;\n@group(0) @binding(5) var<storage, read> nb: array<f32>;\n@group(0) @binding(6) var<storage, read_write> out: array<f32>;\n\nvar<workgroup> red: array<f32, 256>;\n\nfn block_sum(v: f32, t: u32) -> f32 {\n    red[t] = v;\n    workgroupBarrier();\n    for (var s = 128u; s > 0u; s = s >> 1u) {\n        if (t < s) { red[t] = red[t] + red[t + s]; }\n        workgroupBarrier();\n    }\n    let r = red[0];\n    workgroupBarrier();\n    return r;\n}\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n    let row = wg_index(wid, nwg);\n    if (row >= p.rows) { return; }\n    let t = lid.x;\n    let base = row * p.dim;\n    var s = 0.0;\n    for (var j = t; j < p.dim; j = j + 256u) {\n        var v = h[base + j];\n        if (p.mode == 1u) {\n            var g = 1.0;\n            if (p.has_gate != 0u) { g = mods[p.gate * p.dim + j]; }\n            v = v + a[base + j] * g;\n            h[base + j] = v;\n        }\n        s = s + v;\n    }\n    let mean = block_sum(s, t) / f32(p.dim);\n    var q = 0.0;\n    for (var j = t; j < p.dim; j = j + 256u) {\n        let dv = h[base + j] - mean;\n        q = q + dv * dv;\n    }\n    let inv = inverseSqrt(block_sum(q, t) / f32(p.dim) + p.eps);\n    for (var j = t; j < p.dim; j = j + 256u) {\n        let n = (h[base + j] - mean) * inv;\n        var o: f32;\n        if (p.affine != 0u) {\n            o = n * nw[j] + nb[j];\n        } else {\n            o = n * (1.0 + mods[p.scale * p.dim + j]) + mods[p.shift * p.dim + j];\n        }\n        out[base + j] = o;\n    }\n}\n",
+ "head_split": "// One 256-thread workgroup per token: optional RMS across all heads, optional\n// interleaved-pair RoPE, scatter to [heads, rows, head_dim].\nstruct P { rows: u32, stride: u32, col_off: u32, heads: u32, hd: u32, has_norm: u32, has_rope: u32, _a: u32, eps: f32, _b: u32, _c: u32, _d: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> src: array<f32>;\n@group(0) @binding(2) var<storage, read> nw: array<f32>;\n@group(0) @binding(3) var<storage, read> cs: array<f32>;\n@group(0) @binding(4) var<storage, read> sn: array<f32>;\n@group(0) @binding(5) var<storage, read_write> out: array<f32>;\n\nvar<workgroup> red: array<f32, 256>;\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n    let r = wg_index(wid, nwg);\n    if (r >= p.rows) { return; }\n    let t = lid.x;\n    let width = p.heads * p.hd;\n    let base = r * p.stride + p.col_off;\n    var inv = 1.0;\n    if (p.has_norm != 0u) {\n        var s = 0.0;\n        for (var j = t; j < width; j = j + 256u) { let v = src[base + j]; s = s + v * v; }\n        red[t] = s;\n        workgroupBarrier();\n        for (var k = 128u; k > 0u; k = k >> 1u) {\n            if (t < k) { red[t] = red[t] + red[t + k]; }\n            workgroupBarrier();\n        }\n        inv = inverseSqrt(red[0] / f32(width) + p.eps);\n    }\n    let half = p.hd / 2u;\n    for (var pi = t; pi < width / 2u; pi = pi + 256u) {\n        let j = 2u * pi;\n        let hh = j / p.hd;\n        let c = j % p.hd;\n        var x1 = src[base + j];\n        var x2 = src[base + j + 1u];\n        if (p.has_norm != 0u) {\n            x1 = x1 * inv * nw[j];\n            x2 = x2 * inv * nw[j + 1u];\n        }\n        if (p.has_rope != 0u) {\n            let ti = r * half + c / 2u;\n            let co = cs[ti];\n            let si = sn[ti];\n            let y1 = x1 * co - x2 * si;\n            let y2 = x1 * si + x2 * co;\n            x1 = y1;\n            x2 = y2;\n        }\n        let o = (hh * p.rows + r) * p.hd + c;\n        out[o] = x1;\n        out[o + 1u] = x2;\n    }\n}\n",
+ "elementwise": "// Small elementwise kernels, one thread per output element, 256 per group.\n//   op 0 gate_residual: x[i] += y[i] · aux[gate·dim + i % dim]\n//   op 1 dmd_step:      x0 = x − σt·y; x = has_aux ? (1−σn)·x0 + σn·aux : x0\n//   op 2 tanh_clamp:    x = tanh(x / s) · s\n//   op 3 patchify:      x[tok, f] = y[latent]       (gather)\n//   op 4 unpatchify:    x[latent] = y[tok, f]       (gather)\nstruct P { n: u32, op: u32, dim: u32, gate: u32, has_aux: u32, c: u32, t: u32, hh: u32, ww: u32, pp: u32, s0: f32, s1: f32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read_write> x: array<f32>;\n@group(0) @binding(2) var<storage, read> y: array<f32>;\n@group(0) @binding(3) var<storage, read> aux: array<f32>;\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n    let i = wg_index(wid, nwg) * 256u + lid.x;\n    if (i >= p.n) { return; }\n    switch p.op {\n        case 0u: { x[i] = x[i] + y[i] * aux[p.gate * p.dim + i % p.dim]; }\n        case 1u: {\n            let x0 = x[i] - p.s0 * y[i];\n            if (p.has_aux != 0u) { x[i] = (1.0 - p.s1) * x0 + p.s1 * aux[i]; } else { x[i] = x0; }\n        }\n        case 2u: { x[i] = tanh_safe(x[i] / p.s0) * p.s0; }\n        case 3u: {\n            // i = tok·F + f, f = c'·p² + kh·p + kw\n            let f = p.c * p.pp * p.pp;\n            let tok = i / f;\n            let fi = i % f;\n            let cc = fi / (p.pp * p.pp);\n            let kh = (fi / p.pp) % p.pp;\n            let kw = fi % p.pp;\n            let gw = p.ww / p.pp;\n            let gh = p.hh / p.pp;\n            let tt = tok / (gh * gw);\n            let yy = (tok / gw) % gh;\n            let xg = tok % gw;\n            x[i] = y[((cc * p.t + tt) * p.hh + yy * p.pp + kh) * p.ww + xg * p.pp + kw];\n        }\n        default: {\n            // i = ((c'·t + tt)·hh + y)·ww + xx\n            let xx = i % p.ww;\n            let yy = (i / p.ww) % p.hh;\n            let tt = (i / (p.ww * p.hh)) % p.t;\n            let cc = i / (p.ww * p.hh * p.t);\n            let gw = p.ww / p.pp;\n            let gh = p.hh / p.pp;\n            let tok = (tt * gh + yy / p.pp) * gw + xx / p.pp;\n            let f = p.c * p.pp * p.pp;\n            x[i] = y[tok * f + ((yy % p.pp) * p.pp + xx % p.pp) * p.c + cc];\n        }\n    }\n    if (p.op == 9999u) { x[0] = aux[0]; }\n}\n",
+ "flash": "// Register-tiled flash attention, for dense attention and the VSA fine stage.\n//\n// One workgroup = 64 query rows of one head, 256 threads as 16×16. Each key\n// chunk of 64:\n//   S = Q·Kᵀ    like the linear kernel: d in steps of 16 through shared memory,\n//               each thread a 4×4 block of S in registers (rows ty+16i, cols tx+16j);\n//   softmax     online, base 2, one thread per row over the 64×64 tile in shared memory;\n//   O += P·V    each thread owns 4 rows × d/16 columns of O in registers.\n// Nothing lives in per-thread arrays larger than 32 floats, which is what the\n// one-row-per-thread kernel got wrong (its q/acc arrays of 128 spill).\n//\n// mode 0 dense: query rows wid.x·64 + r, key chunks of consecutive rows.\n// mode 1 VSA:   query tile wid.x (slots via `slot`), key chunk c = selected tile\n//               sel[h][qt][c]; out = O/l + coarse[h][qt] · gate[h][token].\nstruct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> q: array<f32>;\n@group(0) @binding(2) var<storage, read> k: array<f32>;\n@group(0) @binding(3) var<storage, read> v: array<f32>;\n@group(0) @binding(4) var<storage, read_write> out: array<f32>;\n@group(0) @binding(5) var<storage, read> slot: array<u32>;\n@group(0) @binding(6) var<storage, read> sel: array<u32>;\n@group(0) @binding(7) var<storage, read> coarse: array<f32>;\n@group(0) @binding(8) var<storage, read> gate: array<f32>;\n\nconst PAD: u32 = 0xffffffffu;\nconst SS: u32 = 65u;   // padded row stride of the S/P tile\n\nvar<workgroup> buf: array<f32, 2048>;     // Q|K panels (2×16×64) or a V panel (16×128)\nvar<workgroup> ss: array<f32, 4160>;      // 64 × 65\nvar<workgroup> rowm: array<f32, 64>;\nvar<workgroup> rowl: array<f32, 64>;\nvar<workgroup> rowc: array<f32, 64>;\nvar<workgroup> qrows: array<u32, 64>;     // token of each query row (PAD if none)\nvar<workgroup> krows: array<u32, 64>;     // token of each key row in this chunk\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wid: vec3<u32>) {\n    let tx = tid % 16u;\n    let ty = tid / 16u;\n    let h = wid.y;\n    let qt = wid.x;\n    let d = p.d;\n    let nd = d / 16u;\n    if (tid < 64u) {\n        var tok = PAD;\n        if (p.mode == 0u) {\n            let r = qt * 64u + tid;\n            if (r < p.sq) { tok = r; }\n        } else {\n            tok = slot[qt * 64u + tid];\n        }\n        qrows[tid] = tok;\n        rowm[tid] = -1e30;\n        rowl[tid] = 0.0;\n    }\n    // O block: rows ty + 16i, cols tx + 16j (j < 8) as two vec4 per row.\n    var o0a = vec4<f32>(0.0); var o0b = vec4<f32>(0.0);\n    var o1a = vec4<f32>(0.0); var o1b = vec4<f32>(0.0);\n    var o2a = vec4<f32>(0.0); var o2b = vec4<f32>(0.0);\n    var o3a = vec4<f32>(0.0); var o3b = vec4<f32>(0.0);\n    var nchunks = (p.sk + 63u) / 64u;\n    if (p.mode == 1u) { nchunks = p.topk; }\n    workgroupBarrier();\n\n    for (var c = 0u; c < nchunks; c = c + 1u) {\n        if (tid < 64u) {\n            var tok = PAD;\n            if (p.mode == 0u) {\n                let r = c * 64u + tid;\n                if (r < p.sk) { tok = r; }\n            } else {\n                let tile = sel[(h * p.nb + qt) * p.topk + c];\n                tok = slot[tile * 64u + tid];\n            }\n            krows[tid] = tok;\n        }\n        workgroupBarrier();\n        // S = Q·Kᵀ over d in panels of 16. The 4×4 block is four named vec4\n        // (rows ty + 16i, cols tx + 16j): arrays here were kept in local\n        // memory by NVIDIA's Vulkan compiler (5.75× on the GEMM when unrolled).\n        var s0 = vec4<f32>(0.0);\n        var s1 = vec4<f32>(0.0);\n        var s2 = vec4<f32>(0.0);\n        var s3 = vec4<f32>(0.0);\n        for (var d0 = 0u; d0 < d; d0 = d0 + 16u) {\n            for (var e = tid; e < 1024u; e = e + 256u) {\n                let r = e / 16u;\n                let kk = e % 16u;\n                let qtok = qrows[r];\n                var qv = 0.0;\n                if (qtok != PAD) { qv = q[(h * p.sq + qtok) * d + d0 + kk]; }\n                buf[kk * 64u + r] = qv;\n                let ktok = krows[r];\n                var kv = 0.0;\n                if (ktok != PAD) { kv = k[(h * p.sk + ktok) * d + d0 + kk]; }\n                buf[1024u + kk * 64u + r] = kv;\n            }\n            workgroupBarrier();\n            for (var kk = 0u; kk < 16u; kk = kk + 1u) {\n                let o = kk * 64u;\n                let b = vec4<f32>(buf[1024u + o + tx], buf[1024u + o + tx + 16u], buf[1024u + o + tx + 32u], buf[1024u + o + tx + 48u]);\n                s0 = fma(vec4<f32>(buf[o + ty]), b, s0);\n                s1 = fma(vec4<f32>(buf[o + ty + 16u]), b, s1);\n                s2 = fma(vec4<f32>(buf[o + ty + 32u]), b, s2);\n                s3 = fma(vec4<f32>(buf[o + ty + 48u]), b, s3);\n            }\n            workgroupBarrier();\n        }\n        let sv = array<vec4<f32>, 4>(s0, s1, s2, s3);\n        for (var i = 0u; i < 4u; i = i + 1u) {\n            let row = sv[i];\n            for (var j = 0u; j < 4u; j = j + 1u) {\n                let col = tx + 16u * j;\n                var val = -1e30;\n                if (krows[col] != PAD) { val = row[j] * p.scale_log2; }\n                ss[(ty + 16u * i) * SS + col] = val;\n            }\n        }\n        workgroupBarrier();\n        // Online softmax, one thread per row.\n        if (tid < 64u) {\n            let base = tid * SS;\n            var mx = rowm[tid];\n            for (var j = 0u; j < 64u; j = j + 1u) { mx = max(mx, ss[base + j]); }\n            let corr = exp2(rowm[tid] - mx);\n            var sum = 0.0;\n            for (var j = 0u; j < 64u; j = j + 1u) {\n                let e = exp2(ss[base + j] - mx);\n                ss[base + j] = e;\n                sum = sum + e;\n            }\n            rowl[tid] = rowl[tid] * corr + sum;\n            rowm[tid] = mx;\n            rowc[tid] = corr;\n        }\n        workgroupBarrier();\n        let c0 = rowc[ty]; let c1 = rowc[ty + 16u]; let c2 = rowc[ty + 32u]; let c3 = rowc[ty + 48u];\n        o0a = o0a * c0; o0b = o0b * c0;\n        o1a = o1a * c1; o1b = o1b * c1;\n        o2a = o2a * c2; o2b = o2b * c2;\n        o3a = o3a * c3; o3b = o3b * c3;\n        // O += P·V, keys in panels of 16.\n        for (var k0 = 0u; k0 < 64u; k0 = k0 + 16u) {\n            for (var e = tid; e < 16u * d; e = e + 256u) {\n                let kk = e / d;\n                let col = e % d;\n                let ktok = krows[k0 + kk];\n                var vv = 0.0;\n                if (ktok != PAD) { vv = v[(h * p.sk + ktok) * d + col]; }\n                buf[kk * 128u + col] = vv;\n            }\n            workgroupBarrier();\n            for (var kk = 0u; kk < 16u; kk = kk + 1u) {\n                // V columns beyond d hold stale values; they only feed O\n                // columns that are never stored.\n                let vo = kk * 128u + tx;\n                let va = vec4<f32>(buf[vo], buf[vo + 16u], buf[vo + 32u], buf[vo + 48u]);\n                let vb = vec4<f32>(buf[vo + 64u], buf[vo + 80u], buf[vo + 96u], buf[vo + 112u]);\n                let pc = k0 + kk;\n                let p0 = vec4<f32>(ss[ty * SS + pc]);\n                let p1 = vec4<f32>(ss[(ty + 16u) * SS + pc]);\n                let p2 = vec4<f32>(ss[(ty + 32u) * SS + pc]);\n                let p3 = vec4<f32>(ss[(ty + 48u) * SS + pc]);\n                o0a = fma(p0, va, o0a); o0b = fma(p0, vb, o0b);\n                o1a = fma(p1, va, o1a); o1b = fma(p1, vb, o1b);\n                o2a = fma(p2, va, o2a); o2b = fma(p2, vb, o2b);\n                o3a = fma(p3, va, o3a); o3b = fma(p3, vb, o3b);\n            }\n            workgroupBarrier();\n        }\n    }\n    let oa = array<vec4<f32>, 4>(o0a, o1a, o2a, o3a);\n    let ob = array<vec4<f32>, 4>(o0b, o1b, o2b, o3b);\n    for (var i = 0u; i < 4u; i = i + 1u) {\n        let r = ty + 16u * i;\n        let tok = qrows[r];\n        if (tok == PAD) { continue; }\n        let inv = 1.0 / rowl[r];\n        for (var j = 0u; j < nd; j = j + 1u) {\n            let col = tx + 16u * j;\n            var o: f32;\n            if (j < 4u) { o = oa[i][j]; } else { o = ob[i][j - 4u]; }\n            o = o * inv;\n            if (p.mode == 1u) {\n                o = o + coarse[(h * p.nb + qt) * d + col] * gate[(h * p.sq + tok) * d + col];\n            }\n            out[(tok * p.heads + h) * d + col] = o;\n        }\n    }\n}\n",
+ "vsa_pool": "// VSA tile means: one workgroup per (tile, head); thread c < d averages\n// column c of q, k, v over the tile's real tokens.\nstruct P { heads: u32, seq: u32, d: u32, nb: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> q: array<f32>;\n@group(0) @binding(2) var<storage, read> k: array<f32>;\n@group(0) @binding(3) var<storage, read> v: array<f32>;\n@group(0) @binding(4) var<storage, read> slot: array<u32>;\n@group(0) @binding(5) var<storage, read> bsz: array<u32>;\n@group(0) @binding(6) var<storage, read_write> pooled: array<f32>;   // [3][heads][nb][d]\n\n@compute @workgroup_size(128)\nfn main(@builtin(local_invocation_index) c: u32, @builtin(workgroup_id) wid: vec3<u32>) {\n    let t = wid.x;\n    let h = wid.y;\n    if (c >= p.d) { return; }\n    let n = bsz[t];\n    var sq = 0.0;\n    var sk = 0.0;\n    var sv = 0.0;\n    for (var i = 0u; i < n; i = i + 1u) {\n        let idx = (h * p.seq + slot[t * 64u + i]) * p.d + c;\n        sq = sq + q[idx];\n        sk = sk + k[idx];\n        sv = sv + v[idx];\n    }\n    let inv = 1.0 / f32(max(n, 1u));\n    let o = (h * p.nb + t) * p.d + c;\n    let plane = p.heads * p.nb * p.d;\n    pooled[o] = sq * inv;\n    pooled[plane + o] = sk * inv;\n    pooled[2u * plane + o] = sv * inv;\n}\n",
+ "vsa_coarse": "// VSA coarse stage: one workgroup per (query tile, head), 256 threads.\n//   scores    s[kt] = mean q · mean k · scale over all key tiles (≤ 2048);\n//   select    the top-k key tiles: every tile scoring above the k-th largest,\n//             then ties at it by lower index (= sorting by (score desc, index\n//             asc)), written in index order;\n//   coarse    coarse[h][qt] = Σ softmax(s)[kt] · mean v[kt].\n//\n// Top-k is a radix select over the scores' order-preserving u32 keys, 4 bits\n// per pass (8 passes): each thread counts its own keys into 16 digit counters\n// packed 4 per u32 (≤ 8 keys per thread, so a byte holds a count) in a column\n// only it writes; the 16 totals come from a two-level sum. No atomics: the\n// workgroup-atomic version of this search picked the wrong tiles on an AMD\n// RDNA1 Mac (Chrome → Metal) while Apple, NVIDIA and SwiftShader were exact\n// (2026-11-17 browser self-test), and a plain atomic-free bit search needed\n// ~288 barriers per workgroup where this needs ~50. The selected tiles are\n// written by all threads at once after a prefix scan of per-thread counts\n// over contiguous index slices (the old code had thread 0 write them alone).\n// exp(s − max) is computed once per tile, after the selection, not once per\n// tile per output column. Workgroup memory: 8 + 1 + 4 + 1 KiB (+64 B), under\n// WebGPU's 16 KiB default.\nstruct P { heads: u32, d: u32, nb: u32, topk: u32, scale: f32, _a: u32, _b: u32, _c: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> pooled: array<f32>;\n@group(0) @binding(2) var<storage, read_write> coarse: array<f32>;\n@group(0) @binding(3) var<storage, read_write> sel: array<u32>;\n\nvar<workgroup> sc: array<f32, 2048>;\nvar<workgroup> red: array<f32, 256>;\n// Digit counters: word w, thread t at hist[w * 256 + t]; digit g in byte g % 4 of word g / 4.\nvar<workgroup> hist: array<u32, 1024>;\n// Partial digit sums (bucket · 16 + chunk), then the prefix scan.\nvar<workgroup> part: array<u32, 256>;\nvar<workgroup> tot: array<u32, 16>;\n\n// Float → u32 with the same order.\nfn okey(x: f32) -> u32 {\n    let b = bitcast<u32>(x);\n    return select(b | 0x80000000u, ~b, (b & 0x80000000u) != 0u);\n}\n\n@compute @workgroup_size(256)\nfn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wid: vec3<u32>) {\n    let qt = wid.x;\n    let h = wid.y;\n    let nb = p.nb;\n    let plane = p.heads * nb * p.d;\n    let qb = (h * nb + qt) * p.d;\n    var mx = -3.0e38;\n    for (var kt = tid; kt < nb; kt = kt + 256u) {\n        let kb = plane + (h * nb + kt) * p.d;\n        var dot = 0.0;\n        for (var c = 0u; c < p.d; c = c + 1u) { dot = fma(pooled[qb + c], pooled[kb + c], dot); }\n        let s = dot * p.scale;\n        sc[kt] = s;\n        mx = max(mx, s);\n    }\n    red[tid] = mx;\n    workgroupBarrier();\n    for (var st = 128u; st > 0u; st = st >> 1u) {\n        if (tid < st) { red[tid] = max(red[tid], red[tid + st]); }\n        workgroupBarrier();\n    }\n    let m = red[0];\n\n    // Each thread's contiguous slice of key tiles (≤ 8 of them).\n    let per = (nb + 255u) / 256u;\n    let lo = min(tid * per, nb);\n    let hi = min(lo + per, nb);\n\n    // Radix select: the k-th largest key, 4 bits per pass from the top.\n    var prefix = 0u;\n    var krem = p.topk;\n    for (var pi = 0u; pi < 8u; pi = pi + 1u) {\n        let shift = 28u - 4u * pi;\n        var w0 = 0u; var w1 = 0u; var w2 = 0u; var w3 = 0u;\n        for (var kt = lo; kt < hi; kt = kt + 1u) {\n            let key = okey(sc[kt]);\n            if (pi == 0u || (key >> (shift + 4u)) == prefix) {\n                let g = (key >> shift) & 15u;\n                let inc = 1u << ((g & 3u) * 8u);\n                let wsel = g >> 2u;\n                w0 = w0 + select(0u, inc, wsel == 0u);\n                w1 = w1 + select(0u, inc, wsel == 1u);\n                w2 = w2 + select(0u, inc, wsel == 2u);\n                w3 = w3 + select(0u, inc, wsel == 3u);\n            }\n        }\n        hist[tid] = w0;\n        hist[256u + tid] = w1;\n        hist[512u + tid] = w2;\n        hist[768u + tid] = w3;\n        workgroupBarrier();\n        {\n            // Bucket b's count over threads 16·c .. 16·c + 15.\n            let b = tid / 16u;\n            let c = tid % 16u;\n            let base = (b >> 2u) * 256u + c * 16u;\n            let sh = (b & 3u) * 8u;\n            var s = 0u;\n            for (var i = 0u; i < 16u; i = i + 1u) { s = s + ((hist[base + i] >> sh) & 255u); }\n            part[b * 16u + c] = s;\n        }\n        workgroupBarrier();\n        if (tid < 16u) {\n            var s = 0u;\n            for (var i = 0u; i < 16u; i = i + 1u) { s = s + part[tid * 16u + i]; }\n            tot[tid] = s;\n        }\n        workgroupBarrier();\n        // Every thread walks the totals from the top digit (same answer everywhere).\n        var acc = 0u;\n        var digit = 0u;\n        var found = false;\n        for (var j = 0u; j < 16u; j = j + 1u) {\n            let g = 15u - j;\n            let n = tot[g];\n            if (!found) {\n                if (acc + n >= krem) {\n                    digit = g;\n                    krem = krem - acc;\n                    found = true;\n                } else {\n                    acc = acc + n;\n                }\n            }\n        }\n        prefix = (prefix << 4u) | digit;\n        workgroupBarrier();\n    }\n    let t = prefix;\n\n    // Write the selection: keys above t, then ties at t up to top-k, each in\n    // index order. Exclusive prefix of (above, tie) counts packed 16 + 16 bits.\n    var na = 0u;\n    var ne = 0u;\n    for (var kt = lo; kt < hi; kt = kt + 1u) {\n        let key = okey(sc[kt]);\n        na = na + select(0u, 1u, key > t);\n        ne = ne + select(0u, 1u, key == t);\n    }\n    let mine = na | (ne << 16u);\n    part[tid] = mine;\n    workgroupBarrier();\n    for (var off = 1u; off < 256u; off = off << 1u) {\n        var v = part[tid];\n        if (tid >= off) { v = v + part[tid - off]; }\n        workgroupBarrier();\n        part[tid] = v;\n        workgroupBarrier();\n    }\n    let excl = part[tid] - mine;\n    let above = part[255] & 0xffffu;\n    let out0 = (h * nb + qt) * p.topk;\n    var pa = excl & 0xffffu;\n    var pe = above + (excl >> 16u);\n    for (var kt = lo; kt < hi; kt = kt + 1u) {\n        let key = okey(sc[kt]);\n        if (key > t) {\n            sel[out0 + pa] = kt;\n            pa = pa + 1u;\n        } else if (key == t) {\n            if (pe < p.topk) { sel[out0 + pe] = kt; }\n            pe = pe + 1u;\n        }\n    }\n    workgroupBarrier();\n\n    // Softmax weights once per tile, then the coarse output.\n    var z = 0.0;\n    for (var kt = tid; kt < nb; kt = kt + 256u) {\n        let e = exp(sc[kt] - m);\n        sc[kt] = e;\n        z = z + e;\n    }\n    red[tid] = z;\n    workgroupBarrier();\n    for (var st = 128u; st > 0u; st = st >> 1u) {\n        if (tid < st) { red[tid] = red[tid] + red[tid + st]; }\n        workgroupBarrier();\n    }\n    let zt = red[0];\n    if (tid < p.d) {\n        var o = 0.0;\n        for (var kt = 0u; kt < nb; kt = kt + 1u) {\n            o = fma(sc[kt], pooled[2u * plane + (h * nb + kt) * p.d + tid], o);\n        }\n        coarse[qb + tid] = o / zt;\n    }\n}\n",
+ "linear3": "// y[y_row + m, n] = act(Σ_k x[x_row + m, k] · W[n, k] + b[n]), third version:\n// the 64×64 / 4×4-per-thread kernel of `linear.wgsl` with the register block\n// written out by hand — four named vec4 accumulators, no arrays, no loops over\n// them. Tests whether the array accumulators were being spilled to local\n// memory by the driver's compiler (both 64×64 and 128×128 tiles measured\n// ~2 TFLOP/s on an RTX 4090).\nstruct P { m: u32, n: u32, k: u32, x_row: u32, y_row: u32, has_bias: u32, act: u32, _p: u32 }\n@group(0) @binding(0) var<uniform> p: P;\n@group(0) @binding(1) var<storage, read> x: array<f32>;\n@group(0) @binding(2) var<storage, read> w: array<{W_TYPE}>;\n@group(0) @binding(3) var<storage, read> bias: array<f32>;\n@group(0) @binding(4) var<storage, read_write> y: array<f32>;\n\nfn load_w(i: u32) -> f32 { {W_LOAD} }\n\nvar<workgroup> xs: array<f32, 1024>;   // [16 k][64 rows]\nvar<workgroup> ws: array<f32, 1024>;   // [16 k][64 cols]\n\nfn store(m: u32, n: u32, v: f32) {\n    if (m >= p.m || n >= p.n) { return; }\n    var o = v;\n    if (p.has_bias != 0u) { o = o + bias[n]; }\n    if (p.act == 1u) { o = gelu_tanh(o); }\n    y[(p.y_row + m) * p.n + n] = o;\n}\n\n@compute @workgroup_size(16, 16)\nfn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {\n    let m0 = wid.y * 64u;\n    let n0 = wid.x * 64u;\n    let tx = lid.x;\n    let ty = lid.y;\n    let tid = ty * 16u + tx;\n    var c0 = vec4<f32>(0.0);   // row ty,      cols tx + 16j\n    var c1 = vec4<f32>(0.0);   // row ty + 16\n    var c2 = vec4<f32>(0.0);   // row ty + 32\n    var c3 = vec4<f32>(0.0);   // row ty + 48\n    for (var k0 = 0u; k0 < p.k; k0 = k0 + 16u) {\n        for (var t = 0u; t < 4u; t = t + 1u) {\n            let e = tid + t * 256u;\n            let r = e / 16u;\n            let kk = e % 16u;\n            let gk = k0 + kk;\n            var xv = 0.0;\n            if (m0 + r < p.m && gk < p.k) { xv = x[(p.x_row + m0 + r) * p.k + gk]; }\n            xs[kk * 64u + r] = xv;\n            var wv = 0.0;\n            if (n0 + r < p.n && gk < p.k) { wv = load_w((n0 + r) * p.k + gk); }\n            ws[kk * 64u + r] = wv;\n        }\n        workgroupBarrier();\n        for (var kk = 0u; kk < 16u; kk = kk + 1u) {\n            let o = kk * 64u;\n            let b = vec4<f32>(ws[o + tx], ws[o + tx + 16u], ws[o + tx + 32u], ws[o + tx + 48u]);\n            c0 = fma(vec4<f32>(xs[o + ty]), b, c0);\n            c1 = fma(vec4<f32>(xs[o + ty + 16u]), b, c1);\n            c2 = fma(vec4<f32>(xs[o + ty + 32u]), b, c2);\n            c3 = fma(vec4<f32>(xs[o + ty + 48u]), b, c3);\n        }\n        workgroupBarrier();\n    }\n    let rows = array<vec4<f32>, 4>(c0, c1, c2, c3);\n    for (var i = 0u; i < 4u; i = i + 1u) {\n        let m = m0 + ty + 16u * i;\n        let v = rows[i];\n        store(m, n0 + tx, v.x);\n        store(m, n0 + tx + 16u, v.y);\n        store(m, n0 + tx + 32u, v.z);\n        store(m, n0 + tx + 48u, v.w);\n    }\n}\n"
+};
+const $ = (id) => document.getElementById(id);
+const MAX_DIM = 65535;
+let device, adapter, dummy, attnBK = 16, flashOK = false;
+// Shared memory flash.wgsl declares: Q|K panel, S tile, row state.
+const FLASH_SHARED = 2048 * 4 + 4160 * 4 + 5 * 64 * 4;
+const pipes = new Map();
+
+// ---- f16 packing (round to nearest) ------------------------------------
+const f32b = new Float32Array(1), u32b = new Uint32Array(f32b.buffer);
+function toHalf(v) {
+  f32b[0] = v; const x = u32b[0];
+  const sign = (x >>> 16) & 0x8000; let e = ((x >>> 23) & 0xff) - 112; let m = x & 0x7fffff;
+  if (e >= 31) return sign | 0x7c00;
+  if (e <= 0) { if (e < -10) return sign; m = (m | 0x800000) >>> (1 - e); return sign | ((m + 0x1000) >>> 13); }
+  return sign | ((e << 10) + ((m + 0x1000) >>> 13));
+}
+function packHalf(a) { const o = new Uint32Array(a.length / 2); for (let i = 0; i < o.length; i++) o[i] = toHalf(a[2*i]) | (toHalf(a[2*i+1]) << 16); return o; }
+
+// ---- deterministic inputs -------------------------------------------------
+let seed = 42;
+function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+function normal(n) { const o = new Float32Array(n); for (let i = 0; i < n; i++) { const u = rnd() || 1e-9, v = rnd(); o[i] = Math.sqrt(-2 * Math.log(u)) * Math.cos(6.283185307 * v); } return o; }
+function uniform(n, a) { const o = new Float32Array(n); for (let i = 0; i < n; i++) o[i] = (rnd() * 2 - 1) * a; return o; }
+
+// ---- GPU plumbing (mirrors fastwan-wgpu/src/lib.rs) ------------------------
+const USAGE = () => GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+function upload(data) {
+  const b = device.createBuffer({ size: Math.max(16, data.byteLength), usage: USAGE(), mappedAtCreation: true });
+  new data.constructor(b.getMappedRange()).set(data); b.unmap(); return b;
+}
+function alloc(n) { return device.createBuffer({ size: Math.max(16, n * 4), usage: USAGE() }); }
+function weight(data, rows, cols) {
+  const f16 = cols % 2 === 0 && data.every((v) => Math.abs(v) <= 65000);
+  return { buf: upload(f16 ? packHalf(data) : data), rows, cols, f16 };
+}
+function weightSrc(src, f16) {
+  return f16 ? src.replace("{W_TYPE}", "u32").replace("{W_LOAD}", "let v = unpack2x16float(w[i >> 1u]); return select(v.x, v.y, (i & 1u) == 1u);")
+             : src.replace("{W_TYPE}", "f32").replace("{W_LOAD}", "return w[i];");
+}
+function pipeline(key, make) {
+  if (!pipes.has(key)) {
+    const module = device.createShaderModule({ label: key, code: SHADERS.common + "\n" + make() });
+    pipes.set(key, device.createComputePipeline({ label: key, layout: "auto", compute: { module, entryPoint: "main" } }));
+  }
+  return pipes.get(key);
+}
+function params(words) { // numbers are u32; {f: x} is an f32
+  const n = Math.ceil(words.length / 4) * 4, buf = new ArrayBuffer(n * 4), u = new Uint32Array(buf), f = new Float32Array(buf);
+  words.forEach((w, i) => { if (typeof w === "object") f[i] = w.f; else u[i] = w >>> 0; });
+  const b = device.createBuffer({ size: n * 4, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true });
+  new Uint32Array(b.getMappedRange()).set(u); b.unmap(); return b;
+}
+let enc = null;
+function dispatch(pipe, words, bufs, groups) {
+  const entries = [{ binding: 0, resource: { buffer: params(words) } }, ...bufs.map((b, i) => ({ binding: i + 1, resource: { buffer: b } }))];
+  const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+  enc ??= device.createCommandEncoder();
+  const pass = enc.beginComputePass(); pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(...groups); pass.end();
+}
+function flush() { if (enc) { device.queue.submit([enc.finish()]); enc = null; } }
+async function download(buf, n) {
+  const st = device.createBuffer({ size: Math.max(16, n * 4), usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  enc ??= device.createCommandEncoder(); enc.copyBufferToBuffer(buf, 0, st, 0, Math.max(16, n * 4)); flush();
+  await st.mapAsync(GPUMapMode.READ); const out = new Float32Array(st.getMappedRange().slice(0, n * 4)); st.unmap(); st.destroy(); return out;
+}
+const grid = (n) => { n = Math.max(1, n); if (n <= MAX_DIM) return [n, 1, 1]; const y = Math.ceil(n / MAX_DIM); return [Math.ceil(n / y), y, 1]; };
+
+// ---- ops ------------------------------------------------------------------
+const GPU = {
+  linear(x, xRow, rows, w, bias, act, y, yRow) {
+    // linear3: the engine's default GEMM (hand-unrolled vec4 accumulators).
+    const p = pipeline(w.f16 ? "linear3_f16" : "linear3_f32", () => weightSrc(SHADERS.linear3, w.f16));
+    dispatch(p, [rows, w.rows, w.cols, xRow, yRow, bias ? 1 : 0, act], [x, w.buf, bias ?? dummy, y], [Math.ceil(w.rows / 64), Math.ceil(rows / 64), 1]);
+  },
+  norm(h, a, rows, dim, mods, gate, norm, eps, out) {
+    const p = pipeline("norm", () => SHADERS.norm);
+    const aff = norm.w ? 1 : 0;
+    dispatch(p, [rows, dim, a ? 1 : 0, gate ?? 0, gate == null ? 0 : 1, aff, norm.scale ?? 0, norm.shift ?? 0, { f: eps }],
+      [h, a ?? dummy, mods, norm.w ?? dummy, norm.b ?? dummy, out], grid(rows));
+  },
+  headSplit(src, rows, stride, col, heads, hd, w, rope, eps, out) {
+    const p = pipeline("head_split", () => SHADERS.head_split);
+    dispatch(p, [rows, stride, col, heads, hd, w ? 1 : 0, rope ? 1 : 0, 0, { f: eps }], [src, w ?? dummy, rope?.[0] ?? dummy, rope?.[1] ?? dummy, out], grid(rows));
+  },
+  flash(mode, q, k, v, out, heads, sq, sk, d, scale, st, gate) {
+    const p = pipeline("flash", () => SHADERS.flash);
+    dispatch(p, [heads, sq, sk, d, { f: scale * Math.LOG2E }, mode, st ? st.nb : 0, st ? st.topk : 0],
+      [q, k, v, out, st ? st.slot : dummy, st ? st.sel : dummy, st ? st.coarse : dummy, gate ?? dummy],
+      [mode === 0 ? Math.ceil(sq / 64) : st.nb, heads, 1]);
+  },
+  vsaPrepare(spec) {
+    const { plan, heads, d, topk } = spec, nb = plan.bsz.length;
+    return { nb, topk, heads, d, seq: plan.seq, scale: spec.scale, slot: upload(plan.slot), bsz: upload(plan.bsz),
+             pooled: alloc(3 * heads * nb * d), coarse: alloc(heads * nb * d), sel: upload(new Uint32Array(heads * nb * topk)) };
+  },
+  vsa(q, k, v, gate, st, out) {
+    dispatch(pipeline("vsa_pool", () => SHADERS.vsa_pool), [st.heads, st.seq, st.d, st.nb], [q, k, v, st.slot, st.bsz, st.pooled], [st.nb, st.heads, 1]);
+    dispatch(pipeline("vsa_coarse", () => SHADERS.vsa_coarse), [st.heads, st.d, st.nb, st.topk, { f: st.scale }], [st.pooled, st.coarse, st.sel], [st.nb, st.heads, 1]);
+    GPU.flash(1, q, k, v, out, st.heads, st.seq, st.seq, st.d, st.scale, st, gate);
+  },
+  attention(q, k, v, heads, sq, sk, d, out) {
+    if (flashOK && d % 16 === 0) return GPU.flash(0, q, k, v, out, heads, sq, sk, d, 1 / Math.sqrt(d), null, null);
+    const p = pipeline("attention" + attnBK, () => SHADERS.attention.replaceAll("{BK_D}", String(attnBK * 128)).replaceAll("{BK}", String(attnBK)));
+    dispatch(p, [heads, sq, sk, d, { f: 1 / Math.sqrt(d) }], [q, k, v, out], [Math.ceil(sq / 64), heads, 1]);
+  },
+  elem(op, x, y, aux, n, extra, s0 = 0, s1 = 0) {
+    const p = pipeline("elementwise", () => SHADERS.elementwise);
+    dispatch(p, [n, op, ...extra, { f: s0 }, { f: s1 }], [x, y ?? dummy, aux ?? dummy], grid(Math.ceil(n / 256)));
+  },
+  conv(a, b, s, w, bias, ep, res, out) {
+    const p = pipeline(w.f16 ? "conv_f16" : "conv_f32", () => weightSrc(SHADERS.conv, w.f16));
+    const up = s.up ? 2 : 1, mt = Math.ceil(s.frames * s.h * up * s.w * up / 64);
+    const [gy, gz] = mt <= MAX_DIM ? [mt, 1] : [Math.ceil(mt / Math.ceil(mt / MAX_DIM)), Math.ceil(mt / MAX_DIM)];
+    dispatch(p, [s.frames, s.cinA, s.cinB, s.cout, s.h, s.w, up, s.k, b ? 1 : 0, bias ? 1 : 0, ep],
+      [a, b ?? dummy, w.buf, bias ?? dummy, res ?? dummy, out], [Math.ceil(s.cout / 64), gy, gz]);
+  },
+};
+
+// ---- VSA geometry (mirrors fastwan-core::vsa) -------------------------------
+const PAD = 0xffffffff;
+function tilePlan([t, h, w]) {
+  const tiles = [Math.ceil(t / 4), Math.ceil(h / 4), Math.ceil(w / 4)], nb = tiles[0] * tiles[1] * tiles[2];
+  const slot = new Uint32Array(nb * 64).fill(PAD), bsz = new Uint32Array(nb);
+  let tile = 0;
+  for (let tt = 0; tt < tiles[0]; tt++) for (let hh = 0; hh < tiles[1]; hh++) for (let ww = 0; ww < tiles[2]; ww++, tile++) {
+    let s = tile * 64;
+    for (let z = tt * 4; z < Math.min(t, tt * 4 + 4); z++) for (let y = hh * 4; y < Math.min(h, hh * 4 + 4); y++) for (let x = ww * 4; x < Math.min(w, ww * 4 + 4); x++) slot[s++] = (z * h + y) * w + x;
+    bsz[tile] = s - tile * 64;
+  }
+  return { slot, bsz, seq: t * h * w };
+}
+function vsaSpec(grid, heads, d, sparsity) {
+  const plan = tilePlan(grid), nb = plan.bsz.length;
+  return { plan, heads, d, scale: 1 / Math.sqrt(d), topk: Math.min(nb, Math.max(1, Math.ceil((1 - sparsity) * nb))) };
+}
+
+// ---- f32 reference (mirrors fastwan-cpu) -----------------------------------
+const gelu = (x) => 0.5 * x * (1 + Math.tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
+const REF = {
+  linear(x, xRow, rows, w, n, k, b, act, yLen, yRow) {
+    const y = new Float32Array(yLen);
+    for (let i = 0; i < rows; i++) for (let o = 0; o < n; o++) {
+      let acc = 0; for (let j = 0; j < k; j++) acc += x[(xRow + i) * k + j] * w[o * k + j];
+      acc += b ? b[o] : 0; y[(yRow + i) * n + o] = act ? gelu(acc) : acc;
+    } return y;
+  },
+  normRow(src, dim, norm, mods, eps) {
+    let m = 0; for (const v of src) m += v; m /= dim; let q = 0; for (const v of src) q += (v - m) ** 2;
+    const inv = 1 / Math.sqrt(q / dim + eps);
+    return src.map((v, j) => norm.w ? (v - m) * inv * norm.w[j] + norm.b[j] : (v - m) * inv * (1 + mods[norm.scale * dim + j]) + mods[norm.shift * dim + j]);
+  },
+  headSplit(src, rows, stride, col, heads, hd, w, rope, eps) {
+    const out = new Float32Array(rows * heads * hd), width = heads * hd, half = hd / 2;
+    for (let r = 0; r < rows; r++) {
+      const x = src.slice(r * stride + col, r * stride + col + width);
+      let v = Float32Array.from(x);
+      if (w) { let s = 0; for (const a of x) s += a * a; const inv = 1 / Math.sqrt(s / width + eps); v = v.map((a, j) => a * inv * w[j]); }
+      if (rope) for (let h = 0; h < heads; h++) for (let i = 0; i < half; i++) {
+        const c = rope[0][r * half + i], s = rope[1][r * half + i], a = v[h * hd + 2 * i], b = v[h * hd + 2 * i + 1];
+        v[h * hd + 2 * i] = a * c - b * s; v[h * hd + 2 * i + 1] = a * s + b * c;
+      }
+      for (let h = 0; h < heads; h++) for (let c = 0; c < hd; c++) out[(h * rows + r) * hd + c] = v[h * hd + c];
+    } return out;
+  },
+  attention(q, k, v, heads, sq, sk, d) {
+    const out = new Float32Array(sq * heads * d), sc = 1 / Math.sqrt(d), p = new Float64Array(sk);
+    for (let h = 0; h < heads; h++) for (let i = 0; i < sq; i++) {
+      let mx = -Infinity;
+      for (let j = 0; j < sk; j++) { let s = 0; for (let c = 0; c < d; c++) s += q[(h * sq + i) * d + c] * k[(h * sk + j) * d + c]; p[j] = s * sc; mx = Math.max(mx, p[j]); }
+      let den = 0; for (let j = 0; j < sk; j++) { p[j] = Math.exp(p[j] - mx); den += p[j]; }
+      for (let c = 0; c < d; c++) { let a = 0; for (let j = 0; j < sk; j++) a += p[j] * v[(h * sk + j) * d + c]; out[(i * heads + h) * d + c] = a / den; }
+    } return out;
+  },
+  // fastvideo-rs's VSA host oracle: tile means, coarse attention + top-k
+  // (score desc, index asc), fine attention in the picked tiles, + coarse·gate.
+  vsa(q, k, v, gate, { plan, heads, d, scale, topk }) {
+    const { slot, bsz, seq } = plan, nb = bsz.length, out = new Float32Array(seq * heads * d);
+    for (let h = 0; h < heads; h++) {
+      const m = [q, k, v].map(() => new Float64Array(nb * d));
+      for (let t = 0; t < nb; t++) {
+        for (let i = 0; i < bsz[t]; i++) { const tok = slot[t * 64 + i]; [q, k, v].forEach((src, j) => { for (let c = 0; c < d; c++) m[j][t * d + c] += src[(h * seq + tok) * d + c]; }); }
+        for (const mm of m) for (let c = 0; c < d; c++) mm[t * d + c] /= bsz[t];
+      }
+      for (let qt = 0; qt < nb; qt++) {
+        const sc = new Float64Array(nb);
+        for (let kt = 0; kt < nb; kt++) { let s = 0; for (let c = 0; c < d; c++) s += Math.fround(m[0][qt * d + c]) * Math.fround(m[1][kt * d + c]); sc[kt] = Math.fround(s * scale); }
+        let mx = -Infinity; for (const x of sc) mx = Math.max(mx, x);
+        let z = 0; const e = sc.map((x) => { const y = Math.exp(x - mx); z += y; return y; });
+        const coarse = new Float64Array(d);
+        for (let kt = 0; kt < nb; kt++) for (let c = 0; c < d; c++) coarse[c] += e[kt] / z * Math.fround(m[2][kt * d + c]);
+        const picks = Array.from({ length: nb }, (_, i) => i).sort((a, b) => sc[b] - sc[a] || a - b).slice(0, topk);
+        for (let qs = 0; qs < bsz[qt]; qs++) {
+          const qtok = slot[qt * 64 + qs], acc = new Float64Array(d);
+          let mm = -Infinity, zz = 0;
+          for (const kt of picks) for (let ks = 0; ks < bsz[kt]; ks++) {
+            const ktok = slot[kt * 64 + ks];
+            let s = 0; for (let c = 0; c < d; c++) s += q[(h * seq + qtok) * d + c] * k[(h * seq + ktok) * d + c];
+            s *= scale;
+            if (s > mm) { const shrink = isFinite(mm) ? Math.exp(mm - s) : 0; zz *= shrink; for (let c = 0; c < d; c++) acc[c] *= shrink; mm = s; }
+            const w = Math.exp(s - mm); zz += w;
+            for (let c = 0; c < d; c++) acc[c] += w * v[(h * seq + ktok) * d + c];
+          }
+          for (let c = 0; c < d; c++) out[(qtok * heads + h) * d + c] = coarse[c] * gate[(h * seq + qtok) * d + c] + acc[c] / zz;
+        }
+      }
+    }
+    return out;
+  },
+  conv(a, b, s, w, bias, ep, res) {
+    const up = s.up ? 2 : 1, oh = s.h * up, ow = s.w * up, cin = s.cinA + s.cinB, pad = s.k >> 1;
+    const out = new Float32Array(s.frames * s.cout * oh * ow);
+    for (let f = 0; f < s.frames; f++) for (let co = 0; co < s.cout; co++) for (let y = 0; y < oh; y++) for (let x = 0; x < ow; x++) {
+      let acc = bias ? bias[co] : 0;
+      for (let ci = 0; ci < cin; ci++) for (let ky = 0; ky < s.k; ky++) for (let kx = 0; kx < s.k; kx++) {
+        const yy = y + ky - pad, xx = x + kx - pad; if (yy < 0 || xx < 0 || yy >= oh || xx >= ow) continue;
+        const sy = Math.floor(yy / up), sx = Math.floor(xx / up);
+        const val = ci < s.cinA ? a[((f * s.cinA + ci) * s.h + sy) * s.w + sx] : b[((f * s.cinB + ci - s.cinA) * s.h + sy) * s.w + sx];
+        acc += w[(co * cin + ci) * s.k * s.k + ky * s.k + kx] * val;
+      }
+      const o = ((f * s.cout + co) * oh + y) * ow + x;
+      out[o] = ep === 1 ? Math.max(acc, 0) : ep === 2 ? Math.max(acc + res[o], 0) : acc;
+    } return out;
+  },
+};
+
+function relErr(a, b) {
+  let scale = 1e-6, worst = 0;
+  for (let i = 0; i < b.length; i++) { scale = Math.max(scale, Math.abs(b[i])); const d = Math.abs(a[i] - b[i]); worst = Number.isNaN(d) ? Infinity : Math.max(worst, d); }
+  return worst / scale;
+}
+
+// ---- conformance cases ----------------------------------------------------
+function cases() {
+  const out = [];
+  for (const [m, k, n, act, f32] of [[37, 70, 33, 0, false], [130, 96, 200, 1, false], [65, 256, 64, 0, false], [33, 48, 40, 0, true]]) {
+    out.push({ kernel: "linear", label: `${m}×${k}×${n}${act ? " gelu" : ""}${f32 ? " f32-w" : " f16-w"}`, run: async () => {
+      const x = normal((m + 3) * k), w = uniform(n * k, 0.2), b = normal(n);
+      const gw = f32 ? { buf: upload(w), rows: n, cols: k, f16: false } : weight(w, n, k), gy = alloc((m + 2) * n);
+      GPU.linear(upload(x), 3, m, gw, upload(b), act, gy, 2);
+      return [await download(gy, (m + 2) * n), REF.linear(x, 3, m, w, n, k, b, act, (m + 2) * n, 2)];
+    }});
+  }
+  const rows = 19, dim = 96;
+  for (const kind of ["adaln", "res+gate+affine", "res+mod"]) {
+    out.push({ kernel: kind === "adaln" ? "layer_norm" : "residual_norm", label: `${rows}×${dim} ${kind}`, run: async () => {
+      const h = normal(rows * dim), a = normal(rows * dim), mods = uniform(6 * dim, 0.5), nw = uniform(dim, 0.5).map((v) => v + 1), nb = uniform(dim, 0.5);
+      const gh = upload(h), go = alloc(rows * dim);
+      const norm = kind === "res+gate+affine" ? { w: upload(nw), b: upload(nb) } : kind === "adaln" ? { scale: 1, shift: 0 } : { scale: 4, shift: 3 };
+      GPU.norm(gh, kind === "adaln" ? null : upload(a), rows, dim, upload(mods), kind === "res+gate+affine" ? 2 : null, norm, 1e-6, go);
+      const g = await download(go, rows * dim), ref = new Float32Array(rows * dim);
+      for (let r = 0; r < rows; r++) {
+        let row = h.slice(r * dim, (r + 1) * dim);
+        if (kind !== "adaln") row = row.map((v, j) => v + a[r * dim + j] * (kind === "res+gate+affine" ? mods[2 * dim + j] : 1));
+        ref.set(REF.normRow(row, dim, kind === "res+gate+affine" ? { w: nw, b: nb } : norm, mods, 1e-6), r * dim);
+      }
+      return [g, ref];
+    }});
+  }
+  out.push({ kernel: "head_split", label: "23 rows, 3 heads × 12, rms + rope", run: async () => {
+    const s = 23, heads = 3, hd = 12, stride = 3 * heads * hd + 5;
+    const src = normal(s * stride), w = uniform(heads * hd, 0.3).map((v) => v + 1), ang = uniform(s * hd / 2, 3);
+    const cs = ang.map(Math.cos), sn = ang.map(Math.sin), go = alloc(s * heads * hd);
+    GPU.headSplit(upload(src), s, stride, 7, heads, hd, upload(w), [upload(cs), upload(sn)], 1e-6, go);
+    return [await download(go, s * heads * hd), REF.headSplit(src, s, stride, 7, heads, hd, w, [cs, sn], 1e-6)];
+  }});
+  for (const [heads, sq, sk, d] of [[3, 70, 70, 64], [2, 100, 13, 128], [1, 33, 129, 128], [12, 96, 96, 128]]) {
+    out.push({ kernel: "attention", label: `${heads} heads, ${sq}×${sk}, d ${d}`, run: async () => {
+      const q = normal(heads * sq * d), k = normal(heads * sk * d), v = normal(heads * sk * d), go = alloc(sq * heads * d);
+      GPU.attention(upload(q), upload(k), upload(v), heads, sq, sk, d, go);
+      return [await download(go, sq * heads * d), REF.attention(q, k, v, heads, sq, sk, d)];
+    }});
+  }
+  for (const [grid, heads, d, sp] of [[[5, 6, 9], 2, 128, 0.75], [[4, 8, 8], 3, 16, 0.5], [[9, 5, 7], 1, 64, 0.8]]) {
+    const spec = vsaSpec(grid, heads, d, sp);
+    out.push({ kernel: "vsa", label: `grid ${grid.join("×")}, ${heads} heads, d ${d}, top ${spec.topk}/${spec.plan.bsz.length} tiles`, run: async () => {
+      if (!flashOK) throw new Error("adapter shared memory too small for the flash kernel");
+      const n = heads * spec.plan.seq * d, [q, k, v, g] = [normal(n), normal(n), normal(n), normal(n)], go = alloc(n);
+      GPU.vsa(upload(q), upload(k), upload(v), upload(g), GPU.vsaPrepare(spec), go);
+      return [await download(go, n), REF.vsa(q, k, v, g, spec)];
+    }});
+  }
+  out.push({ kernel: "patchify", label: "3×2×6×10, p 2", run: async () => {
+    const [c, t, h, w, p] = [3, 2, 6, 10, 2], lat = normal(c * t * h * w), go = alloc(lat.length);
+    GPU.elem(3, go, upload(lat), null, lat.length, [0, 0, 0, c, t, h, w, p]);
+    const ref = new Float32Array(lat.length), gh = h / p, gw = w / p, f = c * p * p;
+    for (let tt = 0; tt < t; tt++) for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) for (let cc = 0; cc < c; cc++) for (let kh = 0; kh < p; kh++) for (let kw = 0; kw < p; kw++)
+      ref[((tt * gh + y) * gw + x) * f + cc * p * p + kh * p + kw] = lat[((cc * t + tt) * h + y * p + kh) * w + x * p + kw];
+    return [await download(go, lat.length), ref];
+  }});
+  out.push({ kernel: "dmd_step + tanh", label: "1001 elements", run: async () => {
+    const n = 1001, x = normal(n), v = normal(n), e = normal(n), gx = upload(x);
+    GPU.elem(1, gx, upload(v), upload(e), n, [0, 0, 1, 0, 0, 0, 0, 0], 0.757, 0.522);
+    GPU.elem(2, gx, null, null, n, [0, 0, 0, 0, 0, 0, 0, 0], 3);
+    const ref = x.map((xi, i) => { const x0 = xi - 0.757 * v[i]; const r = (1 - 0.522) * x0 + 0.522 * e[i]; return Math.tanh(r / 3) * 3; });
+    return [await download(gx, n), ref];
+  }});
+  const convs = [
+    [{ frames: 2, cinA: 5, cinB: 3, cout: 7, h: 9, w: 11, up: false, k: 3 }, 0, "concat"],
+    [{ frames: 3, cinA: 4, cinB: 0, cout: 6, h: 5, w: 7, up: true, k: 3 }, 1, "upsample + relu"],
+    [{ frames: 1, cinA: 6, cinB: 0, cout: 6, h: 8, w: 8, up: false, k: 3 }, 2, "residual + relu"],
+    [{ frames: 2, cinA: 8, cinB: 0, cout: 16, h: 6, w: 5, up: false, k: 1 }, 0, "1×1"],
+  ];
+  for (const [s, ep, what] of convs) {
+    out.push({ kernel: "conv2d", label: `${s.k}×${s.k} ${what}`, run: async () => {
+      const up = s.up ? 2 : 1, on = s.frames * s.cout * s.h * up * s.w * up, kl = (s.cinA + s.cinB) * s.k * s.k;
+      const a = normal(s.frames * s.cinA * s.h * s.w), b = normal(s.frames * s.cinB * s.h * s.w), w = uniform(s.cout * kl, 0.3), bias = normal(s.cout), res = normal(on), go = alloc(on);
+      GPU.conv(upload(a), s.cinB ? upload(b) : null, s, weight(w, s.cout, kl), upload(bias), ep, ep === 2 ? upload(res) : null, go);
+      return [await download(go, on), REF.conv(a, b, s, w, bias, ep, res)];
+    }});
+  }
+  return out;
+}
+
+async function runChecks() {
+  $("chk-run").disabled = true; seed = 42;
+  const body = $("chk-body"); body.textContent = "";
+  let pass = 0, total = 0;
+  for (const c of cases()) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${c.kernel}</td><td>${c.label}</td><td class="num">…</td><td><span class="pill wait">running</span></td>`;
+    body.append(tr); total++;
+    try {
+      const [g, r] = await c.run(); const e = relErr(g, r), ok = e <= 2e-3; pass += ok;
+      tr.children[2].textContent = e.toExponential(2);
+      tr.children[3].innerHTML = `<span class="pill ${ok ? "ok" : "bad"}">${ok ? "pass" : "fail"}</span>`;
+    } catch (err) { tr.children[3].innerHTML = `<span class="pill bad">error</span>`; tr.children[2].textContent = String(err.message ?? err).slice(0, 60); }
+    $("chk-sum").textContent = `${pass} / ${total} pass`;
+  }
+  $("chk-sum").textContent = pass === total ? `all ${total} kernels pass` : `${total - pass} of ${total} failed`;
+  $("chk-run").disabled = false;
+}
+
+// ---- throughput -------------------------------------------------------------
+const RATES = {};
+async function timeIt(fn, iters) {
+  fn(); flush(); await device.queue.onSubmittedWorkDone();
+  const t0 = performance.now();
+  for (let i = 0; i < iters; i++) fn();
+  flush(); await device.queue.onSubmittedWorkDone();
+  return (performance.now() - t0) / iters;
+}
+async function runBench() {
+  $("bench-run").disabled = true; $("bench-run").textContent = "Running…";
+  const body = $("bench-body"); body.textContent = "";
+  const row = (k, shape) => { const tr = document.createElement("tr"); tr.innerHTML = `<td>${k}</td><td>${shape}</td><td class="num">…</td><td class="num">…</td>`; body.append(tr); return tr; };
+  const fill = (tr, ms, flops) => { tr.children[2].textContent = ms.toFixed(2); tr.children[3].textContent = (flops / ms / 1e9).toPrecision(3); };
+  try {
+    // `#quick` (append to the URL) shrinks every shape 16-64x: for weak or software GPUs.
+    const Q = location.hash === "#quick";
+    const d = 1536, M = Q ? 256 : 4096;
+    const x = alloc(M * 8960), y = alloc(M * 8960);
+    const gemm = [];
+    for (const [name, k, n] of [["linear · fused QKV", d, 3 * d], ["linear · FFN up + GELU", d, 8960], ["linear · FFN down", 8960, d]]) {
+      const w = weight(uniform(n * k, 0.05), n, k), tr = row(name, `${M}×${k}→${n}, f16 weights`);
+      const ms = await timeIt(() => GPU.linear(x, 0, M, w, null, name.includes("GELU") ? 1 : 0, y, 0), 5);
+      fill(tr, ms, 2 * M * n * k); gemm.push([2 * M * n * k, ms]);
+    }
+    RATES.gemm = gemm.reduce((a, [f]) => a + f, 0) / gemm.reduce((a, [, t]) => a + t, 0);
+    const att = [];
+    for (const [name, sq, sk] of Q ? [["attention · dense self", 512, 512], ["attention · cross", 512, 512]] : [["attention · dense self", 4096, 4096], ["attention · cross", 8192, 512]]) {
+      const H = 12, hd = 128, q = alloc(H * sq * hd), k = alloc(H * sk * hd), v = alloc(H * sk * hd), o = alloc(sq * H * hd);
+      const tr = row(name, `${H} heads, ${sq}×${sk}, d 128`);
+      const ms = await timeIt(() => GPU.attention(q, k, v, H, sq, sk, hd, o), 3);
+      fill(tr, ms, 4 * sq * sk * hd * H); if (name.includes("self")) att.push([4 * sq * sk * hd * H, ms]);
+    }
+    RATES.attn = att[0][0] / att[0][1];
+    if (flashOK) {
+      // VSA at the 480p grid (21×30×52 tokens, 624 tiles, top 125), or fewer
+      // frames if this adapter's binding limit cannot hold a full q/k/v.
+      const H = 12, hd = 128, lim = device.limits.maxStorageBufferBindingSize;
+      let t = Q ? 5 : 21;
+      while (t > 1 && H * t * 30 * 52 * hd * 4 > lim) t -= 4;
+      const spec = vsaSpec(Q ? [5, 8, 13] : [t, 30, 52], H, hd, 0.8), S = spec.plan.seq, n = H * S * hd;
+      const [q, k, v, g, o] = [alloc(n), alloc(n), alloc(n), alloc(n), alloc(n)], st = GPU.vsaPrepare(spec);
+      const tr = row("attention · VSA 0.8", `${H} heads, ${S.toLocaleString()} tokens, ${spec.topk}/${spec.plan.bsz.length} tiles, d 128`);
+      const ms = await timeIt(() => GPU.vsa(q, k, v, g, st, o), 3);
+      const flops = 4 * S * spec.topk * 64 * hd * H;
+      fill(tr, ms, flops);
+      RATES.vsa = flops / ms;
+    }
+    {
+      const [hh, ww] = Q ? [30, 52] : [240, 416];
+      const s = { frames: 1, cinA: 64, cinB: 0, cout: 64, h: hh, w: ww, up: true, k: 3 };
+      const a = alloc(64 * hh * ww), o = alloc(64 * 4 * hh * ww), w = weight(uniform(64 * 576, 0.05), 64, 576);
+      const tr = row("conv2d · TAEHV last stage", `1 frame, 64→64, 3×3, ×2 upsample → ${2 * ww}×${2 * hh}`);
+      const ms = await timeIt(() => GPU.conv(a, null, s, w, null, 1, null, o), 3);
+      fill(tr, ms, 2 * 4 * hh * ww * 64 * 576);
+    }
+    renderEstimate();
+  } catch (err) {
+    const tr = document.createElement("tr"); tr.innerHTML = `<td colspan="4" class="err"></td>`; tr.firstChild.textContent = "Benchmark failed: " + (err.message ?? err); body.append(tr);
+  }
+  $("bench-run").disabled = false; $("bench-run").textContent = "Run again";
+}
+
+// ---- estimate ---------------------------------------------------------------
+const dur = (s) => s < 120 ? s.toFixed(1) + " s" : s < 7200 ? (s / 60).toFixed(0) + " min" : (s / 3600).toFixed(1) + " h";
+const GEOMS = [[832, 480, 81, "FastWan default, 5 s"], [832, 480, 33, "2 s"], [640, 352, 49, "3 s"], [480, 272, 33, "2 s"]];
+function renderEstimate() {
+  const body = $("est-body"); body.textContent = "";
+  const lim = device ? device.limits.maxStorageBufferBindingSize : 0;
+  const d = 1536, f = 8960, L = 30, text = 512;
+  for (const [w, h, fr, note] of GEOMS) {
+    const S = ((fr - 1) / 4 + 1) * (h / 16) * (w / 16);
+    const gemmF = L * 2 * S * (6 * d * d + 2 * d * f), attnF = L * (4 * S * S * d + 4 * S * text * d);
+    const largest = Math.max(S * 3 * d, S * f) * 4; // f32: fused QKV or the unchunked FFN hidden
+    const fits = largest <= lim;
+    const dense = RATES.gemm ? gemmF / RATES.gemm / 1e3 + attnF / RATES.attn / 1e3 : null;
+    // VSA: each tile attends to ceil(20% of tiles) tiles of 64 tokens; cross attention stays dense.
+    const nb = Math.ceil(((fr - 1) / 4 + 1) / 4) * Math.ceil(h / 64) * Math.ceil(w / 64), topk = Math.ceil(0.2 * nb);
+    const vsaF = L * 4 * S * topk * 64 * d, crossF = L * 4 * S * text * d;
+    const step = RATES.gemm && RATES.vsa ? gemmF / RATES.gemm / 1e3 + vsaF / RATES.vsa / 1e3 + crossF / RATES.attn / 1e3 : null;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${w}×${h}×${fr} <span class="note">${note}</span></td><td class="num">${S.toLocaleString()}</td><td class="num">${(largest / 2 ** 20).toFixed(0)} MiB</td>`
+      + `<td><span class="pill ${fits ? "ok" : "bad"}">${fits ? "yes" : "chunk FFN"}</span></td>`
+      + `<td class="num">${step == null ? "run benchmarks" : dur(step)}</td><td class="num">${step == null ? "–" : dur(3 * step)}</td>`
+      + `<td class="num">${dense == null ? "–" : dur(3 * dense)}</td>`;
+    body.append(tr);
+  }
+}
+
+// ---- boot -------------------------------------------------------------------
+function kv(label, value) { const d = document.createElement("div"); d.innerHTML = `<span class="label"></span><b></b>`; d.children[0].textContent = label; d.children[1].textContent = value; $("dev-kv").append(d); }
+async function boot() {
+  renderEstimate();
+  if (!navigator.gpu) {
+    $("dev-state").className = "pill bad"; $("dev-state").textContent = "no WebGPU";
+    $("dev-err").hidden = false;
+    $("dev-err").textContent = "This browser does not expose WebGPU here. Use a current Chrome, Edge or Firefox on Windows, macOS or Linux, and open the page over https or localhost. On Linux Chrome you may need chrome://flags/#enable-unsafe-webgpu and Vulkan enabled.";
+    $("chk-sum").textContent = "no GPU"; return;
+  }
+  try {
+    adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    if (!adapter) throw new Error("navigator.gpu.requestAdapter returned no adapter (GPU blocklisted or disabled)");
+    const want = ["maxStorageBufferBindingSize", "maxBufferSize", "maxComputeWorkgroupStorageSize", "maxComputeInvocationsPerWorkgroup", "maxComputeWorkgroupSizeX", "maxComputeWorkgroupSizeY"];
+    const requiredLimits = {}; for (const k of want) requiredLimits[k] = adapter.limits[k];
+    device = await adapter.requestDevice({ requiredLimits });
+    device.lost.then((i) => { $("dev-state").className = "pill bad"; $("dev-state").textContent = "device lost"; $("dev-err").hidden = false; $("dev-err").textContent = i.message; });
+    attnBK = device.limits.maxComputeWorkgroupStorageSize >= 32768 ? 32 : 16;
+    flashOK = device.limits.maxComputeWorkgroupStorageSize >= FLASH_SHARED;
+    dummy = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+    const info = adapter.info ?? {};
+    kv("Vendor", info.vendor || "unknown"); kv("Architecture", info.architecture || "unknown");
+    kv("Device", info.description || info.device || "not exposed by the browser");
+    kv("Max binding", (device.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0) + " MiB");
+    kv("Max buffer", (device.limits.maxBufferSize / 2 ** 20).toFixed(0) + " MiB");
+    kv("Workgroup memory", (device.limits.maxComputeWorkgroupStorageSize / 1024) + " KiB → " + (flashOK ? "flash attention + VSA" : "fallback attention, no VSA (needs " + Math.ceil(FLASH_SHARED / 1024) + " KiB)"));
+    $("dev-state").className = "pill ok"; $("dev-state").textContent = "ready";
+    renderEstimate();
+    $("bench-run").disabled = false;
+    await runChecks();
+  } catch (err) {
+    $("dev-state").className = "pill bad"; $("dev-state").textContent = "failed";
+    $("dev-err").hidden = false; $("dev-err").textContent = String(err.message ?? err);
+  }
+}
+$("chk-run").addEventListener("click", runChecks);
+$("bench-run").addEventListener("click", runBench);
+boot();
+</script>
+
+</body>
+</html>

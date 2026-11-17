@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>fastwan-rs</title>
+<meta name="description" content="FastWan 2.1 text-to-video in Rust, for desktop NVIDIA and AMD GPUs.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+/* Layout: one narrow column — what it is, the two pages you can open, how to run the engine, what is verified. */
+:root {
+  --bg: #f2f3f0; --panel: #ffffff; --ink: #1c221f; --muted: #5b6560; --rule: #d5dad5; --accent: #9a5b00; --accent-soft: #f3e6cf;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif; --f-body: "IBM Plex Sans", system-ui, sans-serif; --f-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #111513; --panel: #191e1b; --ink: #e3e8e4; --muted: #98a39d; --rule: #2c342f; --accent: #f0a640; --accent-soft: #3a2c15; color-scheme: dark } }
+:root[data-theme="dark"] { --bg: #111513; --panel: #191e1b; --ink: #e3e8e4; --muted: #98a39d; --rule: #2c342f; --accent: #f0a640; --accent-soft: #3a2c15; color-scheme: dark }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.6 var(--f-body); }
+main { max-width: 760px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 48px 64px; display: grid; gap: 28px; }
+.eyebrow { font: 500 0.72rem/1 var(--f-mono); text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); }
+h1 { font: 600 2.6rem/1.05 var(--f-display); margin: 8px 0 12px; letter-spacing: -0.015em; text-wrap: balance; }
+h2 { font: 600 1.15rem/1.2 var(--f-display); margin: 0; }
+p { margin: 0; max-width: 64ch; }
+.lede { color: var(--muted); font-size: 1.05rem; }
+.pages { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+a.card { display: grid; gap: 8px; padding: 18px; background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; color: inherit; text-decoration: none; min-width: 0; }
+a.card:hover, a.card:focus-visible { border-color: var(--accent); outline: none; }
+a.card .go { color: var(--accent); font: 500 0.9rem var(--f-body); }
+.tag { justify-self: start; font: 500 0.7rem/1 var(--f-mono); padding: 4px 8px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); letter-spacing: 0.04em; }
+section { display: grid; gap: 10px; }
+pre { font: 0.82rem/1.55 var(--f-mono); background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 12px 14px; margin: 0; overflow-x: auto; }
+ul { margin: 0; padding-left: 1.2em; display: grid; gap: 4px; max-width: 64ch; }
+code { font: 0.88em var(--f-mono); }
+footer { color: var(--muted); font-size: 0.85rem; }
+.clip { margin: 0; display: grid; gap: 8px; }
+.clip video { width: 100%; height: auto; max-width: 100%; border-radius: 6px; background: #000; aspect-ratio: 832 / 480; }
+.clip figcaption { color: var(--muted); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="eyebrow">FastWan 2.1 · 1.3B · 3 DMD steps</span>
+    <h1>fastwan-rs</h1>
+    <p class="lede">Text-to-video on your own desktop GPU, in Rust. One set of fused kernels runs through WebGPU (Vulkan, DX12, Metal: NVIDIA, AMD, Intel, Apple) or CUDA, and the TAEHV decoder turns latents into frames you can watch while the clip finishes.</p>
+  </header>
+
+  <figure class="clip">
+    <video src="/media/fox-832x480.mp4" autoplay muted loop playsinline width="832" height="480"></video>
+    <figcaption>"A red fox trots through fresh snow in a birch forest at dawn…" · 832×480, 81 frames, seed 7 · generated in 10.8 s on an RTX 4090 (dense attention; 6.9 s with VSA)</figcaption>
+  </figure>
+
+  <div class="pages">
+    <a class="card" href="/demo/">
+      <span class="tag">needs the local engine</span>
+      <h2>Prompt Studio</h2>
+      <p>Type a prompt, pick size, length and seed, and watch the three denoising steps and the decode land. The model runs on your GPU; this page only talks to it.</p>
+      <span class="go">Open the studio →</span>
+    </a>
+    <a class="card" href="/bench/">
+      <span class="tag">runs in this browser</span>
+      <h2>WebGPU Bench</h2>
+      <p>Runs the engine's WGSL kernels on your GPU, checks each against a reference, measures throughput at Wan shapes and estimates clip time per resolution.</p>
+      <span class="go">Test your GPU →</span>
+    </a>
+  </div>
+
+  <section>
+    <h2>Run the engine</h2>
+    <p>Download the model once (about 14 GB with the text encoder), then start the engine and allow this site to reach it:</p>
+<pre>huggingface-cli download FastVideo/FastWan2.1-T2V-1.3B-Diffusers \
+    --include "transformer/*" "text_encoder/*" "tokenizer/*" --local-dir fastwan
+huggingface-cli download madebyollin/taehv taew2_1.safetensors --local-dir fastwan
+fastwan serve --model-dir fastwan --allow-origin <span id="origin">https://fastwan.pages.dev</span></pre>
+    <p>The engine listens only on 127.0.0.1 and answers this one site. Without <code>--allow-origin</code> it serves the studio itself at <code>http://127.0.0.1:7860/</code>.</p>
+  </section>
+
+  <section>
+    <h2>Where it stands</h2>
+    <ul>
+      <li>The Wan DiT matches Diffusers to 4·10⁻⁷ and the UMT5 text encoder matches transformers to 2·10⁻⁶, on random-weight test models.</li>
+      <li>Every WebGPU kernel passes against a CPU reference in both wgpu and Chrome's WebGPU.</li>
+      <li>On an RTX 4090 with CUDA, a 5-second 832×480 clip takes 6.9 s: three denoising steps of 1.35 s with video sparse attention, plus the decode. Through WebGPU (Vulkan) the same card takes 42.7 s per clip: slower, but it runs on AMD, Intel and Apple GPUs too.</li>
+    </ul>
+  </section>
+
+  <footer>fastwan-rs · a lean Rust port of the Wan path of fastvideo-rs · FastWan weights by FastVideo, TAEHV by madebyollin</footer>
+</main>
+<script>document.getElementById("origin").textContent = location.origin.startsWith("http") ? location.origin : "https://fastwan.pages.dev";</script>
+</body>
+</html>

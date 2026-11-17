@@ -1,0 +1,12 @@
+[package]
+name = "fastwan-model"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastwan-core = { version = "0.1.0", path = "../fastwan-core" }
+fastwan-cpu = { version = "0.1.0", path = "../fastwan-cpu" }
+
+[dev-dependencies]
+half = "2.7.1"
+safetensors = "0.8.0"

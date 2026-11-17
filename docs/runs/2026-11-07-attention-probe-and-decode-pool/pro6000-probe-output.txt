@@ -1,0 +1,63 @@
+old binary ok
+NVIDIA RTX PRO 6000 Blackwell Server Edition, 580.178.04, 500.00 W
+--- check cuda (new)
+attention h2 5x5 d16                             rel 4.30e-3  ok
+attention h3 70x70 d64                           rel 5.39e-3  ok
+attention h2 100x13 d128                         rel 4.09e-3  ok
+attention h1 33x129 d128                         rel 6.72e-3  ok
+attention h12 200x200 d128                       rel 5.97e-3  ok
+attention h3 130x512 d128                        rel 4.45e-3  ok
+vsa (5, 6, 9) h2 d128 topk 3/12                  rel 4.69e-3  ok
+vsa (4, 8, 8) h3 d16 topk 2/4                    rel 4.15e-3  ok
+vsa (9, 5, 7) h1 d64 topk 3/12                   rel 3.44e-3  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps (latent)      rel 4.58e-3  ok
+all 50 checks pass (tolerance 3e-2)
+--- old VSA unprofiled
+denoise 1.737s; scaled to 30 layers ≈ 1.74s
+--- bin VSA unprofiled
+denoise 1.772s; scaled to 30 layers ≈ 1.77s
+--- old dense unprofiled
+denoise 3.196s; scaled to 30 layers ≈ 3.20s
+--- bin dense unprofiled
+denoise 3.276s; scaled to 30 layers ≈ 3.28s
+--- new profiled VSA + decode (alloc row)
+denoise profile (CUDA, synced per op): 1782.6 ms in ops; GEMMs 758.1 ms at 342.8 TFLOP/s
+  vsa fine (mma)                               743.2 ms  41.7%      90 calls     8.258 ms/call
+  vsa coarse + top-k                            57.4 ms   3.2%      90 calls     0.638 ms/call
+  attention (mma)                               42.2 ms   2.4%      90 calls     0.469 ms/call
+  vsa pool                                      23.6 ms   1.3%      90 calls     0.262 ms/call
+  alloc (zeroed)                                 5.9 ms   0.3%      76 calls     0.077 ms/call
+denoise 1.890s; scaled to 30 layers ≈ 1.89s
+decode profile (CUDA, synced per op): 322.2 ms in ops; GEMMs -0.0 ms at 0.0 TFLOP/s
+  conv2d (mma)                                 273.6 ms  84.9%     385 calls     0.711 ms/call
+  alloc (zeroed)                                44.2 ms  13.7%     583 calls     0.076 ms/call
+  copy (dtod)                                    4.1 ms   1.3%     282 calls     0.015 ms/call
+decode (TAEHV) 0.530s -> 81 frames 832x480
+--- probe 1 VSA (1 = no K/V loads, 2 = no MMAs)
+denoise profile (CUDA, synced per op): 1622.1 ms in ops; GEMMs 698.9 ms at 371.9 TFLOP/s
+  vsa fine (mma)                               651.4 ms  40.2%      90 calls     7.238 ms/call
+denoise 1.730s; scaled to 30 layers ≈ 1.73s
+--- probe 2 VSA (1 = no K/V loads, 2 = no MMAs)
+denoise profile (CUDA, synced per op): 1476.4 ms in ops; GEMMs 731.0 ms at 355.5 TFLOP/s
+  vsa fine (mma)                               469.7 ms  31.8%      90 calls     5.219 ms/call
+denoise 1.586s; scaled to 30 layers ≈ 1.59s
+--- probe 0 dense
+denoise profile (CUDA, synced per op): 3275.2 ms in ops; GEMMs 732.9 ms at 335.6 TFLOP/s
+  attention (mma)                             2396.5 ms  73.2%     180 calls    13.314 ms/call
+denoise 3.383s; scaled to 30 layers ≈ 3.38s
+--- probe 1 dense
+denoise profile (CUDA, synced per op): 2711.9 ms in ops; GEMMs 658.2 ms at 373.7 TFLOP/s
+  attention (mma)                             1907.6 ms  70.3%     180 calls    10.598 ms/call
+denoise 2.819s; scaled to 30 layers ≈ 2.82s
+--- probe 2 dense
+denoise profile (CUDA, synced per op): 2621.4 ms in ops; GEMMs 686.4 ms at 358.4 TFLOP/s
+  attention (mma)                             1789.0 ms  68.2%     180 calls     9.939 ms/call
+denoise 2.729s; scaled to 30 layers ≈ 2.73s
+--- generate old
+run 0: total 2.39s  prompt 0.23s  denoise 1.73s (["0.56", "0.58", "0.58"])  decode 0.37s
+run 1: total 2.27s  prompt 0.12s  denoise 1.73s (["0.56", "0.58", "0.58"])  decode 0.36s
+--- generate bin
+run 0: total 2.44s  prompt 0.23s  denoise 1.78s (["0.59", "0.60", "0.60"])  decode 0.37s
+run 1: total 2.33s  prompt 0.12s  denoise 1.79s (["0.59", "0.60", "0.60"])  decode 0.36s
+PSNR new vs old: PSNR y:inf u:inf v:inf average:inf min:inf max:inf
+exit 0

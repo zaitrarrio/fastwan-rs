@@ -1,0 +1,897 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta name="fastwan-served" content="">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FastWan Prompt Studio</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+/* Layout: two columns on desktop — the prompt desk on the left, the screening room (player, stages, history) on the right; stacked on phones. */
+:root {
+  --bg: #f2f3f0; --panel: #ffffff; --ink: #1c221f; --muted: #5b6560; --rule: #d5dad5;
+  --accent: #9a5b00; --accent-ink: #ffffff; --accent-soft: #f3e6cf; --screen: #0e1110;
+  --ok: #1f7a46; --ok-soft: #dcefe3; --bad: #b42318; --bad-soft: #f8dedb;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #111513; --panel: #191e1b; --ink: #e3e8e4; --muted: #98a39d; --rule: #2c342f;
+  --accent: #f0a640; --accent-ink: #1a1306; --accent-soft: #3a2c15; --screen: #050706;
+  --ok: #5cc98a; --ok-soft: #173325; --bad: #ff7b6e; --bad-soft: #3d1c19; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #111513; --panel: #191e1b; --ink: #e3e8e4; --muted: #98a39d; --rule: #2c342f;
+  --accent: #f0a640; --accent-ink: #1a1306; --accent-soft: #3a2c15; --screen: #050706;
+  --ok: #5cc98a; --ok-soft: #173325; --bad: #ff7b6e; --bad-soft: #3d1c19; color-scheme: dark }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--f-body); }
+.wrap { max-width: 1240px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 24px 48px; display: grid; gap: 20px; }
+header { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: baseline; justify-content: space-between; }
+h1 { font: 600 1.9rem/1.1 var(--f-display); margin: 0; letter-spacing: -0.01em; }
+h2 { font: 600 1.05rem/1.2 var(--f-display); margin: 0; letter-spacing: 0.01em; }
+.engine { display: flex; gap: 10px; align-items: center; font: 0.85rem var(--f-mono); color: var(--muted); min-width: 0; }
+.engine span:last-child { overflow-wrap: anywhere; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.wait { background: var(--accent); }
+.grid { display: grid; grid-template-columns: minmax(0, 400px) minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 18px; display: grid; gap: 14px; min-width: 0; }
+.label { font: 500 0.7rem/1 var(--f-mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+label.field { display: grid; gap: 6px; }
+textarea, select, input { font: 0.95rem/1.45 var(--f-body); color: var(--ink); background: var(--bg); border: 1px solid var(--rule); border-radius: 4px; padding: 9px 10px; width: 100%; }
+textarea { min-height: 120px; resize: vertical; }
+textarea:focus, select:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+.row > * { flex: 1 1 110px; min-width: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font: 0.8rem var(--f-body); border: 1px solid var(--rule); background: transparent; color: var(--ink); border-radius: 99px; padding: 4px 10px; cursor: pointer; }
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+.chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+textarea[readonly] { color: var(--muted, var(--ink)); background: transparent; }
+button { font: 500 0.92rem var(--f-body); border-radius: 4px; cursor: pointer; padding: 9px 14px; border: 1px solid var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); }
+button.ghost { background: transparent; color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button:focus-visible, .chip:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.hint { color: var(--muted); font-size: 0.82rem; margin: 0; }
+.connect { display: grid; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid var(--rule); }
+.modes { display: flex; gap: 0; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+.modes button { flex: 1 1 0; border: 0; border-radius: 0; background: transparent; color: var(--ink); padding: 8px 10px; font-size: 0.85rem; }
+.modes button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+.progress { height: 6px; background: var(--rule); border-radius: 3px; overflow: hidden; }
+.check { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; margin-top: 12px; cursor: pointer; }
+.check input { flex: none; width: auto; padding: 0; margin: 3px 0 0; accent-color: var(--accent); }
+.progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+.cmd { font: 0.8rem/1.5 var(--f-mono); background: var(--bg); border: 1px solid var(--rule); border-radius: 4px; padding: 8px 10px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg { font: 0.88rem/1.45 var(--f-mono); padding: 10px 12px; border-radius: 4px; white-space: pre-wrap; margin: 0; }
+.msg.bad { background: var(--bad-soft); color: var(--bad); }
+.msg.note { background: var(--accent-soft); color: var(--ink); font-family: var(--f-body); }
+code { font: 0.85em var(--f-mono); background: var(--accent-soft); padding: 1px 5px; border-radius: 3px; }
+.screen { background: var(--screen); border-radius: 4px; display: grid; place-items: center; aspect-ratio: 832 / 480; max-width: 100%; overflow: hidden; position: relative; }
+.screen canvas { width: 100%; height: 100%; object-fit: contain; display: block; image-rendering: auto; }
+.screen #canvas-up { position: absolute; inset: 0; }
+.screen canvas[hidden] { display: none; }
+.screen .empty { position: absolute; inset: 0; display: grid; place-items: center; color: #8d9792; font: 0.9rem var(--f-mono); text-align: center; padding: 16px; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.controls input[type=range] { flex: 1 1 200px; padding: 0; accent-color: var(--accent); background: transparent; border: 0; }
+.counter { font: 0.85rem var(--f-mono); font-variant-numeric: tabular-nums; color: var(--muted); min-width: 9ch; text-align: right; }
+.stages { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+@media (max-width: 520px) { .stages { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.stage { border: 1px solid var(--rule); border-radius: 4px; padding: 8px; display: grid; gap: 4px; min-width: 0; }
+.stage b { font: 500 0.82rem var(--f-body); }
+.stage span { font: 0.8rem var(--f-mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.stage.active { border-color: var(--accent); background: var(--accent-soft); }
+.stage.done { border-color: var(--ok); }
+.stage.done span { color: var(--ok); }
+.summary { font: 0.85rem var(--f-mono); color: var(--muted); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.history { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.clip { border: 1px solid var(--rule); border-radius: 4px; padding: 6px; background: transparent; color: var(--ink); text-align: left; display: grid; gap: 6px; cursor: pointer; font: inherit; }
+.clip:hover, .clip.current { border-color: var(--accent); }
+.clip canvas { width: 100%; aspect-ratio: 832 / 480; background: var(--screen); border-radius: 2px; object-fit: cover; }
+.clip span { font-size: 0.78rem; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+@media (prefers-reduced-motion: no-preference) { .stage.active { animation: pulse 1.4s ease-in-out infinite; } }
+@keyframes pulse { 50% { background: transparent; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>FastWan Prompt Studio</h1>
+    <div class="engine" aria-live="polite"><span class="dot wait" id="eng-dot"></span><span id="eng-text">Connecting to the local engine…</span></div>
+  </header>
+
+  <div class="grid">
+    <form class="panel" id="form" autocomplete="off">
+      <div class="modes" id="modes" role="group" aria-label="Where the model runs" hidden>
+        <button type="button" data-mode="engine" aria-pressed="true">Local engine</button>
+        <button type="button" data-mode="browser" aria-pressed="false">In this browser (WebGPU)</button>
+      </div>
+      <div class="connect" id="browser-panel" hidden>
+        <h2>Run in this browser</h2>
+        <p class="hint">Downloads the model once (kept in the browser's cache for next time) and runs it on your GPU through WebGPU. Prompts come from a precomputed gallery: the 11 GB text encoder does not fit in a browser.</p>
+        <div class="row">
+          <label class="field"><span class="label">Weights</span><select id="bw-variant"></select></label>
+          <button type="button" class="ghost" id="bw-load" style="flex:0 0 auto">Load model</button>
+        </div>
+        <div class="progress" id="bw-progress" hidden><div id="bw-bar"></div></div>
+        <p class="hint" id="bw-status"></p>
+        <p class="msg bad" id="bw-crash" hidden></p>
+        <div id="selftest" hidden>
+          <p class="hint">GPU self-test: every kernel the model uses, at the model's shapes, on this GPU against a CPU reference in this tab. The CPU part takes a minute or two and the tab may look frozen meanwhile. No model download needed.</p>
+          <button type="button" class="ghost" id="st-run">Run GPU self-test</button>
+          <pre class="cmd" id="st-out" style="max-height:24em;overflow:auto;white-space:pre-wrap"></pre>
+        </div>
+        <label class="check" id="bw-up-row" hidden><input type="checkbox" id="bw-up"><span>Upscale ×4 after decoding <span class="hint" id="bw-up-hint">(480×272 → 1920×1088; Real-ESRGAN compact video model, 2.5 MB more)</span></span></label>
+      </div>
+      <div class="connect" id="connect" hidden>
+        <h2>Connect your engine</h2>
+        <p class="hint">This page runs the model on your own GPU through the <code>fastwan</code> engine. Start it on this computer, allowing this site:</p>
+        <pre class="cmd" id="start-cmd"></pre>
+        <div class="row">
+          <label class="field"><span class="label">Engine address</span><input id="engine-url" type="url"></label>
+          <button type="button" class="ghost" id="engine-go" style="flex:0 0 auto">Connect</button>
+        </div>
+        <p class="hint">Chrome and Edge may ask to let this site reach devices on your local network: allow it. Safari blocks pages on https from reaching 127.0.0.1, so use Chrome, Edge or Firefox.</p>
+      </div>
+      <h2>Prompt</h2>
+      <label class="field"><span class="label" id="prompt-label">Describe the clip</span>
+        <textarea id="prompt" maxlength="2000">A red fox trots through fresh snow in a birch forest at dawn, its breath steaming, low golden sunlight, shallow depth of field.</textarea></label>
+      <div class="chips" id="examples" aria-label="Example prompts"></div>
+      <p class="msg note" id="gallery-note" hidden>This engine runs without the text encoder, so it can only make its precomputed prompts: pick one above. Add more with <code>fastwan encode</code>.</p>
+      <div class="row">
+        <label class="field"><span class="label">Size</span><select id="size"></select></label>
+        <label class="field"><span class="label">Length</span><select id="length"></select></label>
+      </div>
+      <div class="row">
+        <label class="field"><span class="label">Seed</span><input id="seed" type="number" min="0" step="1" placeholder="random"></label>
+        <button type="button" class="ghost" id="dice" style="flex:0 0 auto">New seed</button>
+      </div>
+      <button type="submit" class="primary" id="go" disabled>Generate clip</button>
+      <p class="hint"><span id="steps-hint">3 denoising steps, 16 fps.</span> Ctrl/⌘ + Enter generates. <span id="where-engine">Clips stay on your machine: the engine runs on your GPU, and this page only talks to it.</span><span id="where-browser" hidden>Clips stay on your machine: the model runs on your GPU inside this tab.</span></p>
+      <p class="msg bad" id="err" hidden></p>
+      <p class="msg note" id="synthetic" hidden>The engine is running the tiny synthetic model (<code>--synthetic</code>), so clips are coloured noise. Start it with <code>--model-dir</code> for real video.</p>
+    </form>
+
+    <div style="display:grid;gap:20px;min-width:0">
+      <section class="panel" aria-labelledby="out-h">
+        <div class="controls"><h2 id="out-h" style="flex:1">Clip</h2><span class="summary" id="summary"></span></div>
+        <div class="screen" id="screen"><canvas id="canvas" width="832" height="480"></canvas><canvas id="canvas-up" hidden></canvas><div class="empty" id="empty">Your clip plays here as soon as the first frames are decoded.</div></div>
+        <div class="controls">
+          <button type="button" class="ghost" id="play" disabled>Pause</button>
+          <input type="range" id="scrub" min="0" max="0" value="0" disabled aria-label="Frame">
+          <span class="counter" id="counter">0 / 0</span>
+        </div>
+        <div class="controls">
+          <button type="button" class="ghost" id="save-webm" disabled>Save WebM</button>
+          <button type="button" class="ghost" id="save-png" disabled>Save frame PNG</button>
+          <span class="hint" id="save-hint"></span>
+        </div>
+        <div class="stages" id="stages" aria-live="polite"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="hist-h">
+        <h2 id="hist-h">This session</h2>
+        <div class="history" id="history"><p class="hint">Finished clips appear here. The engine keeps the last eight, so you can reopen them.</p></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const FPS = 16;
+// Served by the engine itself → same origin. Hosted (Cloudflare Pages) → the
+// engine on this machine, which must be started with --allow-origin <this site>.
+// `fastwan serve` marks the page it serves; a copy of the site hosted
+// anywhere else (localhost included) drives an engine or runs in the tab.
+const SAME = document.querySelector('meta[name="fastwan-served"]')?.content === "engine";
+let ENGINE = SAME ? "" : (store("fastwan.engine") || "http://127.0.0.1:7860");
+const api = (path) => ENGINE + path;
+// Phones (and iPadOS, which reports a Mac): the tab's memory limit covers GPU
+// memory too and the OS resets the tab when it is exceeded, so the browser
+// engine runs lighter there (see createEngine's `mobile`).
+const MOBILE = /iPhone|iPad|iPod|Android/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { return null; } }
+const START = `fastwan serve --model-dir fastwan --allow-origin ${location.origin}`;
+const EXAMPLES = [
+  ["Fox in snow", "A red fox trots through fresh snow in a birch forest at dawn, its breath steaming, low golden sunlight, shallow depth of field."],
+  ["Night market", "A crowded night market in the rain, neon signs reflected in puddles, steam rising from food stalls, handheld camera moving through the crowd."],
+  ["Ocean cliff", "Aerial drone shot sweeping along green sea cliffs as waves crash into white foam, overcast sky, cinematic."],
+  ["Pour-over", "Close-up of hot water pouring in a slow spiral over coffee grounds in a glass pour-over, morning window light, macro detail."],
+  ["Koi pond", "Top-down view of orange and white koi gliding beneath lily pads in a clear pond, ripples spreading, soft daylight."],
+];
+const SIZES = [[832, 480, "832×480 · landscape"], [480, 832, "480×832 · portrait"], [640, 352, "640×352"], [480, 272, "480×272 · fastest"]];
+const LENGTHS = [[81, "5 s · 81 frames"], [49, "3 s · 49 frames"], [33, "2 s · 33 frames"], [17, "1 s · 17 frames"]];
+// Long videos (a causal "Self-Forcing" variant): generated and shown block by
+// block (12 frames each). The K/V cache (12 latent frames, f32) is ~2.3 GB at
+// 480×272 and grows with the frame size, so only the two smaller sizes; the
+// decoded frames stay in the tab, so the length is capped at ~700 MB of them.
+const LONG_SIZES = [[480, 272, "480×272"], [640, 352, "640×352"]];
+const LONG_LENGTHS = [[165, "10 s"], [321, "20 s"], [477, "30 s"], [969, "60 s"]]; // 9 + 12k: whole blocks
+const LONG_CACHE = 12, LONG_SINK = 3, FRAME_BUDGET = 700e6;
+
+// In-browser mode: the WebGPU engine compiled to wasm (/pkg/), weights
+// streamed from a public bucket block by block (HTTP ranges) and cached.
+// ?weights=<base URL> points it elsewhere (tests use a local server).
+// The public copy of the browser weights (R2 bucket fastwan-public, prefix v1/);
+// empty until it is published. ?weights=<base URL> points the page elsewhere.
+const PUBLIC_WEIGHTS = "https://weights.fastwan.dev/v1";
+// The in-browser engine's build hash; web/build.py stamps it into the site copy.
+const PKG_V = "dev";
+const WEIGHTS = (new URLSearchParams(location.search).get("weights") || PUBLIC_WEIGHTS).replace(/\/+$/, "");
+const CAN_BROWSER = !SAME && "gpu" in navigator;
+// Hosted page with WebGPU: run in the tab unless the visitor chose their engine.
+let MODE = CAN_BROWSER && store("fastwan.mode") !== "engine" ? "browser" : "engine";
+const bw = { mod: null, eng: null, manifest: null, loaded: null, entries: [], clips: new Map() };
+
+let info = null, job = null, poll = null;
+let clip = { frames: [], width: 0, height: 0, total: 0, id: null };
+let frame = 0, playing = true, lastTick = 0, recording = false;
+const ctx = $("canvas").getContext("2d");
+
+// ---- engine status ------------------------------------------------------------
+let infoTimer = 0;
+function schedule(ms) { clearTimeout(infoTimer); infoTimer = setTimeout(refreshInfo, ms); }
+async function refreshInfo() {
+  clearTimeout(infoTimer);
+  if (MODE === "browser") { showBrowserInfo(); return; }
+  try {
+    const r = await fetch(api("/api/info"), { cache: "no-store" });
+    info = await r.json();
+  } catch {
+    setEngine("bad", SAME ? "Can't reach the engine. Restart fastwan serve." : `No engine at ${ENGINE}. Start one on this machine (see below).`);
+    if (!SAME) $("connect").hidden = false;
+    $("go").disabled = true; schedule(3000); return;
+  }
+  if (info.error) { setEngine("bad", "Engine failed to start: " + info.error); $("go").disabled = true; return; }
+  if (!info.ready) {
+    const secs = info.loading_s != null ? ` · ${Math.round(info.loading_s)} s` : "";
+    setEngine("wait", `Loading the model: ${info.loading || "starting"}${secs}`);
+    $("go").disabled = true; schedule(1500); return;
+  }
+  setEngine("ok", `${info.model} · ${info.backend}`);
+  if (!SAME) $("connect").hidden = true;
+  $("synthetic").hidden = !info.synthetic;
+  applyGallery(info.gallery);
+  fillOptions();
+  $("go").disabled = !!job;
+}
+// Gallery mode (`fastwan serve --gallery`): no text encoder, so the prompt is
+// picked from the engine's precomputed list instead of typed.
+let gallery = null;
+const norm = (p) => p.trim().split(/\s+/).join(" ");
+const escHtml = (t) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+function renderChips() {
+  const list = gallery || EXAMPLES.map(([, p]) => p);
+  const labels = gallery ? gallery.map((p) => (p.length > 42 ? p.slice(0, 40).trimEnd() + "…" : p)) : EXAMPLES.map(([l]) => l);
+  $("examples").innerHTML = list.map((p, i) => `<button type="button" class="chip" data-i="${i}" title="${escHtml(p)}"${gallery ? ' aria-pressed="false"' : ""}>${escHtml(labels[i])}</button>`).join("");
+  markChip();
+}
+function markChip() {
+  if (!gallery) return;
+  const cur = norm($("prompt").value);
+  document.querySelectorAll("#examples .chip").forEach((b) => b.setAttribute("aria-pressed", String(norm(gallery[b.dataset.i]) === cur)));
+}
+function applyGallery(list) {
+  const next = Array.isArray(list) && list.length ? list : null;
+  if (JSON.stringify(next) === JSON.stringify(gallery)) return;
+  gallery = next;
+  $("prompt").readOnly = !!gallery;
+  $("prompt-label").textContent = gallery ? "Prompt (from the engine's gallery)" : "Describe the clip";
+  $("examples").setAttribute("aria-label", gallery ? "Gallery prompts" : "Example prompts");
+  $("gallery-note").hidden = !gallery;
+  if (gallery && !gallery.some((p) => norm(p) === norm($("prompt").value))) $("prompt").value = gallery[0];
+  renderChips();
+}
+function setEngine(kind, text) { $("eng-dot").className = "dot " + kind; $("eng-text").textContent = text; }
+function fillOptions() {
+  const keep = [$("size").value, $("length").value];
+  $("size").innerHTML = (info.long ? LONG_SIZES : SIZES).filter(([w, h]) => w * h <= info.max_pixels).map(([w, h, l]) => `<option value="${w}x${h}">${l}</option>`).join("");
+  if (keep[0]) $("size").value = keep[0];
+  if (!$("size").value) $("size").selectedIndex = 0;
+  const [sw, sh] = $("size").value.split("x").map(Number);
+  $("length").innerHTML = info.long
+    ? LONG_LENGTHS.filter(([f]) => f * sw * sh * 4 <= FRAME_BUDGET).map(([f, l]) => `<option value="${f}">${l} · ${f} frames</option>`).join("")
+    : LENGTHS.filter(([f]) => f <= info.max_frames).map(([f, l]) => `<option value="${f}">${l}</option>`).join("");
+  if (keep[0]) $("size").value = keep[0];
+  if (keep[1]) $("length").value = keep[1];
+  if (!$("size").value) $("size").selectedIndex = 0;
+  if (!$("length").value) $("length").selectedIndex = 0;
+}
+
+// ---- stages -----------------------------------------------------------------
+const STAGES = [["encoding", "Prompt"], ["step0", "Step 1"], ["step1", "Step 2"], ["step2", "Step 3"], ["decoding", "Decode"]];
+function renderLongStages(s) {
+  const fmt = (x) => x.toFixed(x < 10 ? 2 : 1) + " s", st = s.stage, n = s.blocks.length;
+  const gen = n ? s.blocks.reduce((a, b) => a + b, 0) : 0;
+  const cells = [
+    ["Prompt", st === "encoding" ? "active" : "done", st === "encoding" ? "loading…" : `${s.tokens} tok`],
+    ["Blocks", st === "generating" ? "active" : n ? "done" : "", `${n} / ${s.total_blocks || "…"}`],
+    ["First frames", s.first_s ? "done" : st === "generating" ? "active" : "", s.first_s ? fmt(s.first_s) : "–"],
+    ["Speed", n ? "done" : "", n ? `${(s.frames / gen).toFixed(1)} fps · ${(1000 * gen / n).toFixed(0)} ms/block` : "–"],
+  ];
+  $("stages").innerHTML = cells.map(([l, c, d]) => `<div class="stage ${c}"><b>${l}</b><span>${st === "failed" && c === "active" ? "failed" : d}</span></div>`).join("");
+}
+function renderStages(s) {
+  if (s?.long) return renderLongStages(s);
+  const st = s ? s.stage : null, steps = s ? s.steps : [];
+  const fmt = (x) => x.toFixed(x < 10 ? 2 : 1) + " s";
+  const stages = s?.upscale ? [...STAGES, ["upscaling", "Upscale ×" + s.upscale]] : STAGES;
+  $("stages").innerHTML = stages.map(([key, label], i) => {
+    let cls = "", detail = "–";
+    if (s) {
+      if (key === "encoding") {
+        if (st === "encoding") { cls = "active"; detail = "UMT5…"; }
+        else if (st !== "queued") { cls = "done"; detail = `${fmt(s.encode_s)} · ${s.tokens} tok`; }
+        else detail = "queued";
+      } else if (key.startsWith("step")) {
+        const k = +key.slice(4);
+        if (steps[k] != null) { cls = "done"; detail = fmt(steps[k]); }
+        else if ((st === "denoising" || st === "preparing") && steps.length === k) { cls = "active"; detail = "running"; }
+      } else if (key === "upscaling") {
+        if (st === "upscaling") { cls = "active"; detail = `${s.up_frames} / ${s.frames}`; }
+        if (st === "done") { cls = "done"; detail = fmt(s.up_s); }
+        if (st === "failed") { detail = "failed"; }
+      } else {
+        if (st === "decoding") { cls = "active"; detail = `${s.frames} / ${s.total_frames}`; }
+        if (st === "done" || st === "upscaling") { cls = "done"; detail = fmt(s.decode_s); }
+        if (st === "failed") { detail = "failed"; }
+      }
+    }
+    return `<div class="stage ${cls}"><b>${label}</b><span>${detail}</span></div>`;
+  }).join("");
+}
+
+// ---- generation -----------------------------------------------------------------
+async function generate(e) {
+  e?.preventDefault();
+  if (job?.long) { try { bw.eng?.stop(); } catch {} $("go").disabled = true; $("go").textContent = "Stopping…"; return; }
+  if (!info?.ready || job) return;
+  $("err").hidden = true;
+  const [width, height] = $("size").value.split("x").map(Number);
+  if (MODE === "browser") return browserGenerate(width, height, +$("length").value);
+  const body = { prompt: $("prompt").value, width, height, frames: +$("length").value };
+  if ($("seed").value !== "") body.seed = Math.max(0, Math.floor(+$("seed").value));
+  $("go").disabled = true; $("go").textContent = "Generating…";
+  try {
+    const r = await fetch(api("/api/generate"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const v = await r.json();
+    if (!r.ok) throw new Error(v.error || `The engine answered ${r.status}.`);
+    job = { id: v.id, prompt: body.prompt, seed: v.seed };
+    startClip(v.id, width, height, body.frames);
+    pollJob();
+  } catch (err) {
+    showError(err.message); resetButton();
+  }
+}
+function resetButton() { job = null; $("go").textContent = info?.long ? "Generate video" : "Generate clip"; $("go").disabled = !info?.ready; }
+function showError(m) { $("err").textContent = m; $("err").hidden = false; }
+
+function startClip(id, w, h, total) {
+  clip = { frames: [], width: w, height: h, total, id, up: null };
+  try { bw.eng?.clearUpscaled(); } catch {}
+  $("canvas-up").hidden = true;
+  frame = 0; playing = true;
+  $("canvas").width = w; $("canvas").height = h;
+  $("screen").style.aspectRatio = `${w} / ${h}`;
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, w, h);
+  $("empty").hidden = false; $("empty").textContent = "Waiting for the first frames…";
+  $("summary").textContent = "";
+  updateControls();
+  document.querySelectorAll(".clip").forEach((c) => c.classList.toggle("current", +c.dataset.id === id));
+}
+
+async function fetchFrames(id) {
+  const r = await fetch(api(`/api/jobs/${id}/frames?from=${clip.frames.length}`), { cache: "no-store" });
+  if (!r.ok) return;
+  const buf = await r.arrayBuffer();
+  const head = new Uint32Array(buf, 0, 4);
+  const [w, h, , count] = head, px = w * h;
+  if (!count || clip.id !== id) return;
+  if (w !== clip.width || h !== clip.height) { clip.width = w; clip.height = h; $("canvas").width = w; $("canvas").height = h; }
+  const rgb = new Uint8Array(buf, 16);
+  for (let f = 0; f < count; f++) {
+    const img = new ImageData(w, h), d = img.data, off = f * px * 3;
+    for (let i = 0, j = 0; i < px; i++, j += 4) { d[j] = rgb[off + 3 * i]; d[j + 1] = rgb[off + 3 * i + 1]; d[j + 2] = rgb[off + 3 * i + 2]; d[j + 3] = 255; }
+    clip.frames.push(img);
+  }
+  $("empty").hidden = true;
+  updateControls();
+}
+
+async function pollJob() {
+  if (!job) return;
+  let s;
+  try { s = await (await fetch(api(`/api/jobs/${job.id}`), { cache: "no-store" })).json(); }
+  catch { poll = setTimeout(pollJob, 1000); return; }
+  if (s.error && s.stage !== "failed") { showError(s.error); resetButton(); return; }
+  renderStages(s);
+  if (s.frames > clip.frames.length) await fetchFrames(job.id);
+  if (s.stage === "failed") { showError("Generation failed: " + s.error); resetButton(); return; }
+  if (s.stage === "done") {
+    finishClip(s);
+    resetButton(); return;
+  }
+  poll = setTimeout(pollJob, 250);
+}
+
+function finishClip(s) {
+  if (s.long) {
+    $("summary").textContent = `${s.frames} frames (${(s.frames / FPS).toFixed(1)} s) · ${s.width}×${s.height} · seed ${s.seed} · ${s.blocks.length} blocks · first frames ${s.first_s.toFixed(1)} s · total ${s.total_s.toFixed(1)} s${s.stopped ? " · stopped" : ""}`;
+    addHistory(s); return;
+  }
+  const steps = s.steps.reduce((a, b) => a + b, 0);
+  $("summary").textContent = `${s.frames} frames · ${s.width}×${s.height} · seed ${s.seed} · prompt ${s.encode_s.toFixed(1)} s · denoise ${steps.toFixed(1)} s · decode ${s.decode_s.toFixed(1)} s${s.upscale ? ` · ×${s.upscale} to ${s.width * s.upscale}×${s.height * s.upscale} ${s.up_s.toFixed(1)} s` : ""} · total ${s.total_s.toFixed(1)} s`;
+  addHistory(s);
+}
+
+// ---- playback -----------------------------------------------------------------
+// Frames are ImageData (low-res); upscaled frames are drawn by the engine on #canvas-up.
+function paint(c, f) { if (f instanceof ImageData) c.putImageData(f, 0, 0); else c.drawImage(f, 0, 0); }
+function draw() {
+  const n = clip.frames.length;
+  if (n) {
+    const f = Math.min(frame, n - 1);
+    let up = false;
+    if (clip.up && f < clip.up.ready && bw.eng) { try { bw.eng.showUpscaled(f); up = true; } catch {} }
+    $("canvas-up").hidden = !up;
+    if (!up) paint(ctx, clip.frames[f]);
+  }
+  $("counter").textContent = `${clip.frames.length ? frame + 1 : 0} / ${clip.total || clip.frames.length}`;
+  $("scrub").value = frame;
+}
+function tick(t) {
+  if (playing && clip.frames.length && t - lastTick >= 1000 / FPS) {
+    lastTick = t;
+    frame = frame + 1 < clip.frames.length ? frame + 1 : (recording || clip.streaming ? frame : 0);
+    draw();
+  }
+  requestAnimationFrame(tick);
+}
+function updateControls() {
+  const n = clip.frames.length;
+  $("scrub").max = Math.max(0, n - 1); $("scrub").disabled = !n;
+  $("play").disabled = !n; $("play").textContent = playing ? "Pause" : "Play";
+  const done = n && n === clip.total;
+  $("save-webm").disabled = !done || recording || typeof MediaRecorder === "undefined";
+  $("save-png").disabled = !n;
+  draw();
+}
+$("play").onclick = () => { playing = !playing; updateControls(); };
+$("scrub").oninput = (e) => { frame = +e.target.value; playing = false; updateControls(); };
+
+// ---- saving ---------------------------------------------------------------------
+function download(blob, name) {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+function slug() { return (job?.prompt || $("prompt").value).toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40).replace(/-+$/, "") || "fastwan"; }
+$("save-png").onclick = async () => {
+  const name = `${slug()}-f${frame + 1}.png`;
+  if (clip.up && frame < clip.up.ready && bw.eng) {
+    // The upscaled frame lives on the GPU: read just this one back.
+    const k = clip.up.k, W = clip.width * k, H = clip.height * k, rgba = await bw.eng.upscaledFrame(frame);
+    const c = document.createElement("canvas"); c.width = W; c.height = H;
+    c.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, W * H * 4), W, H), 0, 0);
+    c.toBlob((b) => b && download(b, name), "image/png");
+    return;
+  }
+  $("canvas").toBlob((b) => b && download(b, name), "image/png");
+};
+$("save-webm").onclick = () => {
+  // Record the upscaled canvas once every frame is upscaled.
+  const upAll = clip.up && clip.up.ready >= clip.frames.length;
+  const stream = $(upAll ? "canvas-up" : "canvas").captureStream(FPS);
+  const type = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"].find((t) => MediaRecorder.isTypeSupported(t));
+  const rec = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 8e6 });
+  const parts = [];
+  rec.ondataavailable = (e) => e.data.size && parts.push(e.data);
+  rec.onstop = () => { recording = false; $("save-hint").textContent = ""; download(new Blob(parts, { type: "video/webm" }), `${slug()}.webm`); updateControls(); };
+  recording = true; frame = 0; playing = true; draw(); updateControls();
+  $("save-hint").textContent = "Recording one pass in real time…";
+  rec.start();
+  setTimeout(() => rec.stop(), (clip.frames.length / FPS) * 1000 + 150);
+};
+
+// ---- history --------------------------------------------------------------------
+function addHistory(s) {
+  const h = $("history");
+  if (!h.querySelector(".clip")) h.innerHTML = "";
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "clip current"; b.dataset.id = s.id;
+  b.title = s.prompt;
+  const c = document.createElement("canvas"); c.width = 208; c.height = Math.round(208 * s.height / s.width);
+  const mid = clip.frames[Math.floor(clip.frames.length / 2)];
+  if (mid) { const t = document.createElement("canvas"); t.width = mid.width; t.height = mid.height; paint(t.getContext("2d"), mid); c.getContext("2d").drawImage(t, 0, 0, c.width, c.height); }
+  const span = document.createElement("span"); span.textContent = s.prompt;
+  b.append(c, span);
+  b.onclick = () => reopen(s);
+  document.querySelectorAll(".clip").forEach((x) => x.classList.remove("current"));
+  h.prepend(b);
+  while (h.children.length > 8) h.lastChild.remove();
+}
+async function reopen(s) {
+  if (job) return;
+  if (bw.clips.has(s.id)) {
+    const c = bw.clips.get(s.id);
+    startClip(s.id, c.s.width, c.s.height, c.s.long ? c.s.frames : c.s.total_frames);
+    clip.frames = c.frames.slice(); $("empty").hidden = true; updateControls();
+    $("prompt").value = c.s.prompt; $("seed").value = c.s.seed; markChip();
+    renderStages(c.s); finishClip(c.s); document.querySelector(`.clip[data-id="${s.id}"]`)?.remove(); addHistory(c.s);
+    // Upscaled frames are kept on the GPU for the current clip only: redo them.
+    if (c.s.upscale && bw.eng && bw.upScale) {
+      job = { id: s.id }; $("go").disabled = true;
+      upscaleClip(c.s).catch((e) => showError("Upscale failed: " + (e?.message || e))).finally(() => { renderStages(c.s); resetButton(); });
+    }
+    return;
+  }
+  if (MODE === "browser") { showError(s.long ? "Only the latest long video is kept in memory." : "That clip is no longer in memory."); return; }
+  const r = await fetch(api(`/api/jobs/${s.id}`), { cache: "no-store" });
+  if (!r.ok) { showError("The engine no longer holds that clip (it keeps the last eight)."); return; }
+  const cur = await r.json();
+  startClip(s.id, cur.width, cur.height, cur.frames);
+  $("prompt").value = cur.prompt; $("seed").value = cur.seed; markChip();
+  await fetchFrames(s.id);
+  renderStages(cur); finishClip(cur); document.querySelector(`.clip[data-id="${s.id}"]`)?.remove(); addHistory(cur);
+}
+
+// ---- in-browser engine (WebGPU via wasm) ---------------------------------------
+function setMode(m) {
+  MODE = m; store("fastwan.mode", m);
+  document.querySelectorAll("#modes button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === m)));
+  $("browser-panel").hidden = m !== "browser";
+  $("where-engine").hidden = m === "browser"; $("where-browser").hidden = m !== "browser";
+  if (m === "engine") { $("bw-progress").hidden = true; info = null; applyGallery(null); setEngine("wait", "Connecting to the local engine…"); }
+  else { $("connect").hidden = true; clearTimeout(infoTimer); }
+  refreshInfo();
+}
+function bwStatus(kind, text) { $("bw-status").textContent = text; if (MODE === "browser") setEngine(kind, text); }
+function mb(n) { return n >= 1e9 ? (n / 1e9).toFixed(2) + " GB" : (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + " MB"; }
+async function showBrowserInfo() {
+  if (bw.loaded) {
+    info = { ready: true, model: bw.loaded, backend: bw.eng.adapter(), gallery: bw.entries.map((e) => e.prompt), max_pixels: MOBILE ? 480 * 272 : 832 * 480, max_frames: MOBILE ? 33 : 81, synthetic: bw.manifest.model === "tiny", long: !!bw.long };
+    setEngine("ok", `${info.model} · ${info.backend}`);
+    $("synthetic").hidden = true;
+    applyGallery(info.gallery); fillOptions(); $("go").disabled = !!job;
+    return;
+  }
+  info = null; $("go").disabled = true;
+  if (!("gpu" in navigator)) { bwStatus("bad", "This browser has no WebGPU. Use a recent Chrome or Edge (or Safari 26+)."); $("bw-load").disabled = true; return; }
+  if (!WEIGHTS) { bwStatus("bad", "No public weights are configured for this page yet (add ?weights=<base URL>)."); $("bw-load").disabled = true; return; }
+  if (!bw.manifest) {
+    try { bw.manifest = await (await fetch(`${WEIGHTS}/manifest.json`, { cache: "no-store" })).json(); }
+    catch { bwStatus("bad", `Cannot reach the weights at ${WEIGHTS}.`); return; }
+    $("bw-variant").innerHTML = Object.entries(bw.manifest.variants).filter(([k, v]) => !MOBILE || (k === "f4" && !v.causal)).map(([k, v]) => `<option value="${k}">${escHtml(v.label)} · ${mb(v.bytes)}</option>`).join("");
+    const pref = store("fastwan.variant"); if (pref && bw.manifest.variants[pref]) $("bw-variant").value = pref;
+    if (bw.manifest.upscaler && !MOBILE) {
+      $("bw-up-row").hidden = false; $("bw-up").checked = store("fastwan.upscale") === "1";
+      $("bw-up").onchange = () => store("fastwan.upscale", $("bw-up").checked ? "1" : "0");
+    }
+  }
+  bwStatus("wait", "Load the model to run it in this browser.");
+}
+
+// Cache: whole groups, keyed by file, size and group, so a re-uploaded file
+// is fetched again.
+async function cached(key, fetcher) {
+  let c = null;
+  try { c = await caches.open("fastwan-weights-v1"); const hit = await c.match(key); if (hit) return new Uint8Array(await hit.arrayBuffer()); } catch {}
+  const bytes = await fetcher();
+  try { await c?.put(key, new Response(bytes)); } catch {}
+  return bytes;
+}
+async function fetchBytes(url, range, onBytes) {
+  const r = await fetch(url, range ? { headers: { Range: `bytes=${range[0]}-${range[1] - 1}` } } : {});
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  const len = range ? range[1] - range[0] : +r.headers.get("Content-Length") || 0;
+  if (!r.body || !len) { const b = new Uint8Array(await r.arrayBuffer()); onBytes?.(b.length); return b; }
+  const out = new Uint8Array(len), rd = r.body.getReader(); let o = 0;
+  for (;;) { const { done, value } = await rd.read(); if (done) break; out.set(value, o); o += value.length; onBytes?.(value.length); }
+  if (o !== len) throw new Error(`${url}: got ${o} of ${len} bytes`);
+  return out;
+}
+// safetensors header → groups (the head, then blocks.0 …) of contiguous bytes.
+async function readGroups(url) {
+  const n = Number(new DataView((await fetchBytes(url, [0, 8])).buffer).getBigUint64(0, true));
+  const head = JSON.parse(new TextDecoder().decode(await fetchBytes(url, [8, 8 + n])));
+  const groups = new Map();
+  for (const [name, t] of Object.entries(head)) {
+    if (name === "__metadata__") continue;
+    const m = /^blocks\.(\d+)\./.exec(name), k = m ? +m[1] : -1;
+    if (!groups.has(k)) groups.set(k, { key: k, tensors: [], start: Infinity, end: 0, bytes: 0 });
+    const g = groups.get(k), [a, b] = t.data_offsets;
+    g.tensors.push([name, t]); g.start = Math.min(g.start, a); g.end = Math.max(g.end, b); g.bytes += b - a;
+  }
+  for (const g of groups.values()) if (g.bytes !== g.end - g.start) throw new Error(`${url} is not block-ordered (re-export it with fastwan quantize)`);
+  return { dataStart: 8 + n, groups, meta: head.__metadata__ || {} };
+}
+// One group's bytes as a standalone safetensors blob.
+function groupBlob(g, bytes) {
+  const hdr = {};
+  for (const [name, t] of g.tensors) hdr[name] = { dtype: t.dtype, shape: t.shape, data_offsets: [t.data_offsets[0] - g.start, t.data_offsets[1] - g.start] };
+  let text = JSON.stringify(hdr); while ((text.length) % 8) text += " ";
+  const h = new TextEncoder().encode(text), out = new Uint8Array(8 + h.length + bytes.length);
+  new DataView(out.buffer).setBigUint64(0, BigInt(h.length), true); out.set(h, 8); out.set(bytes, 8 + h.length);
+  return out;
+}
+async function bwLoad() {
+  $("bw-load").disabled = true;
+  const key = $("bw-variant").value, v = bw.manifest.variants[key];
+  bw.variant = v.label; bw.long = false;
+  crumb(MOBILE ? "phone" : "this device", "loading the model");
+  store("fastwan.variant", key);
+  bwStatus("wait", "Starting WebGPU…");
+  // Versioned URLs: a cached engine from an older deploy must not meet a newer page.
+  // ?engine=<commit> loads an older engine build kept at /pkg-<commit>/ (bisecting a regression).
+  const ENG = new URLSearchParams(location.search).get("engine"), PKG = ENG && /^[0-9a-f]{7}$/.test(ENG) ? `/pkg-${ENG}` : "/pkg";
+  if (!bw.mod) { bw.mod = await import(`${PKG}/fastwan_web.js?v=${PKG_V}`); await bw.mod.default({ module_or_path: `${PKG}/fastwan_web_bg.wasm?v=${PKG_V}` }); }
+  if (bw.eng) { bw.eng.free(); bw.eng = null; bw.loaded = null; }
+  // ?kernels=LINEAR,FLASH picks the WebGPU kernels (A/B runs); empty = defaults.
+  bw.eng = await bw.mod.createEngine(bw.manifest.model, new URLSearchParams(location.search).get("kernels") || "", MOBILE); bw.upScale = 0; bw.upAttached = false;
+  if (new URLSearchParams(location.search).has("nokeep")) bw.eng.setKeepAlive?.(false); // diagnostics
+  // ?attention=dense|vsa forces the clip attention (default: VSA from 81 frames).
+  bw.eng.setAttention?.(new URLSearchParams(location.search).get("attention") || "");
+  console.info("fastwan: engine", PKG);
+  const url = `${WEIGHTS}/${v.file}`, { dataStart, groups } = await readGroups(url);
+  const blocks = [...groups.keys()].filter((k) => k >= 0).sort((a, b) => a - b);
+  if (blocks.length !== bw.eng.layers()) throw new Error(`${v.file} has ${blocks.length} blocks, the model ${bw.eng.layers()}`);
+  const taeUrl = `${WEIGHTS}/${bw.manifest.tae.file}`;
+  const total = [...groups.values()].reduce((a, g) => a + g.bytes, 0) + bw.manifest.tae.bytes;
+  let got = 0; const t0 = performance.now();
+  $("bw-progress").hidden = false;
+  const tick = (n) => { got += n; $("bw-bar").style.width = `${(100 * got / total).toFixed(1)}%`; };
+  // Count bytes as they stream in; a group served from the cache counts at once.
+  const load = async (key, size, fetcher) => {
+    let streamed = 0;
+    const bytes = await cached(key, () => fetcher((n) => { streamed += n; tick(n); }));
+    tick(size - streamed);
+    return bytes;
+  };
+  const group = async (g, label) => {
+    bwStatus("wait", `Loading ${label} · ${mb(got)} of ${mb(total)}`);
+    const range = [dataStart + g.start, dataStart + g.end];
+    return groupBlob(g, await load(`${url}?size=${v.bytes}&g=${g.key}`, g.bytes, (on) => fetchBytes(url, range, on)));
+  };
+  for (const k of blocks) bw.eng.addBlock(await group(groups.get(k), `block ${k + 1} of ${blocks.length}`));
+  bw.eng.finishDit(await group(groups.get(-1), "the embedders"));
+  bwStatus("wait", "Loading the decoder…");
+  const tb = await load(`${taeUrl}?size=${bw.manifest.tae.bytes}`, bw.manifest.tae.bytes, (on) => fetchBytes(taeUrl, null, on));
+  bw.eng.loadTae(tb);
+  const gurl = `${WEIGHTS}/${bw.manifest.gallery}`;
+  bw.entries = (await (await fetch(gurl, { cache: "no-store" })).json()).prompts;
+  bw.galleryBase = gurl.slice(0, gurl.lastIndexOf("/") + 1);
+  bw.long = !!v.causal;
+  bw.loaded = `${v.name || bw.manifest.name || "FastWan2.1-T2V-1.3B"} · ${v.label} · in this browser`;
+  $("go").textContent = bw.long ? "Generate video" : "Generate clip";
+  $("steps-hint").textContent = bw.long ? "Long video: 4 denoising steps per block of 12 frames, shown as each block is done; Stop ends it early. 16 fps." : "3 denoising steps, 16 fps.";
+  $("bw-up-row").hidden = bw.long || !bw.manifest.upscaler || MOBILE;
+  console.info("fastwan: WebGPU", bw.eng.adapter(), "|", bw.eng.limits());
+  $("bw-load").disabled = false; $("bw-load").textContent = "Reload";
+  bwStatus("ok", `Model ready in ${((performance.now() - t0) / 1000).toFixed(1)} s.`);
+  crumb(false);
+  showBrowserInfo();
+  if ($("size").querySelector('option[value="480x272"]')) $("size").value = "480x272";
+  fillOptions();
+}
+// The upscaler loads on first use (it is small).
+// Upscaled frames never leave the GPU: each batch is kept there and drawn
+// straight onto #canvas-up (a WebGPU canvas over the 2D one). The low-res
+// clip plays meanwhile; every frame switches to 4× as soon as its batch is
+// done. Only "Save frame PNG" reads one frame back.
+async function upscaleClip(s) {
+  const u = bw.manifest.upscaler;
+  if (!bw.upScale) {
+    const url = `${WEIGHTS}/${u.file}`;
+    bw.upScale = bw.eng.loadUpscaler(await cached(`${url}?size=${u.bytes}`, () => fetchBytes(url, null)));
+  }
+  if (!bw.upAttached) { bw.eng.attachCanvas($("canvas-up")); bw.upAttached = true; }
+  const k = bw.upScale, w = clip.width, h = clip.height, px = w * h, n = clip.frames.length, id = clip.id;
+  $("canvas-up").width = w * k; $("canvas-up").height = h * k;
+  bw.eng.clearUpscaled();
+  clip.up = { k, ready: 0 };
+  const batch = Math.max(1, Math.min(n, bw.eng.upscaleBatch(h, w), 4));
+  s.upscale = k; s.up_frames = 0; s.stage = "upscaling"; renderStages(s);
+  const t = performance.now();
+  for (let f0 = 0; f0 < n; f0 += batch) {
+    const m = Math.min(batch, n - f0), rgb = new Uint8Array(m * px * 3);
+    for (let f = 0; f < m; f++) {
+      const d = clip.frames[f0 + f].data;
+      for (let i = 0, j = 0, o = f * px * 3; i < px; i++, j += 4, o += 3) { rgb[o] = d[j]; rgb[o + 1] = d[j + 1]; rgb[o + 2] = d[j + 2]; }
+    }
+    const ready = await wasmCall(bw.eng.upscaleKeep(rgb, m, h, w));
+    if (clip.id !== id) return;
+    clip.up.ready = ready; s.up_frames = ready; renderStages(s);
+    if (!playing) draw();
+  }
+  s.up_s = (performance.now() - t) / 1000;
+  updateControls();
+}
+// A Rust panic aborts the wasm module and leaves its promise pending forever;
+// it surfaces only as an uncaught RuntimeError. Fail the call on one, and
+// drop the engine (it cannot be used again) so the next load starts clean.
+function wasmCall(p) {
+  return new Promise((resolve, reject) => {
+    const crash = (e) => {
+      const err = e.reason || e.error || e;
+      if (!(err instanceof WebAssembly.RuntimeError) && !/unreachable|RuntimeError/.test(String(e.message || err))) return;
+      cleanup(); bw.eng = null; bw.loaded = null; bw.upScale = 0; bw.upAttached = false;
+      $("bw-load").textContent = "Load model"; bwStatus("bad", "The engine crashed; load the model again.");
+      reject(new Error(`the engine crashed (${String(err.message || err)}); see the browser console`));
+    };
+    const cleanup = () => { removeEventListener("error", crash); removeEventListener("unhandledrejection", crash); };
+    addEventListener("error", crash); addEventListener("unhandledrejection", crash);
+    p.then((v) => { cleanup(); resolve(v); }, (e) => { cleanup(); reject(e); });
+  });
+}
+// The engine sends RGBA packed on the GPU: each frame is one slice.
+function rgbaFrame(rgba, f, w, h) {
+  const n = w * h * 4;
+  return new ImageData(new Uint8ClampedArray(rgba.buffer.slice(rgba.byteOffset + f * n, rgba.byteOffset + (f + 1) * n)), w, h);
+}
+function pushFrames(ev) {
+  const { width: w, height: h, count, rgba } = ev;
+  if (w !== clip.width || h !== clip.height) { clip.width = w; clip.height = h; $("canvas").width = w; $("canvas").height = h; }
+  for (let f = 0; f < count; f++) clip.frames.push(rgbaFrame(rgba, f, w, h));
+  $("empty").hidden = true; updateControls();
+}
+// Breadcrumb in localStorage while the engine works: if the tab is reset (out
+// of memory, GPU watchdog) the next visit says where and with what settings.
+let crumbWhat = "";
+function crumb(what, where) {
+  if (what === false) { try { localStorage.removeItem("fastwan.run"); } catch {} return; }
+  if (what) crumbWhat = what;
+  store("fastwan.run", JSON.stringify({ what: crumbWhat, where, variant: bw.variant || "", t: Date.now() }));
+}
+function showCrash() {
+  let c = null; try { c = JSON.parse(store("fastwan.run") || "null"); } catch {}
+  if (!c) return;
+  crumb(false);
+  const four = /4-bit/.test(c.variant || "");
+  const tip = c.where === "loading the model" ? (four ? "This device may not have the memory for the model." : "Use the 4-bit weights.")
+    : (four ? "Try fewer frames (1 s)." : "Try fewer frames (1 s) or the 4-bit weights.");
+  $("bw-crash").textContent = `The last run here (${c.what}${c.variant ? ", " + c.variant : ""}) stopped during ${c.where} and the page was reset: the browser most likely ran out of memory. ${tip}`;
+  $("bw-crash").hidden = false;
+}
+// Long video: blocks stream in and play as they arrive; the button stops it.
+async function browserGenerateLong(width, height, frames, entry, seed) {
+  const prompt = entry.prompt, id = Date.now();
+  job = { id, prompt, seed, long: true };
+  $("go").disabled = false; $("go").textContent = "Stop";
+  startClip(id, width, height, frames); clip.streaming = true;
+  // Diagnostics: ?noplay=1 keeps playback paused while a long video is made.
+  if (new URLSearchParams(location.search).has("noplay")) playing = false;
+  const s = { id, prompt, seed, long: true, stage: "encoding", blocks: [], frames: 0, total_frames: frames, width, height, tokens: entry.tokens, first_s: 0, total_s: 0 };
+  renderStages(s);
+  const t0 = performance.now();
+  crumb(`long video, ${width}×${height}, ${frames} frames`, "starting");
+  try {
+    const eurl = bw.galleryBase + entry.file;
+    const emb = await cached(eurl, () => fetchBytes(eurl, null));
+    await wasmCall(bw.eng.generateLong(emb, width, height, frames, seed, LONG_CACHE, LONG_SINK, (ev) => {
+      if (ev.type === "prepared") { s.stage = "generating"; crumb(null, "block 1"); }
+      else if (ev.type === "block") {
+        s.blocks.push(ev.ms / 1000); s.total_blocks = ev.total; clip.blockMs = s.blocks; (clip.denoiseMs ||= []).push(ev.denoise_ms / 1000); crumb(null, `block ${ev.index + 2}`);
+        // Diagnostics: Chrome started with --js-flags=--expose-gc collects after every block.
+        if (typeof gc === "function" && new URLSearchParams(location.search).has("gc")) gc();
+      }
+      else if (ev.type === "frames") { pushFrames(ev); s.frames += ev.count; if (!s.first_s) s.first_s = (performance.now() - t0) / 1000; }
+      renderStages(s);
+    }));
+    s.stopped = s.frames < frames;
+    clip.total = s.frames;
+    s.total_s = (performance.now() - t0) / 1000; s.stage = "done";
+    clip.streaming = false; renderStages(s); updateControls();
+    // Long videos are hundreds of MB of frames: keep only the latest one.
+    for (const [k, c] of bw.clips) if (c.s.long) bw.clips.delete(k);
+    bw.clips.set(id, { s, frames: clip.frames.slice() });
+    finishClip(s);
+    crumb(false);
+  } catch (err) {
+    crumb(false); clip.streaming = false;
+    s.stage = "failed"; renderStages(s);
+    showError("Generation failed: " + (err?.message || err));
+  }
+  resetButton();
+}
+async function browserGenerate(width, height, frames) {
+  const prompt = $("prompt").value, entry = bw.entries.find((e) => norm(e.prompt) === norm(prompt));
+  if (!entry) { showError("Pick one of the gallery prompts: the browser engine has no text encoder."); return; }
+  const seed = $("seed").value !== "" ? Math.max(0, Math.floor(+$("seed").value)) : Math.floor(Math.random() * 1e9);
+  if (bw.long) return browserGenerateLong(width, height, frames, entry, seed);
+  const id = Date.now();
+  job = { id, prompt, seed };
+  $("go").disabled = true; $("go").textContent = "Generating…";
+  startClip(id, width, height, frames);
+  const s = { id, prompt, seed, stage: "encoding", steps: [], encode_s: 0, decode_s: 0, frames: 0, total_frames: frames, width, height, tokens: entry.tokens, total_s: 0 };
+  renderStages(s);
+  const t0 = performance.now();
+  crumb(`${width}×${height}, ${frames} frames`, "starting");
+  try {
+    const eurl = bw.galleryBase + entry.file;
+    const emb = await cached(eurl, () => fetchBytes(eurl, null));
+    s.encode_s = (performance.now() - t0) / 1000; s.stage = "preparing"; renderStages(s);
+    let tDec = 0;
+    await wasmCall(bw.eng.generate(emb, width, height, frames, seed, (ev) => {
+      if (ev.type === "prepared") { s.stage = "denoising"; crumb(null, "step 1"); }
+      else if (ev.type === "step") {
+        s.steps.push(ev.ms / 1000);
+        crumb(null, s.steps.length === ev.total ? "the decode" : `step ${s.steps.length + 1}`);
+        if (s.steps.length === ev.total) { s.stage = "decoding"; tDec = performance.now(); }
+      }
+      else if (ev.type === "frames") { pushFrames(ev); s.frames += ev.count; }
+      renderStages(s);
+    }));
+    s.decode_s = (performance.now() - tDec) / 1000;
+    // ×4 of 480×272 is 1920×1088; larger sizes would need GBs of GPU memory.
+    if (bw.manifest.upscaler && $("bw-up").checked && width * height <= 480 * 272) await upscaleClip(s);
+    s.total_s = (performance.now() - t0) / 1000; s.stage = "done";
+    renderStages(s);
+    bw.clips.set(id, { s, frames: clip.frames.slice() });
+    finishClip(s);
+    crumb(false);
+  } catch (err) {
+    crumb(false);
+    s.stage = "failed"; renderStages(s);
+    showError("Generation failed: " + (err?.message || err));
+  }
+  resetButton();
+}
+
+// ---- GPU self-test (?selftest=1) -------------------------------------------------
+async function selfTest() {
+  const out = $("st-out"), log = (t) => { out.textContent += t + "\n"; out.scrollTop = out.scrollHeight; };
+  $("st-run").disabled = true; out.textContent = "";
+  try {
+    if (!bw.mod) {
+      const ENG = new URLSearchParams(location.search).get("engine"), PKG = ENG && /^[0-9a-f]{7}$/.test(ENG) ? `/pkg-${ENG}` : "/pkg";
+      bw.mod = await import(`${PKG}/fastwan_web.js?v=${PKG_V}`); await bw.mod.default({ module_or_path: `${PKG}/fastwan_web_bg.wasm?v=${PKG_V}` });
+    }
+    const eng = bw.eng || await bw.mod.createEngine("fastwan", new URLSearchParams(location.search).get("kernels") || "", MOBILE);
+    log(`adapter: ${eng.adapter()} | ${eng.limits()}`);
+    log(`browser: ${navigator.userAgent}`);
+    try { const a = await navigator.gpu.requestAdapter(); const i = a?.info || {}; log(`gpu: vendor=${i.vendor || "?"} arch=${i.architecture || "?"} device=${i.device || "?"} desc=${i.description || "?"}`); } catch {}
+    log("running the CPU reference (the tab may freeze for a minute or two)…");
+    await new Promise((r) => setTimeout(r, 50));
+    const t0 = performance.now(), fails = [];
+    const bad = await wasmCall(eng.selfTest((ev) => {
+      const line = `${ev.ok ? "ok  " : "FAIL"} ${ev.name}  rel ${ev.rel.toExponential(2)}`;
+      if (!ev.ok) fails.push(line);
+      log(line);
+    }));
+    log(`\n${bad} failed (${((performance.now() - t0) / 1000).toFixed(0)} s)` + (fails.length ? ":\n" + fails.join("\n") : ""));
+  } catch (err) {
+    log("self-test error: " + (err?.message || err));
+  }
+  $("st-run").disabled = false;
+}
+
+// ---- boot -----------------------------------------------------------------------
+renderChips();
+$("examples").onclick = (e) => {
+  const i = e.target.dataset?.i; if (i == null) return;
+  $("prompt").value = gallery ? gallery[i] : EXAMPLES[i][1];
+  markChip(); if (!gallery) $("prompt").focus();
+};
+$("dice").onclick = () => { $("seed").value = Math.floor(Math.random() * 1e9); };
+$("form").addEventListener("submit", generate);
+$("size").addEventListener("change", () => { if (info?.long) fillOptions(); });
+$("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) generate(e); });
+$("start-cmd").textContent = START;
+$("engine-url").value = ENGINE || location.origin;
+$("engine-go").onclick = () => { ENGINE = $("engine-url").value.replace(/\/+$/, ""); store("fastwan.engine", ENGINE); setEngine("wait", "Connecting…"); refreshInfo(); };
+$("modes").hidden = !CAN_BROWSER;
+$("modes").onclick = (e) => { const m = e.target.dataset?.mode; if (m && !job) setMode(m); };
+$("selftest").hidden = !new URLSearchParams(location.search).has("selftest");
+$("st-run").onclick = selfTest;
+$("bw-load").onclick = () => bwLoad().catch((err) => { crumb(false); bwStatus("bad", "Loading failed: " + err.message); $("bw-load").disabled = false; });
+setMode(MODE);
+showCrash();
+renderStages(null);
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
