@@ -31,6 +31,10 @@ pub struct CausalConfig {
     pub sink_frames: usize,
     /// DiT timesteps of the few-step denoise, in order; σ = t / 1000.
     pub timesteps: Vec<f32>,
+    /// Store the K/V cache as 16-bit values where the backend can
+    /// ([`Backend::kv_caps`]): half the cache memory (phones), f16 rounding
+    /// of keys and values. Ignored where unsupported.
+    pub half_kv: bool,
 }
 
 impl CausalConfig {
@@ -51,6 +55,7 @@ impl CausalConfig {
             cap_frames: 12,
             sink_frames: 3,
             timesteps: [1000.0, 750.0, 500.0, 250.0].map(warp).to_vec(),
+            half_kv: false,
         }
     }
 
@@ -76,9 +81,13 @@ struct Run {
 pub struct KvCache<B: Backend> {
     k: Vec<B::Buf>,
     v: Vec<B::Buf>,
-    /// The valid prefix packed with its own stride while the cache fills.
-    pack_k: B::Buf,
-    pack_v: B::Buf,
+    /// The valid prefix packed with its own stride while the cache fills,
+    /// for backends whose attention cannot read a cache in place.
+    pack: Option<(B::Buf, B::Buf)>,
+    /// Attention reads the cache in place ([`Backend::attention_kv`]).
+    strided: bool,
+    /// 16-bit storage.
+    half: bool,
     heads: usize,
     head_dim: usize,
     tpf: usize,
@@ -107,11 +116,14 @@ impl<B: Backend> KvCache<B> {
             )));
         }
         let n = heads * cfg.cap_frames * tpf * head_dim;
+        let (strided, can_half) = be.kv_caps(head_dim);
+        let half = cfg.half_kv && can_half;
         Ok(Self {
-            k: (0..layers).map(|_| be.alloc(n)).collect(),
-            v: (0..layers).map(|_| be.alloc(n)).collect(),
-            pack_k: be.alloc(n),
-            pack_v: be.alloc(n),
+            k: (0..layers).map(|_| be.alloc_kv(n, half)).collect(),
+            v: (0..layers).map(|_| be.alloc_kv(n, half)).collect(),
+            pack: (!strided).then(|| (be.alloc(n), be.alloc(n))),
+            strided,
+            half,
             heads,
             head_dim,
             tpf,
@@ -177,47 +189,61 @@ impl<B: Backend> KvCache<B> {
         n: usize,
         out: &B::Buf,
     ) {
-        let (hd, tpf) = (self.head_dim, self.tpf);
-        let stride = self.cap * tpf * hd;
+        let (hd, tpf, heads) = (self.head_dim, self.tpf, self.heads);
+        let stride = self.cap * tpf;
+        // One store per run of slots, all heads at once.
         for r in &self.runs {
-            let len = r.frames * tpf * hd;
-            for h in 0..self.heads {
-                let src = (h * n + r.from * tpf) * hd;
-                let dst = h * stride + r.slot * tpf * hd;
-                be.copy(k, src, &self.k[li], dst, len);
-                be.copy(v, src, &self.v[li], dst, len);
-            }
+            let (from, len, row) = (r.from * tpf, r.frames * tpf, r.slot * tpf);
+            be.kv_store(
+                k,
+                n,
+                from,
+                len,
+                heads,
+                hd,
+                &self.k[li],
+                row,
+                stride,
+                self.half,
+            );
+            be.kv_store(
+                v,
+                n,
+                from,
+                len,
+                heads,
+                hd,
+                &self.v[li],
+                row,
+                stride,
+                self.half,
+            );
         }
+        // The valid frames are the prefix [0, valid) while the cache fills
+        // (nothing evicted yet), all of it once full.
         let valid = self.frames();
-        if valid == self.cap {
-            be.attention(
+        if valid == self.cap || self.strided {
+            be.attention_kv(
                 q,
                 &self.k[li],
                 &self.v[li],
-                self.heads,
+                heads,
                 n,
-                self.cap * tpf,
+                valid * tpf,
+                stride,
                 hd,
+                self.half,
                 out,
             );
         } else {
-            // Filling: the valid frames are the prefix [0, valid) (nothing has
-            // been evicted yet); pack it so each head is contiguous.
+            // Pack the prefix so each head is contiguous (f32 caches only).
+            let (pk, pv) = self.pack.as_ref().expect("a packing cache");
             let len = valid * tpf * hd;
-            for h in 0..self.heads {
-                be.copy(&self.k[li], h * stride, &self.pack_k, h * len, len);
-                be.copy(&self.v[li], h * stride, &self.pack_v, h * len, len);
+            for h in 0..heads {
+                be.copy(&self.k[li], h * stride * hd, pk, h * len, len);
+                be.copy(&self.v[li], h * stride * hd, pv, h * len, len);
             }
-            be.attention(
-                q,
-                &self.pack_k,
-                &self.pack_v,
-                self.heads,
-                n,
-                valid * tpf,
-                hd,
-                out,
-            );
+            be.attention(q, pk, pv, heads, n, valid * tpf, hd, out);
         }
     }
 }

@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+half = "2.7.1"
 fastwan-core = { version = "0.1.0", path = "../fastwan-core" }
 rayon = "1.12.0"

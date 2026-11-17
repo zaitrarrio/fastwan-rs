@@ -37,6 +37,7 @@ const NORM: &str = include_str!("shaders/norm.wgsl");
 const HEADS: &str = include_str!("shaders/head_split.wgsl");
 const ELEM: &str = include_str!("shaders/elementwise.wgsl");
 const PACK: &str = include_str!("shaders/pack.wgsl");
+const KV: &str = include_str!("shaders/kv.wgsl");
 const FLASH: &str = include_str!("shaders/flash.wgsl");
 const FLASH3: &str = include_str!("shaders/flash3.wgsl");
 /// Shared memory flash3 declares (vec4 panels, S tile, partials, row state).
@@ -807,6 +808,50 @@ impl Wgpu {
     }
 }
 
+impl Wgpu {
+    /// flash3.wgsl reading a K/V cache: keys and values of head h start at
+    /// row h · kstride (not h · sk), and with `half` they are f16 pairs in
+    /// u32 (unpacked with core `unpack2x16float`; no `shader-f16` needed).
+    fn flash3_kv_src(half: bool) -> String {
+        let mut s = FLASH3.replace(
+            "struct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32 }",
+            "struct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32, kstride: u32, _a: u32, _b: u32, _c: u32 }",
+        );
+        let k_load = "    return k[(h * p.sk + tok) * p.d + col];";
+        let v_load = "                    let b = (h * p.sk + ktok) * d + 4u * cq;\n                    vv = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]);";
+        assert!(s.contains("struct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32, kstride"));
+        assert!(
+            s.contains(k_load) && s.contains(v_load),
+            "flash3.wgsl changed: update flash3_kv_src"
+        );
+        if half {
+            s = s
+                .replace("var<storage, read> k: array<f32>;", "var<storage, read> k: array<u32>;")
+                .replace("var<storage, read> v: array<f32>;", "var<storage, read> v: array<u32>;")
+                .replace(
+                    k_load,
+                    "    let e = (h * p.kstride + tok) * p.d + col;\n    let w = unpack2x16float(k[e / 2u]);\n    return select(w.x, w.y, (e & 1u) != 0u);",
+                )
+                .replace(
+                    v_load,
+                    "                    let b = (h * p.kstride + ktok) * d + 4u * cq;\n                    let w0 = unpack2x16float(v[b / 2u]);\n                    let w1 = unpack2x16float(v[b / 2u + 1u]);\n                    vv = vec4<f32>(w0.x, w0.y, w1.x, w1.y);",
+                );
+        } else {
+            s = s
+                .replace(k_load, "    return k[(h * p.kstride + tok) * p.d + col];")
+                .replace(
+                    v_load,
+                    "                    let b = (h * p.kstride + ktok) * d + 4u * cq;\n                    vv = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]);",
+                );
+        }
+        s
+    }
+
+    fn kv_flash_ok(&self, d: usize) -> bool {
+        self.flash_ok && self.flash_variant == 3 && d % 16 == 0 && d <= 128
+    }
+}
+
 impl Backend for Wgpu {
     type Buf = GBuf;
     type Vsa = GVsa;
@@ -1142,6 +1187,102 @@ impl Backend for Wgpu {
             &p,
             &[src, rms_w.unwrap_or(&self.dummy), c, s, out],
             Self::grid(rows),
+        );
+    }
+
+    fn kv_caps(&self, d: usize) -> (bool, bool) {
+        let ok = self.kv_flash_ok(d);
+        (ok, ok)
+    }
+
+    fn alloc_kv(&self, n: usize, half: bool) -> GBuf {
+        if half {
+            assert!(n % 2 == 0, "a 16-bit K/V cache holds pairs");
+            self.alloc(n / 2)
+        } else {
+            self.alloc(n)
+        }
+    }
+
+    fn kv_store(
+        &self,
+        src: &GBuf,
+        n: usize,
+        from: usize,
+        len: usize,
+        heads: usize,
+        d: usize,
+        dst: &GBuf,
+        dst_row: usize,
+        stride: usize,
+        half: bool,
+    ) {
+        if len == 0 {
+            return;
+        }
+        assert!(!half || d % 2 == 0, "16-bit K/V rows hold pairs");
+        let pipe = self.pipeline("kv_store", || KV.to_string());
+        let items = heads * len * if half { d / 2 } else { d };
+        self.dispatch(
+            &pipe,
+            &[
+                n as u32,
+                from as u32,
+                len as u32,
+                heads as u32,
+                d as u32,
+                dst_row as u32,
+                stride as u32,
+                half as u32,
+            ],
+            &[src, dst],
+            Self::grid(items.div_ceil(256)),
+        );
+    }
+
+    fn attention_kv(
+        &self,
+        q: &GBuf,
+        k: &GBuf,
+        v: &GBuf,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+        stride: usize,
+        d: usize,
+        half: bool,
+        out: &GBuf,
+    ) {
+        if !self.kv_flash_ok(d) {
+            assert!(
+                stride == sk && !half,
+                "attention_kv needs flash3 here (kv_caps)"
+            );
+            return self.attention(q, k, v, heads, sq, sk, d, out);
+        }
+        let key = if half { "flash3_kvh" } else { "flash3_kv" };
+        let pipe = self.pipeline(key, || Self::flash3_kv_src(half));
+        let scale = 1.0 / (d as f32).sqrt();
+        let p = [
+            heads as u32,
+            sq as u32,
+            sk as u32,
+            d as u32,
+            (scale * std::f32::consts::LOG2_E).to_bits(),
+            0,
+            0,
+            0,
+            stride as u32,
+            0,
+            0,
+            0,
+        ];
+        let d0 = &self.dummy;
+        self.dispatch(
+            &pipe,
+            &p,
+            &[q, k, v, out, d0, d0, d0, d0],
+            (sq.div_ceil(64) as u32, heads as u32, 1),
         );
     }
 

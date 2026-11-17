@@ -401,6 +401,65 @@ impl Backend for Cpu {
         }
     }
 
+    fn kv_caps(&self, _head_dim: usize) -> (bool, bool) {
+        (true, true)
+    }
+
+    fn kv_store(
+        &self,
+        src: &CpuBuf,
+        n: usize,
+        from: usize,
+        len: usize,
+        heads: usize,
+        d: usize,
+        dst: &CpuBuf,
+        dst_row: usize,
+        stride: usize,
+        half: bool,
+    ) {
+        let src = src.r();
+        let mut dst = dst.w();
+        for h in 0..heads {
+            let s = &src[(h * n + from) * d..][..len * d];
+            let o = &mut dst[(h * stride + dst_row) * d..][..len * d];
+            if half {
+                // The 16-bit cache keeps f16 values: round through f16.
+                for (o, &x) in o.iter_mut().zip(s) {
+                    *o = half::f16::from_f32(x).to_f32();
+                }
+            } else {
+                o.copy_from_slice(s);
+            }
+        }
+    }
+
+    fn attention_kv(
+        &self,
+        q: &CpuBuf,
+        k: &CpuBuf,
+        v: &CpuBuf,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+        stride: usize,
+        d: usize,
+        _half: bool,
+        out: &CpuBuf,
+    ) {
+        // Gather the valid rows of each head and reuse the reference attention.
+        let pack = |b: &CpuBuf| {
+            let b = b.r();
+            let mut v = Vec::with_capacity(heads * sk * d);
+            for h in 0..heads {
+                v.extend_from_slice(&b[h * stride * d..][..sk * d]);
+            }
+            CpuBuf(Arc::new(RwLock::new(v)))
+        };
+        let (pk, pv) = (pack(k), pack(v));
+        self.attention(q, &pk, &pv, heads, sq, sk, d, out);
+    }
+
     fn attention(
         &self,
         q: &CpuBuf,

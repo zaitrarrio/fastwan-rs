@@ -297,6 +297,73 @@ pub trait Backend {
         out: &Self::Buf,
     );
 
+    /// K/V cache support at this head dim: `(strided, half)`. `strided`: the
+    /// backend's [`Backend::attention_kv`] reads a cache in place (rows of each
+    /// head `stride` apart, only the first `sk` valid), so a filling cache
+    /// needs no packing. `half`: [`Backend::alloc_kv`] can store 16-bit
+    /// values (half the memory). The defaults are neither.
+    fn kv_caps(&self, _head_dim: usize) -> (bool, bool) {
+        (false, false)
+    }
+    /// A K/V cache buffer of `n` values, 16-bit when `half` and the backend
+    /// says so in [`Backend::kv_caps`]; otherwise f32 like [`Backend::alloc`].
+    fn alloc_kv(&self, n: usize, half: bool) -> Self::Buf {
+        let _ = half;
+        self.alloc(n)
+    }
+    /// Rows `from .. from + len` of every head of `src` (`[heads, n, d]`)
+    /// into the cache `dst` at row `dst_row` of each head, heads `stride`
+    /// rows apart, in `dst`'s storage (`half` as passed to `alloc_kv`). One
+    /// call per run of consecutive slots, all heads at once.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_store(
+        &self,
+        src: &Self::Buf,
+        n: usize,
+        from: usize,
+        len: usize,
+        heads: usize,
+        d: usize,
+        dst: &Self::Buf,
+        dst_row: usize,
+        stride: usize,
+        half: bool,
+    ) {
+        let _ = half;
+        for h in 0..heads {
+            self.copy(
+                src,
+                (h * n + from) * d,
+                dst,
+                (h * stride + dst_row) * d,
+                len * d,
+            );
+        }
+    }
+    /// [`Backend::attention`] over a cache: `k`/`v` are `[heads, stride, d]`
+    /// of which the first `sk` rows per head are valid. Only called when
+    /// [`Backend::kv_caps`] says strided (or when `stride == sk`).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_kv(
+        &self,
+        q: &Self::Buf,
+        k: &Self::Buf,
+        v: &Self::Buf,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+        stride: usize,
+        head_dim: usize,
+        half: bool,
+        out: &Self::Buf,
+    ) {
+        assert!(
+            stride == sk && !half,
+            "attention_kv: this backend reads only full f32 caches (kv_caps)"
+        );
+        self.attention(q, k, v, heads, sq, sk, head_dim, out);
+    }
+
     /// Whether [`Backend::vsa_attention`] can run at this head dim on this
     /// device (WebGPU needs its flash kernel: head_dim % 16 == 0, ≤ 128, and
     /// enough workgroup memory).

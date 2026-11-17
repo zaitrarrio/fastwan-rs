@@ -72,6 +72,7 @@ fn causal_blocks_match_reference() {
         cap_frames: 3,
         sink_frames: 1,
         timesteps: vec![],
+        half_kv: false,
     };
     let tpf = (h / cfg.patch) * (w / cfg.patch);
     let mut cache = KvCache::new(&be, cfg.layers, cfg.heads, cfg.head_dim, tpf, &ccfg).unwrap();
