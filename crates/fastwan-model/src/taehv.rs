@@ -227,12 +227,53 @@ impl<B: Backend> TaeHv<B> {
         h: usize,
         w: usize,
     ) -> Chunk<B> {
+        assert_eq!(z.len(), frames * self.cfg.latent_channels * h * w);
+        self.launch_x0(be, st, be.upload(z), frames, h, w)
+    }
+
+    /// [`TaeHv::launch_chunk`] from a latent already on the device, laid out
+    /// `[C, frames, h, w]` (a causal block): reordered to frame-major on the
+    /// device, so the latent never makes a round trip through the host.
+    pub fn launch_chunk_dev(
+        &self,
+        be: &B,
+        st: &mut DecodeState<B>,
+        latent: &B::Buf,
+        frames: usize,
+        h: usize,
+        w: usize,
+    ) -> Chunk<B> {
+        let c = self.cfg.latent_channels;
+        let plane = h * w;
+        let x0 = be.alloc(frames * c * plane);
+        for f in 0..frames {
+            for ch in 0..c {
+                be.copy(
+                    latent,
+                    (ch * frames + f) * plane,
+                    &x0,
+                    (f * c + ch) * plane,
+                    plane,
+                );
+            }
+        }
+        self.launch_x0(be, st, x0, frames, h, w)
+    }
+
+    /// The decoder on a frame-major latent `x0` (`[frames, C, h, w]`).
+    fn launch_x0(
+        &self,
+        be: &B,
+        st: &mut DecodeState<B>,
+        x0: B::Buf,
+        frames: usize,
+        h: usize,
+        w: usize,
+    ) -> Chunk<B> {
         let cfg = &self.cfg;
         let nf = cfg.widths;
-        assert_eq!(z.len(), frames * cfg.latent_channels * h * w);
         let (mut f, mut h, mut w) = (frames, h, w);
-        let x0 = be.upload(z);
-        be.tanh_clamp(&x0, z.len(), 3.0);
+        be.tanh_clamp(&x0, frames * cfg.latent_channels * h * w, 3.0);
         let shape = |f, cin_a, cin_b, cout, h, w, upsample, k| ConvShape {
             frames: f,
             cin_a,

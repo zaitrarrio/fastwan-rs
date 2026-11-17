@@ -1610,6 +1610,15 @@ impl Wgpu {
     /// [`Self::download_async`] that reports a failed map or a recorded
     /// WebGPU error instead of panicking.
     pub async fn try_download_async(&self, buf: &GBuf) -> Result<Vec<f32>, String> {
+        self.readback_begin(buf)?.wait(self).await
+    }
+
+    /// Start reading `buf` back: the copy into a staging buffer is submitted
+    /// now and mapped asynchronously, so work queued after this call does not
+    /// delay it. Await [`Readback::wait`] later; the long-video loop queues
+    /// the next block in between, so the GPU is never idle while the page
+    /// waits for frames.
+    pub fn readback_begin(&self, buf: &GBuf) -> Result<Readback, String> {
         if let Some(f) = self.fault() {
             return Err(f);
         }
@@ -1632,34 +1641,11 @@ impl Wgpu {
         staging
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |r| tx.send(r));
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        #[cfg(target_arch = "wasm32")]
-        let _tick = self
-            .keepalive
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .then(|| KeepAlive::start(self.queue.clone()))
-            .flatten();
-        if let Err(e) = rx.await {
-            return Err(self
-                .fault()
-                .unwrap_or_else(|| format!("GPU readback failed: {e}")));
-        }
-        if let Some(f) = self.fault() {
-            return Err(f);
-        }
-        let data = staging
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|e| format!("GPU readback failed: {e:?}"))?;
-        let out = bytemuck::cast_slice::<u8, f32>(&data)[..buf.len].to_vec();
-        drop(data);
-        staging.unmap();
-        retire(staging);
-        Ok(out)
+        Ok(Readback {
+            staging,
+            rx,
+            len: buf.len,
+        })
     }
 
     /// Non-blocking readback for the browser (and usable natively).
@@ -1699,6 +1685,48 @@ impl Wgpu {
 }
 
 /// A minimal one-shot channel future (no executor dependency).
+/// A readback started by [`Wgpu::readback_begin`].
+pub struct Readback {
+    staging: wgpu::Buffer,
+    rx: OneRx<Result<(), wgpu::BufferAsyncError>>,
+    len: usize,
+}
+
+impl Readback {
+    /// The buffer's contents once the GPU has written them.
+    pub async fn wait(self, be: &Wgpu) -> Result<Vec<f32>, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = be.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        #[cfg(target_arch = "wasm32")]
+        let _tick = be
+            .keepalive
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| KeepAlive::start(be.queue.clone()))
+            .flatten();
+        if let Err(e) = self.rx.await {
+            return Err(be
+                .fault()
+                .unwrap_or_else(|| format!("GPU readback failed: {e}")));
+        }
+        if let Some(f) = be.fault() {
+            return Err(f);
+        }
+        let data = self
+            .staging
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| format!("GPU readback failed: {e:?}"))?;
+        let out = bytemuck::cast_slice::<u8, f32>(&data)[..self.len].to_vec();
+        drop(data);
+        self.staging.unmap();
+        retire(self.staging);
+        Ok(out)
+    }
+}
+
 /// While a browser readback is pending, submit an empty batch every 20 ms.
 /// Chrome delivered `mapAsync` callbacks for long videos up to ~40 s late
 /// (blocks of 1.5 s took 16-41 s in runs, natively flat): an empty submit makes

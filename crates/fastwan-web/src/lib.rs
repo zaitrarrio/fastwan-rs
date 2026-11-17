@@ -558,7 +558,7 @@ mod web {
         sink_frames: usize,
         on: &Function,
     ) -> Result<(), JsValue> {
-        use fastwan_model::causal::{CausalConfig, CausalRollout, frame_major};
+        use fastwan_model::causal::{CausalConfig, CausalRollout};
         let emit = |o: Object| {
             let _ = on.call1(&JsValue::NULL, &o);
         };
@@ -616,41 +616,61 @@ mod web {
         be.try_download_async(&fence).await.map_err(err)?;
         emit(Object::new().tap(|o| set(o, "type", "prepared")));
         let blocks = lt.div_ceil(bf);
-        let c = tae.cfg.latent_channels;
         let mut st = tae.state();
+        // Pipelined: block b is queued (denoise, decode from the device
+        // latent, pack, readback copy) before the page waits for block b − 1's
+        // frames, so the GPU always has the next block while the browser
+        // delivers the previous readback. No latent leaves the GPU.
         let mut done = 0usize;
-        for b in 0..blocks {
-            if inner.stop.get() {
-                break;
+        let mut pending: Option<(
+            fastwan_wgpu::Readback,
+            fastwan_model::taehv::Chunk<Wgpu>,
+            usize,
+        )> = None;
+        let mut queued = 0usize;
+        let mut t_last = now_ms();
+        loop {
+            let next = if queued < blocks && !inner.stop.get() {
+                let x = roll.next_block(be, &prompt).map_err(err)?;
+                let ck = tae.launch_chunk_dev(be, &mut st, x, bf, lh, lw);
+                let packed = ck.pack(be);
+                let rb = be
+                    .readback_begin(&packed)
+                    .map_err(|e| err(format!("decode failed: {e} ({})", be.limits_text())))?;
+                queued += 1;
+                Some((rb, ck, queued - 1))
+            } else {
+                None
+            };
+            if let Some((rb, ck, b)) = pending.take() {
+                let raw = rb
+                    .wait(be)
+                    .await
+                    .map_err(|e| err(format!("decode failed: {e} ({})", be.limits_text())))?;
+                let (count, h, w, rgba) = ck.rgba8(&raw);
+                let now = now_ms();
+                let o = Object::new();
+                set(&o, "type", "block");
+                set(&o, "index", b as u32);
+                set(&o, "total", blocks as u32);
+                set(&o, "ms", now - t_last);
+                set(&o, "denoise_ms", now - t_last);
+                emit(o);
+                t_last = now;
+                let o = Object::new();
+                set(&o, "type", "frames");
+                set(&o, "first", done as u32);
+                set(&o, "count", count as u32);
+                set(&o, "width", w as u32);
+                set(&o, "height", h as u32);
+                set(&o, "rgba", Uint8Array::from(&rgba[..]));
+                emit(o);
+                done += count;
             }
-            let t0 = now_ms();
-            let x = roll.next_block(be, &prompt).map_err(err)?;
-            let latent = be.try_download_async(x).await.map_err(err)?;
-            let denoise_ms = now_ms() - t0;
-            let z = frame_major(&latent, c, bf, lh * lw);
-            let ck = tae.launch_chunk(be, &mut st, &z, bf, lh, lw);
-            let packed = ck.pack(be);
-            let raw = be
-                .try_download_async(&packed)
-                .await
-                .map_err(|e| err(format!("decode failed: {e} ({})", be.limits_text())))?;
-            let (count, h, w, rgba) = ck.rgba8(&raw);
-            let o = Object::new();
-            set(&o, "type", "block");
-            set(&o, "index", b as u32);
-            set(&o, "total", blocks as u32);
-            set(&o, "ms", now_ms() - t0);
-            set(&o, "denoise_ms", denoise_ms);
-            emit(o);
-            let o = Object::new();
-            set(&o, "type", "frames");
-            set(&o, "first", done as u32);
-            set(&o, "count", count as u32);
-            set(&o, "width", w as u32);
-            set(&o, "height", h as u32);
-            set(&o, "rgba", Uint8Array::from(&rgba[..]));
-            emit(o);
-            done += count;
+            match next {
+                Some(n) => pending = Some(n),
+                None => break,
+            }
         }
         Ok(())
     }
