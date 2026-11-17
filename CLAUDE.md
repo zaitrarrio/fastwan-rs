@@ -57,12 +57,17 @@ State and invariants only; the reasoning is in `docs/design.md`.
   first eviction sets both) and the kept recent frames move up through the
   scratch (no self-copies on WebGPU). Checked against a transcription of
   MemRoPE's attention (`make_memrope_fixture.py`, `hf_parity` 3e-7); the
-  window cache (`Memory::Window`) is unchanged.
+  window cache (`Memory::Window`) is unchanged. RTX 4090 (595.99): 63 s at
+  832×480 in 96 s (10.5 fps, ~3 % over the window cache), stable; the same
+  weights on the window cache break up mid-clip, so run them with their
+  memory (`docs/runs/2026-11-17-vast-4090-history-forcing`).
 - LightX2V: LightTAE (`lighttaew2_1[_v2]`) is TAEHV's network on raw VAE
   latents: `TaeConfig::lighttaew2_1` (chosen by file name) applies `z·std +
   mean` (Wan 2.1 VAE stats) before TAEHV's clamp; it cannot be folded into
   the first conv (the clamp comes first). `convert_lightx2v_fp8.py` decodes
   `lightx2v/Self-Forcing-FP8` (E4M3 × per-row scale) to bf16 exactly.
+  LightTAE vs TAEHV on the same latents: 35.4 dB, same cost; the FP8 weights
+  make another sample of the scene (21 dB vs bf16), like int4.
 - Browser long videos (`Engine.generateLong` / `stop`; Prompt Studio offers
   them for manifest variants with `"causal": true`, 480×272 and 640×352,
   desktop only: the f32 K/V cache is ~2.3 GB at 480×272). Correct in Chrome
