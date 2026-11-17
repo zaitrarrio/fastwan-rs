@@ -53,15 +53,28 @@ State and invariants only; the reasoning is in `docs/design.md`.
   the prompted subject and moves more, but over-saturates and shows light
   streaks (`docs/runs/2026-11-17-runpod-4090-history-forcing`). MemRoPE (its
   optional demo cache) is not implemented; the vendored code is CC-BY-NC-SA.
+- K/V cache ops: `kv_store` (one dispatch per run of slots, all heads) and
+  `attention_kv` (flash3 reads the cache in place with a head stride; no
+  prefix packing), `alloc_kv(n, half)` for a 16-bit cache (f16 pairs via core
+  `unpack2x16float`, no `shader-f16`; `CausalConfig::half_kv`). CUDA keeps its
+  bf16 cache and the copy path (trait defaults, `kv_caps`).
 - Browser long videos (`Engine.generateLong` / `stop`; Prompt Studio offers
-  them for manifest variants with `"causal": true`, 480×272 and 640×352,
-  desktop only: the f32 K/V cache is ~2.3 GB at 480×272). Correct in Chrome
-  (SwiftShader parity 99.93%, max 1 level), but headless Chrome on an RTX 4090
-  stalls some blocks for 4-41 s while native wgpu stays at 1.6 s/block
-  (`docs/runs/2026-11-15-vast-4090-chrome-long-video`). wgpu's web backend
-  never frees a dropped buffer: `Owned` / `retire` destroy them after the next
-  submit; `KeepAlive` submits an empty batch every 20 ms during readbacks
-  (halves the stalls). Cause of the rest unknown.
+  them for manifest variants with `"causal": true`). Desktop: 480×272 and
+  640×352, f32 cache unless `?halfkv=1`. Phones (`"mobile": true` variants,
+  public `sf4` = 4-bit Self-Forcing): 320×192 (cache 12) or 480×272 (cache
+  9), 16-bit cache (`setHalfKv`, default on phones), 200 MB of frames. The
+  loop is pipelined (block b queued before block b−1's frames are awaited,
+  `Wgpu::readback_begin` / `Readback::wait`) and the latent never leaves the
+  GPU (`TaeHv::launch_chunk_dev`). SwiftShader parity 99.93%, max 1 level,
+  desktop and phone settings. **Headless Chrome on an RTX 4090 still stalls
+  some blocks** (8–42 s vs 1.6 s; native wgpu flat): not the copies, the
+  latent readback or GPU idling (all removed), and the slow blocks shrink
+  with faster kernels (35.5 → 24.8 s with f16), so the GPU itself runs slow
+  then; next step is Chrome GPU timestamps / a trace
+  (`docs/runs/2026-11-17-vast-4090-stalls-f16-phones`). wgpu's web backend
+  never frees a dropped buffer: `Owned` / `retire` destroy them after the
+  next submit; `KeepAlive` submits an empty batch every 20 ms during
+  readbacks.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does) **and the clip has ≥ 21 latent frames
   (81 frames)**; `--attention dense` to compare. Shorter clips under VSA
@@ -94,10 +107,14 @@ State and invariants only; the reasoning is in `docs/design.md`.
   arrays indexed in loops. NVIDIA's Vulkan compiler kept those arrays in local
   memory: unrolling made the GEMM 5.75× and flash attention 7.8× faster.
   `FASTWAN_PROFILE=1` gives per-kernel GPU time; check it after kernel work.
-- WebGPU f16 math (`linear3h`, `flash_h`, `FASTWAN_WGPU_F16=1`) is opt-in: correct
-  (PSNR 43.8 dB vs f32 on a real clip) but 8.5% slower on an RTX 4090, where
-  f16 runs at the f32 rate (`docs/runs/2026-11-03-vast-4090-f16`). Unmeasured
-  on AMD / Intel / Apple, where it should pay; measure before defaulting it on.
+- WebGPU f16 math (`FASTWAN_WGPU_F16=1`, `?f16=1`; needs `shader-f16`) is
+  opt-in. Current kernels: `linear4h` / `flash3h` (vec4<f16> tiles, 16-term
+  f16 partial sums flushed into f32): 62/62 checks; RTX 4090 Chrome GEMMs
+  1.11–1.24×, attention 1.62×, native step −7%
+  (`docs/runs/2026-11-17-vast-4090-stalls-f16-phones`). The old `linear3h` /
+  `flash_h` were 8.5% slower (`docs/runs/2026-11-03-vast-4090-f16`). Default
+  it on only after a real-clip PSNR check and AMD / Apple numbers (Prompt
+  Studio `?selftest=1` → Benchmark f32 vs f16).
 - `--weights int8` (`fastwan_core::quant::Q8`: symmetric int8, one f32 scale
   per 128 input columns) applies to the block linears only. The CPU backend
   dequantizes and is the reference the kernels are checked against. On an RTX
