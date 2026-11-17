@@ -11,8 +11,11 @@ struct P { heads: u32, d: u32, nb: u32, topk: u32, scale: f32, _a: u32, _b: u32,
 
 var<workgroup> sc: array<f32, 2048>;
 var<workgroup> red: array<f32, 256>;
-var<workgroup> cnt: atomic<u32>;
-var<workgroup> thr: u32;
+// Per-thread counts for the top-k search, summed by a tree like `red`. Not a
+// workgroup atomic: on an AMD RDNA1 Mac (Chrome → Metal) the atomicStore /
+// atomicAdd / atomicLoad version picked the wrong tiles for 74% of queries
+// (2026-11-17 browser self-test) while every other stage matched.
+var<workgroup> cnt: array<u32, 256>;
 
 // Float → u32 with the same order.
 fn okey(x: f32) -> u32 {
@@ -63,13 +66,15 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wid: v
     var t = 0u;
     for (var bit = 31i; bit >= 0i; bit = bit - 1i) {
         let cand = t | (1u << u32(bit));
-        if (tid == 0u) { atomicStore(&cnt, 0u); }
-        workgroupBarrier();
         var local = 0u;
         for (var kt = tid; kt < p.nb; kt = kt + 256u) { if (okey(sc[kt]) >= cand) { local = local + 1u; } }
-        atomicAdd(&cnt, local);
+        cnt[tid] = local;
         workgroupBarrier();
-        if (atomicLoad(&cnt) >= p.topk) { t = cand; }
+        for (var st = 128u; st > 0u; st = st >> 1u) {
+            if (tid < st) { cnt[tid] = cnt[tid] + cnt[tid + st]; }
+            workgroupBarrier();
+        }
+        if (cnt[0] >= p.topk) { t = cand; }
         workgroupBarrier();
     }
     if (tid == 0u) {

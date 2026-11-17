@@ -111,6 +111,13 @@ State and invariants only; the reasoning is in `docs/design.md`.
   carried a `var` declared in a loop body across iterations, which broke
   multi-chunk flash attention while naga/wgpu passed. Run the bench page in
   Chrome as well as `cargo test` after shader changes.
+- WGSL: no workgroup atomics. `vsa_coarse`'s top-k counted with
+  `atomic<u32>` (store / add / load across barriers) and picked the wrong
+  tiles for 74% of queries on an AMD RDNA1 Mac (Chrome → Metal) while Apple,
+  NVIDIA and SwiftShader were exact: every 5 s clip was noise there. It now
+  sums per-thread counts with a tree reduction. The browser self-test
+  (`?selftest=1`: `check::ops_deferred` + VSA stage by stage against
+  `vsa::coarse_reference`) finds such per-GPU failures; ask for its output.
 - WGSL auto layouts drop unused bindings, so every declared binding must be
   statically used (see the guard lines at the end of `conv.wgsl` and
   `elementwise.wgsl`).
