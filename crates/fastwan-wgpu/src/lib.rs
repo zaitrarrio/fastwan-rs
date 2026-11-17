@@ -27,6 +27,7 @@ const LINEAR2: &str = include_str!("shaders/linear2.wgsl");
 const LINEAR3: &str = include_str!("shaders/linear3.wgsl");
 const LINEAR3H: &str = include_str!("shaders/linear3h.wgsl");
 const LINEAR4: &str = include_str!("shaders/linear4.wgsl");
+const LINEAR4H: &str = include_str!("shaders/linear4h.wgsl");
 const FLASH_H: &str = include_str!("shaders/flash_h.wgsl");
 /// Token-sized GEMMs only take the f16 path: the 512-row text projections
 /// carry encoder activations that can exceed f16's ±65504.
@@ -40,6 +41,7 @@ const PACK: &str = include_str!("shaders/pack.wgsl");
 const KV: &str = include_str!("shaders/kv.wgsl");
 const FLASH: &str = include_str!("shaders/flash.wgsl");
 const FLASH3: &str = include_str!("shaders/flash3.wgsl");
+const FLASH3H: &str = include_str!("shaders/flash3h.wgsl");
 /// Shared memory flash3 declares (vec4 panels, S tile, partials, row state).
 const FLASH3_SHARED: u32 = 512 * 16 + 4160 * 4 + 2 * 256 * 4 + 5 * 64 * 4;
 const VSA_POOL: &str = include_str!("shaders/vsa_pool.wgsl");
@@ -776,7 +778,9 @@ impl Wgpu {
         scale: f32,
         vsa: Option<(&GVsa, &GBuf)>,
     ) {
-        let pipe = if self.flash_variant == 3 && d <= 128 {
+        let pipe = if self.flash_variant == 3 && d <= 128 && self.f16 {
+            self.pipeline("flash3h", || FLASH3H.to_string())
+        } else if self.flash_variant == 3 && d <= 128 {
             self.pipeline("flash3", || FLASH3.to_string())
         } else if self.f16 {
             self.pipeline("flash_h", || FLASH_H.to_string())
@@ -812,8 +816,8 @@ impl Wgpu {
     /// flash3.wgsl reading a K/V cache: keys and values of head h start at
     /// row h · kstride (not h · sk), and with `half` they are f16 pairs in
     /// u32 (unpacked with core `unpack2x16float`; no `shader-f16` needed).
-    fn flash3_kv_src(half: bool) -> String {
-        let mut s = FLASH3.replace(
+    fn flash3_kv_src(half: bool, f16: bool) -> String {
+        let mut s = (if f16 { FLASH3H } else { FLASH3 }).replace(
             "struct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32 }",
             "struct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32, kstride: u32, _a: u32, _b: u32, _c: u32 }",
         );
@@ -1086,12 +1090,14 @@ impl Backend for Wgpu {
             1 => (LINEAR, 64, "linear"),
             _ => (LINEAR3, 64, "linear3"),
         };
-        let half = self.f16 && f16 && variant == 3 && rows >= F16_MIN_ROWS;
+        let half = self.f16 && f16 && (variant == 3 || variant == 4) && rows >= F16_MIN_ROWS;
         let pipe = if let Some((kind, ..)) = &w.quant {
             match kind {
                 Quant::Q8 => self.pipeline(&format!("{name}_q8"), || Self::q8_src(src)),
                 Quant::Q4 => self.pipeline(&format!("{name}_q4"), || Self::q4_src(src)),
             }
+        } else if half && variant == 4 {
+            self.pipeline("linear4h", || LINEAR4H.to_string())
         } else if half {
             self.pipeline("linear3h", || LINEAR3H.to_string())
         } else {
@@ -1260,8 +1266,13 @@ impl Backend for Wgpu {
             );
             return self.attention(q, k, v, heads, sq, sk, d, out);
         }
-        let key = if half { "flash3_kvh" } else { "flash3_kv" };
-        let pipe = self.pipeline(key, || Self::flash3_kv_src(half));
+        let f16 = self.f16;
+        let key = format!(
+            "flash3{}_kv{}",
+            if f16 { "h" } else { "" },
+            if half { "h" } else { "" }
+        );
+        let pipe = self.pipeline(&key, || Self::flash3_kv_src(half, f16));
         let scale = 1.0 / (d as f32).sqrt();
         let p = [
             heads as u32,

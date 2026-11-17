@@ -57,6 +57,9 @@ mod web {
         stop: std::cell::Cell<bool>,
         /// Clip attention: `None` = the model's default (VSA from 81 frames).
         attention: std::cell::Cell<Option<fastwan_model::Attention>>,
+        /// Long videos keep the K/V cache as 16-bit values (half its memory);
+        /// on by default on phones.
+        half_kv: std::cell::Cell<bool>,
     }
 
     #[wasm_bindgen]
@@ -71,6 +74,7 @@ mod web {
         model: String,
         kernels: Option<String>,
         mobile: Option<bool>,
+        f16: Option<bool>,
     ) -> Result<Engine, JsValue> {
         console_error_panic_hook::set_once();
         let (cfg, tcfg) = match model.as_str() {
@@ -93,6 +97,9 @@ mod web {
         if mobile {
             opts.submit_every = Some(8);
         }
+        // f16 math kernels (linear4h / flash3h) where the adapter has
+        // `shader-f16`; fixed for the device's lifetime.
+        opts.f16 = f16.unwrap_or(false);
         let be = Wgpu::with_options_async(opts).await.map_err(err)?;
         Ok(Engine {
             inner: Rc::new(Inner {
@@ -109,6 +116,7 @@ mod web {
                 mobile,
                 stop: std::cell::Cell::new(false),
                 attention: std::cell::Cell::new(None),
+                half_kv: std::cell::Cell::new(mobile),
             }),
         })
     }
@@ -519,6 +527,110 @@ mod web {
             })
         }
 
+        /// Long videos: keep the K/V cache as 16-bit values (half the cache
+        /// memory; on by default on phones).
+        #[wasm_bindgen(js_name = setHalfKv)]
+        pub fn set_half_kv(&self, on: bool) {
+            self.inner.half_kv.set(on);
+        }
+
+        /// Whether the f16 math kernels are in use (asked for at
+        /// `createEngine` and supported by the adapter).
+        #[wasm_bindgen(js_name = isF16)]
+        pub fn is_f16(&self) -> bool {
+            self.inner.be.f16()
+        }
+
+        /// Time the model's main kernels on this GPU with synthetic data: the
+        /// FFN GEMMs (f16 weights), dense attention and attention over a
+        /// 16-bit K/V cache, each at a model shape. Events:
+        /// `{type: "bench", name, ms, gflops}`, one per kernel (mean of `reps`
+        /// calls after a warm-up, fenced by a readback).
+        pub fn bench(&self, reps: u32, on_event: Function) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            wasm_bindgen_futures::future_to_promise(async move {
+                use fastwan_core::Backend as _;
+                let be = &inner.be;
+                let reps = reps.max(1);
+                let mut rng = Rng::new(3);
+                let fence = be.alloc(1);
+                let emit = |name: &str, ms: f64, flop: f64| {
+                    let o = Object::new();
+                    set(&o, "type", "bench");
+                    set(&o, "name", name);
+                    set(&o, "ms", ms);
+                    set(&o, "gflops", flop / ms / 1e6);
+                    let _ = on_event.call1(&JsValue::NULL, &o);
+                };
+                // Rows: 3 latent frames at 480×272 (one long-video block) ≈
+                // 1530 tokens; 4096 keeps every kernel on its large-tile path.
+                let (m, d, f) = (4096usize, 1536usize, 8960usize);
+                let x = be.upload(&rng.normal(m * f));
+                let wu = be.weight(&rng.uniform(f * d, 0.05), f, d);
+                let wd = be.weight(&rng.uniform(d * f, 0.05), d, f);
+                let h = be.alloc(m * f);
+                let y = be.alloc(m * d);
+                let mut results: Vec<(String, f64, f64)> = Vec::new();
+                let ffn = 2.0 * (m * d * f) as f64;
+                let ms = time_it(be, &fence, reps, &|| {
+                    be.linear(
+                        &x,
+                        0,
+                        m,
+                        &wu,
+                        None,
+                        fastwan_core::backend::Act::GeluTanh,
+                        &h,
+                        0,
+                    )
+                })
+                .await?;
+                results.push(("GEMM 4096×1536→8960 (FFN up, GELU)".into(), ffn, ms));
+                let ms = time_it(be, &fence, reps, &|| {
+                    be.linear(&h, 0, m, &wd, None, fastwan_core::backend::Act::None, &y, 0)
+                })
+                .await?;
+                results.push(("GEMM 4096×8960→1536 (FFN down)".into(), ffn, ms));
+                let (heads, hd, s) = (12usize, 128usize, 4096usize);
+                let q = be.upload(&rng.normal(heads * s * hd));
+                let k = be.upload(&rng.normal(heads * s * hd));
+                let v = be.upload(&rng.normal(heads * s * hd));
+                let o = be.alloc(s * heads * hd);
+                let ms = time_it(be, &fence, reps, &|| {
+                    be.attention(&q, &k, &v, heads, s, s, hd, &o)
+                })
+                .await?;
+                results.push((
+                    "attention 12×4096×4096 d128".into(),
+                    4.0 * (heads * s * s * hd) as f64,
+                    ms,
+                ));
+                if be.kv_caps(hd).1 {
+                    // One long-video block (1530 queries) over a full 12-frame
+                    // cache at 480×272 (6120 keys), 16-bit.
+                    let (sq, sk) = (1530usize, 6120usize);
+                    let kc = be.alloc_kv(heads * sk * hd, true);
+                    let vc = be.alloc_kv(heads * sk * hd, true);
+                    let src = be.upload(&rng.normal(heads * sk * hd));
+                    be.kv_store(&src, sk, 0, sk, heads, hd, &kc, 0, sk, true);
+                    be.kv_store(&src, sk, 0, sk, heads, hd, &vc, 0, sk, true);
+                    let ms = time_it(be, &fence, reps, &|| {
+                        be.attention_kv(&q, &kc, &vc, heads, sq, sk, sk, hd, true, &o)
+                    })
+                    .await?;
+                    results.push((
+                        "attention over 16-bit cache 1530×6120".into(),
+                        4.0 * (heads * sq * sk * hd) as f64,
+                        ms,
+                    ));
+                }
+                for (n, fl, ms) in &results {
+                    emit(n, *ms, *fl);
+                }
+                Ok(JsValue::from(results.len() as u32))
+            })
+        }
+
         /// Diagnostics: turn off the device keep-alive during readbacks.
         #[wasm_bindgen(js_name = setKeepAlive)]
         pub fn set_keep_alive(&self, on: bool) {
@@ -573,6 +685,12 @@ mod web {
         let e = read_embeds(cfg, embeds)?;
         let mut ccfg = CausalConfig::self_forcing();
         ccfg.cache_frames(cache_frames, sink_frames);
+        ccfg.half_kv = inner.half_kv.get();
+        let kv_bytes = if ccfg.half_kv && be.kv_caps(cfg.head_dim).1 {
+            2
+        } else {
+            4
+        };
         let bf = ccfg.block_frames;
         // One block's activations: plan a clip of one block's length.
         let block = Geometry {
@@ -592,7 +710,7 @@ mod web {
         );
         let (lt, lh, lw) = g.latent();
         let tpf = (lh / cfg.patch) * (lw / cfg.patch);
-        let cache_layer = (cache_frames * tpf * cfg.dim() * 4) as u64;
+        let cache_layer = (cache_frames * tpf * cfg.dim() * kv_bytes) as u64;
         let largest = p.largest_binding.max(cache_layer);
         if largest > be.max_binding() {
             return Err(err(format!(
@@ -829,6 +947,24 @@ mod web {
             }
             None
         }
+    }
+
+    /// Mean time of `run` over `reps` calls after one warm-up call, fenced
+    /// by readbacks so queued work is counted.
+    async fn time_it(
+        be: &Wgpu,
+        fence: &fastwan_wgpu::GBuf,
+        reps: u32,
+        run: &dyn Fn(),
+    ) -> Result<f64, JsValue> {
+        run();
+        be.try_download_async(fence).await.map_err(err)?;
+        let t0 = now_ms();
+        for _ in 0..reps {
+            run();
+        }
+        be.try_download_async(fence).await.map_err(err)?;
+        Ok((now_ms() - t0) / reps as f64)
     }
 
     trait Tap: Sized {
