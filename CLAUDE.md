@@ -46,6 +46,23 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (`docs/runs/2026-11-14-vast-4090-self-forcing-long`). Below ~320×192 the
   model gives noise (out of distribution, not a bug). A 60 s video drifts
   (a subject leaves and returns) but stays one scene.
+- History Forcing (`generate --causal --memory memrope`, `CausalConfig::
+  history_forcing`; weights `xzxxntxdy/History-Forcing` `dmd/model.pt`, EMA,
+  through `convert_self_forcing.py`, no stated weights license: not hosted):
+  MemRoPE's cache is `[sink 3 | long EMA | short EMA | recent 4 | block 3]`
+  in slot order; keys are stored **unrotated** and `rope_heads` rotates the
+  valid prefix at slot positions 0.. every forward (queries at the block's
+  slots); a new block that does not fit averages the evicted recent frames
+  over all their tokens (`kv_ema`) into the memory frames (α 0.01 / 0.1; the
+  first eviction sets both) and the kept recent frames move up through the
+  scratch (no self-copies on WebGPU). Checked against a transcription of
+  MemRoPE's attention (`make_memrope_fixture.py`, `hf_parity` 3e-7); the
+  window cache (`Memory::Window`) is unchanged.
+- LightX2V: LightTAE (`lighttaew2_1[_v2]`) is TAEHV's network on raw VAE
+  latents: `TaeConfig::lighttaew2_1` (chosen by file name) applies `z·std +
+  mean` (Wan 2.1 VAE stats) before TAEHV's clamp; it cannot be folded into
+  the first conv (the clamp comes first). `convert_lightx2v_fp8.py` decodes
+  `lightx2v/Self-Forcing-FP8` (E4M3 × per-row scale) to bf16 exactly.
 - Browser long videos (`Engine.generateLong` / `stop`; Prompt Studio offers
   them for manifest variants with `"causal": true`, 480×272 and 640×352,
   desktop only: the f32 K/V cache is ~2.3 GB at 480×272). Correct in Chrome
