@@ -36,6 +36,7 @@ const ATTN: &str = include_str!("shaders/attention.wgsl");
 const NORM: &str = include_str!("shaders/norm.wgsl");
 const HEADS: &str = include_str!("shaders/head_split.wgsl");
 const ELEM: &str = include_str!("shaders/elementwise.wgsl");
+const MEMORY: &str = include_str!("shaders/memory.wgsl");
 const PACK: &str = include_str!("shaders/pack.wgsl");
 const FLASH: &str = include_str!("shaders/flash.wgsl");
 const FLASH3: &str = include_str!("shaders/flash3.wgsl");
@@ -1311,6 +1312,90 @@ impl Backend for Wgpu {
             n,
             [0, 0, noise.is_some() as u32, 0, 0, 0, 0, 0],
             [st, sn],
+        );
+    }
+
+    fn rope_heads(
+        &self,
+        src: &GBuf,
+        src_off: usize,
+        src_stride: usize,
+        dst: &GBuf,
+        dst_off: usize,
+        dst_stride: usize,
+        heads: usize,
+        rows: usize,
+        hd: usize,
+        rope: (&GBuf, &GBuf),
+    ) {
+        let pipe = self.pipeline("memory", || MEMORY.to_string());
+        let p = [
+            0,
+            heads as u32,
+            rows as u32,
+            hd as u32,
+            src_off as u32,
+            src_stride as u32,
+            dst_off as u32,
+            dst_stride as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let n = heads * rows * hd / 2;
+        self.dispatch(
+            &pipe,
+            &p,
+            &[src, rope.0, rope.1, dst],
+            Self::grid(n.div_ceil(256)),
+        );
+    }
+
+    fn kv_ema(
+        &self,
+        buf: &GBuf,
+        heads: usize,
+        head_stride: usize,
+        hd: usize,
+        src_row: usize,
+        src_rows: usize,
+        dst_row: usize,
+        frame_rows: usize,
+        alphas: [f32; 2],
+    ) {
+        assert!(
+            src_row + src_rows <= dst_row || dst_row + 2 * frame_rows <= src_row,
+            "kv_ema: source and memory rows overlap"
+        );
+        let pipe = self.pipeline("memory", || MEMORY.to_string());
+        let p = [
+            1,
+            heads as u32,
+            0,
+            hd as u32,
+            0,
+            0,
+            0,
+            head_stride as u32,
+            src_row as u32,
+            src_rows as u32,
+            dst_row as u32,
+            frame_rows as u32,
+            alphas[0].to_bits(),
+            alphas[1].to_bits(),
+            0,
+            0,
+        ];
+        self.dispatch(
+            &pipe,
+            &p,
+            &[&self.dummy, &self.dummy, &self.dummy, buf],
+            Self::grid(heads * hd.div_ceil(32)),
         );
     }
 

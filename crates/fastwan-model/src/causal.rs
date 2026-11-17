@@ -16,9 +16,32 @@
 //! overwritten instead of shifting the cache (WebGPU cannot copy a buffer
 //! onto itself). Checked against strobe's PyTorch `causal_forward`
 //! (tests/hf_parity.rs, scripts/reference/make_causal_fixture.py).
+//!
+//! [`Memory::MemRope`] is History Forcing's long-video memory (MemRoPE):
+//! the cache is laid out `[sink | long EMA | short EMA | recent | block]`
+//! in slot order, keys are stored without RoPE and rotated at their slot
+//! index on every forward (block-relative RoPE: the current block's queries
+//! sit at the last slots, so positions never grow), and the frames a new
+//! block evicts from the front of the recent window are averaged (over all
+//! their tokens, per head and channel) into the two memory frames,
+//! `m ← α·mean + (1 − α)·m` with α 0.01 (long) and 0.1 (short); the first
+//! eviction sets both to the mean. Checked against MemRoPE's PyTorch
+//! attention (`scripts/reference/make_memrope_fixture.py`).
 
 use crate::dit::{Prompt, StepMods, WanDit, Workspace};
 use fastwan_core::{Backend, Error, Result, rng::Rng};
+
+/// What the cache keeps once it is full.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Memory {
+    /// A sink and a rolling window of the most recent frames, keys rotated
+    /// at their absolute frame before they are stored (Self-Forcing,
+    /// LongLive).
+    Window,
+    /// MemRoPE (History Forcing): a sink, two EMA memory frames and a
+    /// recent window, keys rotated at their slot index on every forward.
+    MemRope { alpha_long: f32, alpha_short: f32 },
+}
 
 /// The rollout's shape and schedule.
 #[derive(Debug, Clone)]
@@ -31,6 +54,8 @@ pub struct CausalConfig {
     pub sink_frames: usize,
     /// DiT timesteps of the few-step denoise, in order; σ = t / 1000.
     pub timesteps: Vec<f32>,
+    /// The cache policy once it is full.
+    pub memory: Memory,
 }
 
 impl CausalConfig {
@@ -51,6 +76,22 @@ impl CausalConfig {
             cap_frames: 12,
             sink_frames: 3,
             timesteps: [1000.0, 750.0, 500.0, 250.0].map(warp).to_vec(),
+            memory: Memory::Window,
+        }
+    }
+
+    /// History Forcing's DMD checkpoint (the same Wan2.1-T2V-1.3B causal
+    /// generator and 4-step schedule as Self-Forcing) with its MemRoPE
+    /// memory: a 12-frame cache of 3 sink frames, a long and a short EMA
+    /// frame (α 0.01 / 0.1), 4 recent frames and the 3-frame block
+    /// (`configs/long_video/inference.yaml`).
+    pub fn history_forcing() -> Self {
+        Self {
+            memory: Memory::MemRope {
+                alpha_long: 0.01,
+                alpha_short: 0.1,
+            },
+            ..Self::self_forcing()
         }
     }
 
@@ -89,6 +130,14 @@ pub struct KvCache<B: Backend> {
     runs: Vec<Run>,
     block_frames: usize,
     last_start: Option<usize>,
+    memory: Memory,
+    /// MemRoPE: valid frames (a prefix of the slots), the current block's
+    /// first slot, whether the memory frames hold an EMA yet, and the key
+    /// RoPE table for slot positions `0..cap`.
+    valid: usize,
+    block_slot: usize,
+    ema_ready: bool,
+    key_rope: Option<(B::Buf, B::Buf)>,
 }
 
 impl<B: Backend> KvCache<B> {
@@ -103,6 +152,14 @@ impl<B: Backend> KvCache<B> {
         if cfg.cap_frames < cfg.sink_frames + cfg.block_frames {
             return Err(Error::Geometry(format!(
                 "cache of {} frames cannot hold a {}-frame sink and a {}-frame block",
+                cfg.cap_frames, cfg.sink_frames, cfg.block_frames
+            )));
+        }
+        if let Memory::MemRope { .. } = cfg.memory
+            && cfg.cap_frames < cfg.sink_frames + 2 + cfg.block_frames
+        {
+            return Err(Error::Geometry(format!(
+                "MemRoPE cache of {} frames cannot hold a {}-frame sink, two memory frames and a {}-frame block",
                 cfg.cap_frames, cfg.sink_frames, cfg.block_frames
             )));
         }
@@ -121,14 +178,59 @@ impl<B: Backend> KvCache<B> {
             runs: Vec::new(),
             block_frames: 0,
             last_start: None,
+            memory: cfg.memory,
+            valid: 0,
+            block_slot: 0,
+            ema_ready: false,
+            key_rope: None,
         })
+    }
+
+    /// Whether keys are stored without RoPE and rotated at their slot on
+    /// every forward (MemRoPE); `head_split` then leaves K unrotated.
+    pub fn rotates_keys(&self) -> bool {
+        matches!(self.memory, Memory::MemRope { .. })
+    }
+
+    /// The RoPE table for slot positions `0..cap` (MemRoPE), `[cap · tpf,
+    /// head_dim / 2]`: `rope_table(cfg, (cap, gh, gw), 0)`.
+    pub fn set_key_rope(&mut self, cos: B::Buf, sin: B::Buf) {
+        self.key_rope = Some((cos, sin));
+    }
+
+    /// The temporal RoPE position of the block starting at latent frame
+    /// `start` (call after [`KvCache::begin_block`]): the frame itself, or
+    /// with MemRoPE its first slot.
+    pub fn query_frame(&self, start: usize) -> usize {
+        match self.memory {
+            Memory::Window => start,
+            Memory::MemRope { .. } => self.block_slot,
+        }
     }
 
     /// Choose the slots for the block starting at latent frame `start`. The
     /// same block again (the next denoise step, the clean rewrite) keeps its
-    /// slots. A new block fills free slots first, then the oldest non-sink.
-    pub fn begin_block(&mut self, start: usize, frames: usize) -> Result<()> {
+    /// slots. A new block fills free slots first, then the oldest non-sink;
+    /// with MemRoPE it is appended, and once the cache is full the frames it
+    /// evicts are folded into the memory frames and the rest of the recent
+    /// window moves up (on the device, every layer, before the block runs).
+    pub fn begin_block(&mut self, be: &B, start: usize, frames: usize) -> Result<()> {
         if self.last_start == Some(start) && self.block_frames == frames {
+            return Ok(());
+        }
+        if let Memory::MemRope {
+            alpha_long,
+            alpha_short,
+        } = self.memory
+        {
+            self.memrope_block(be, frames, [alpha_long, alpha_short])?;
+            self.runs = vec![Run {
+                from: 0,
+                slot: self.block_slot,
+                frames,
+            }];
+            self.last_start = Some(start);
+            self.block_frames = frames;
             return Ok(());
         }
         let mut slots = Vec::with_capacity(frames);
@@ -160,9 +262,68 @@ impl<B: Backend> KvCache<B> {
         Ok(())
     }
 
+    fn memrope_block(&mut self, be: &B, frames: usize, alphas: [f32; 2]) -> Result<()> {
+        if self.valid + frames <= self.cap {
+            self.block_slot = self.valid;
+            self.valid += frames;
+            return Ok(());
+        }
+        let (tpf, hd) = (self.tpf, self.head_dim);
+        let stride = self.cap * tpf * hd;
+        let mem = self.sink + 2;
+        let evict = self.valid + frames - self.cap;
+        if self.valid < mem + evict {
+            return Err(Error::Geometry(format!(
+                "MemRoPE: {} valid frames cannot lose {evict} after a {}-frame sink and two memory frames",
+                self.valid, self.sink
+            )));
+        }
+        let kept = self.valid - mem - evict;
+        let alphas = if self.ema_ready { alphas } else { [1.0, 1.0] };
+        for (bufs, scratch) in [(&self.k, &self.pack_k), (&self.v, &self.pack_v)] {
+            for buf in bufs {
+                be.kv_ema(
+                    buf,
+                    self.heads,
+                    stride,
+                    hd,
+                    mem * tpf,
+                    evict * tpf,
+                    self.sink * tpf,
+                    tpf,
+                    alphas,
+                );
+                if kept > 0 {
+                    // Shift the kept recent frames up through the scratch
+                    // (a buffer cannot be copied onto itself on WebGPU).
+                    let len = kept * tpf * hd;
+                    for h in 0..self.heads {
+                        be.copy(
+                            buf,
+                            h * stride + (mem + evict) * tpf * hd,
+                            scratch,
+                            h * len,
+                            len,
+                        );
+                    }
+                    for h in 0..self.heads {
+                        be.copy(scratch, h * len, buf, h * stride + mem * tpf * hd, len);
+                    }
+                }
+            }
+        }
+        self.ema_ready = true;
+        self.block_slot = mem + kept;
+        self.valid = self.block_slot + frames;
+        Ok(())
+    }
+
     /// Valid frames (all of them once the cache is full).
     pub fn frames(&self) -> usize {
-        self.slot_frame.iter().filter(|s| s.is_some()).count()
+        match self.memory {
+            Memory::Window => self.slot_frame.iter().filter(|s| s.is_some()).count(),
+            Memory::MemRope { .. } => self.valid,
+        }
     }
 
     /// Write layer `li`'s block keys/values (`[heads, n, d]`) into their
@@ -189,6 +350,45 @@ impl<B: Backend> KvCache<B> {
             }
         }
         let valid = self.frames();
+        if let Some((cos, sin)) = &self.key_rope
+            && self.rotates_keys()
+        {
+            // Rotate the valid prefix at slot positions into the scratch;
+            // V is read in place once the cache is full.
+            let rows = valid * tpf;
+            be.rope_heads(
+                &self.k[li],
+                0,
+                stride,
+                &self.pack_k,
+                0,
+                rows * hd,
+                self.heads,
+                rows,
+                hd,
+                (cos, sin),
+            );
+            let v = if valid == self.cap {
+                &self.v[li]
+            } else {
+                for h in 0..self.heads {
+                    be.copy(
+                        &self.v[li],
+                        h * stride,
+                        &self.pack_v,
+                        h * rows * hd,
+                        rows * hd,
+                    );
+                }
+                &self.pack_v
+            };
+            be.attention(q, &self.pack_k, v, self.heads, n, rows, hd, out);
+            return;
+        }
+        assert!(
+            !self.rotates_keys(),
+            "MemRoPE cache without its key RoPE table"
+        );
         if valid == self.cap {
             be.attention(
                 q,
@@ -265,7 +465,12 @@ impl<'a, B: Backend> CausalRollout<'a, B> {
             ffn_chunk,
             Some(crate::dit::Attention::Dense),
         );
-        let cache = KvCache::new(be, c.layers, c.heads, c.head_dim, tpf, &cfg)?;
+        let mut cache = KvCache::new(be, c.layers, c.heads, c.head_dim, tpf, &cfg)?;
+        if cache.rotates_keys() {
+            let t =
+                fastwan_core::rope::rope_table(c, (cfg.cap_frames, lh / c.patch, lw / c.patch), 0);
+            cache.set_key_rope(be.upload_table(&t.cos), be.upload_table(&t.sin));
+        }
         let mods = cfg
             .timesteps
             .iter()
@@ -307,8 +512,12 @@ impl<'a, B: Backend> CausalRollout<'a, B> {
         let nf = self.cfg.block_frames;
         let start = self.next_frame;
         let n = c.in_channels * nf * lh * lw;
-        self.cache.begin_block(start, nf)?;
-        let rope = fastwan_core::rope::rope_table(c, (nf, lh / c.patch, lw / c.patch), start);
+        self.cache.begin_block(be, start, nf)?;
+        let rope = fastwan_core::rope::rope_table(
+            c,
+            (nf, lh / c.patch, lw / c.patch),
+            self.cache.query_frame(start),
+        );
         let (cos, sin) = (be.upload_table(&rope.cos), be.upload_table(&rope.sin));
         be.write(&self.x, &self.rng.normal(n));
         let steps = self.cfg.timesteps.len();

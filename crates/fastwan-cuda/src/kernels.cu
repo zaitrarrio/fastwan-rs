@@ -179,6 +179,60 @@ extern "C" __global__ void fw_dmd_step(u64 x_, u64 v_, u64 e_, long n, int has_n
     x[i] = bf(has_noise ? (1.0f - sn) * x0 + sn * ld(e, i) : x0);
 }
 
+// MemRoPE cache kernels (History Forcing's long-video memory); WGSL twin
+// memory.wgsl. fw_rope_heads: one thread per interleaved pair of
+// [heads, rows, hd] (cos/sin are f32 tables [rows, hd / 2]).
+extern "C" __global__ void fw_rope_heads(u64 src_, u64 dst_, u64 cos_, u64 sin_, int heads, int rows, int hd,
+                                         long src_off, long src_stride, long dst_off, long dst_stride) {
+    const bf16_t* src = (const bf16_t*)src_;
+    bf16_t* dst = (bf16_t*)dst_;
+    const float *cs = (const float*)cos_, *sn = (const float*)sin_;
+    const int half = hd / 2;
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)heads * rows * half) return;
+    const int c = i % half;
+    const int r = (i / half) % rows;
+    const int h = i / ((long)half * rows);
+    const long s = src_off + h * src_stride + (long)r * hd + 2 * c;
+    const long o = dst_off + h * dst_stride + (long)r * hd + 2 * c;
+    const float co = cs[(long)r * half + c], si = sn[(long)r * half + c];
+    const float x1 = ld(src, s), x2 = ld(src, s + 1);
+    dst[o] = bf(x1 * co - x2 * si);
+    dst[o + 1] = bf(x1 * si + x2 * co);
+}
+
+// fw_kv_ema: one 256-thread block per (head, 32 channels); 8 lanes sum the
+// source rows, then both memory frames blend towards the mean, in place.
+extern "C" __global__ void fw_kv_ema(u64 buf_, int heads, int hd, long head_stride, int src_row, int src_rows,
+                                     int dst_row, int frame_rows, float a0, float a1) {
+    __shared__ float red[256];
+    bf16_t* b = (bf16_t*)buf_;
+    const int cpb = (hd + 31) / 32;
+    const int h = blockIdx.x / cpb;
+    const int ch = (blockIdx.x % cpb) * 32 + threadIdx.x % 32;
+    const int lane = threadIdx.x / 32;
+    if (h >= heads) return;
+    const long base = (long)h * head_stride;
+    float acc = 0.0f;
+    if (ch < hd)
+        for (int r = lane; r < src_rows; r += 8) acc += ld(b, base + (long)(src_row + r) * hd + ch);
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    if (lane == 0) {
+        float s = 0.0f;
+        for (int l = 0; l < 8; ++l) s += red[l * 32 + threadIdx.x];
+        red[threadIdx.x] = s / src_rows;
+    }
+    __syncthreads();
+    const float m = red[threadIdx.x % 32];
+    if (ch < hd)
+        for (int r = lane; r < 2 * frame_rows; r += 8) {
+            const float a = r < frame_rows ? a0 : a1;
+            const long o = base + (long)(dst_row + r) * hd + ch;
+            b[o] = bf(a * m + (1.0f - a) * ld(b, o));
+        }
+}
+
 extern "C" __global__ void fw_tanh_clamp(u64 x_, long n, float s) {
     bf16_t* x = (bf16_t*)x_;
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;

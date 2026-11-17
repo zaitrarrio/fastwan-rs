@@ -2,6 +2,10 @@
 
     python3 -I scripts/convert_self_forcing.py self_forcing_dmd.pt transformer.safetensors
 
+Also reads History Forcing's `dmd/model.pt` (huggingface.co/xzxxntxdy/History-Forcing,
+the same causal Wan2.1-T2V-1.3B generator, f32, tensors saved through
+`_rebuild_from_type_v2`), for `generate --causal --memory memrope`.
+
 `self_forcing_dmd.pt` (huggingface.co/gdhe17/Self-Forcing, Apache-2.0) is a
 training checkpoint: the distilled Wan2.1-T2V-1.3B generator under
 `generator_ema` (and the raw `generator`), in the original Wan key names behind
@@ -66,12 +70,29 @@ def rebuild(storage, offset, size, stride, *_):
     return Lazy(storage, offset, size, stride)
 
 
+def rebuild_from_type(func, _new_type, args, _state):
+    """torch._tensor._rebuild_from_type_v2: a tensor saved through its
+    subclass hook (History Forcing's checkpoints); the type is dropped."""
+    return func(*args)
+
+
+def rebuild_parameter(data, *_):
+    return data
+
+
 class Unpickler(pickle.Unpickler):
     def find_class(self, mod, name):
         if (mod, name) == ("collections", "OrderedDict"):
             return collections.OrderedDict
         if (mod, name) == ("torch._utils", "_rebuild_tensor_v2"):
             return rebuild
+        if (mod, name) == ("torch._tensor", "_rebuild_from_type_v2"):
+            return rebuild_from_type
+        if (mod, name) in (("torch._utils", "_rebuild_parameter"),
+                           ("torch._utils", "_rebuild_parameter_with_state")):
+            return rebuild_parameter
+        if (mod, name) in (("torch", "Tensor"), ("torch.nn.parameter", "Parameter")):
+            return name
         if mod == "torch" and name in DTYPES:
             return name
         raise pickle.UnpicklingError(f"refusing global {mod}.{name}")

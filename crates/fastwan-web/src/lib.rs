@@ -343,6 +343,8 @@ mod web {
         /// block by block: events `prepared`, then per block `block`
         /// `{index, total, ms, denoise_ms}` and `frames` (as in `generate`).
         /// `cache_frames` / `sink_frames` are latent frames (12 / 3).
+        /// `memrope` selects History Forcing's MemRoPE memory (a manifest
+        /// variant with `"memory": "memrope"`) instead of the rolling window.
         #[wasm_bindgen(js_name = generateLong)]
         #[allow(clippy::too_many_arguments)]
         pub fn generate_long(
@@ -354,6 +356,7 @@ mod web {
             seed: f64,
             cache_frames: usize,
             sink_frames: usize,
+            memrope: bool,
             on_event: Function,
         ) -> js_sys::Promise {
             let inner = self.inner.clone();
@@ -369,6 +372,7 @@ mod web {
                     seed as u64,
                     cache_frames,
                     sink_frames,
+                    memrope,
                     &on_event,
                 )
                 .await
@@ -556,6 +560,7 @@ mod web {
         seed: u64,
         cache_frames: usize,
         sink_frames: usize,
+        memrope: bool,
         on: &Function,
     ) -> Result<(), JsValue> {
         use fastwan_model::causal::{CausalConfig, CausalRollout, frame_major};
@@ -571,7 +576,11 @@ mod web {
             .ok_or_else(|| err("the decoder is not loaded"))?;
         g.validate(cfg).map_err(err)?;
         let e = read_embeds(cfg, embeds)?;
-        let mut ccfg = CausalConfig::self_forcing();
+        let mut ccfg = if memrope {
+            CausalConfig::history_forcing()
+        } else {
+            CausalConfig::self_forcing()
+        };
         ccfg.cache_frames(cache_frames, sink_frames);
         let bf = ccfg.block_frames;
         // One block's activations: plan a clip of one block's length.

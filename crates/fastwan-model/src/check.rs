@@ -184,6 +184,7 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     model(&mut p);
     upscaler(&mut p);
     causal(&mut p);
+    causal_memrope(&mut p);
     pack(&mut p, &mut rng);
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
@@ -608,6 +609,104 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         p.record("dmd_step + tanh_clamp", g, c);
     }
 
+    // MemRoPE cache ops: rope_heads between strided head layouts, kv_ema
+    // (initialising and blending) on a [heads, rows, d] cache.
+    {
+        let (heads, rows, d, stride) = (3, 37, 24, 50 * 24);
+        let src = rng.normal(heads * stride);
+        let half = d / 2;
+        let ang: Vec<f32> = (0..rows * half)
+            .map(|i| (i as f32 * 0.37).sin() * 3.0)
+            .collect();
+        let (cs, sn): (Vec<f32>, Vec<f32>) = ang.iter().map(|a| (a.cos(), a.sin())).unzip();
+        let n_out = heads * rows * d + 5;
+        let gs = be.upload(&src);
+        let go = be.alloc(n_out);
+        let (gc, gn) = (be.upload_table(&cs), be.upload_table(&sn));
+        be.rope_heads(
+            &gs,
+            2 * d,
+            stride,
+            &go,
+            5,
+            rows * d,
+            heads,
+            rows,
+            d,
+            (&gc, &gn),
+        );
+        let cs_ = cpu.upload(&src);
+        let co = cpu.alloc(n_out);
+        let (cc, cn) = (cpu.upload_table(&cs), cpu.upload_table(&sn));
+        cpu.rope_heads(
+            &cs_,
+            2 * d,
+            stride,
+            &co,
+            5,
+            rows * d,
+            heads,
+            rows,
+            d,
+            (&cc, &cn),
+        );
+        let (g, c) = (p.dl(go), cpu.download(&co));
+        p.record("rope_heads 3x37x24 (strided)", g, c);
+
+        let frame = 6;
+        let buf = rng.normal(heads * stride);
+        let gb = be.upload(&buf);
+        let cb = cpu.upload(&buf);
+        // First eviction: both memory frames become the mean of 3 frames;
+        // then a blend with the long / short rates.
+        be.kv_ema(
+            &gb,
+            heads,
+            stride,
+            d,
+            5 * frame,
+            3 * frame,
+            frame,
+            frame,
+            [1.0, 1.0],
+        );
+        cpu.kv_ema(
+            &cb,
+            heads,
+            stride,
+            d,
+            5 * frame,
+            3 * frame,
+            frame,
+            frame,
+            [1.0, 1.0],
+        );
+        be.kv_ema(
+            &gb,
+            heads,
+            stride,
+            d,
+            3 * frame + 1,
+            2 * frame + 3,
+            frame,
+            frame,
+            [0.01, 0.1],
+        );
+        cpu.kv_ema(
+            &cb,
+            heads,
+            stride,
+            d,
+            3 * frame + 1,
+            2 * frame + 3,
+            frame,
+            frame,
+            [0.01, 0.1],
+        );
+        let (g, c) = (p.dl(gb), cpu.download(&cb));
+        p.record("kv_ema init + blend 3x50x24", g, c);
+    }
+
     // conv2d: 3×3 with concat + upsample + epilogues, 1×1.
     let cases = [
         (
@@ -882,6 +981,7 @@ fn causal<B: Backend>(p: &mut Pair<'_, B>) {
         cap_frames: 5,
         sink_frames: 1,
         timesteps: CausalConfig::self_forcing().timesteps,
+        memory: crate::causal::Memory::Window,
     };
     let gd = WanDit::load(be, cfg.clone(), &src).unwrap();
     let cd = WanDit::load(cpu, cfg, &src).unwrap();
@@ -900,6 +1000,48 @@ fn causal<B: Backend>(p: &mut Pair<'_, B>) {
     }
     p.record(
         "tiny causal rollout, 4 blocks, rolling cache (latent)",
+        gl,
+        cl,
+    );
+}
+
+/// The MemRoPE rollout (History Forcing's memory) on the tiny model: six
+/// 2-frame blocks through a 7-frame cache (1 sink, 2 EMA, 2 recent, the
+/// block): the fourth block evicts one frame and initialises the memory,
+/// the fifth and sixth evict two and blend it. GPU latents vs the CPU's.
+fn causal_memrope<B: Backend>(p: &mut Pair<'_, B>) {
+    use crate::causal::{CausalConfig, CausalRollout, Memory};
+    let (be, cpu) = (p.be, &Cpu);
+    let cfg = WanConfig::tiny();
+    let src = Synthetic { seed: 3 };
+    let embeds = Rng::new(5).normal(cfg.text_len * cfg.text_dim);
+    let ccfg = CausalConfig {
+        block_frames: 2,
+        cap_frames: 7,
+        sink_frames: 1,
+        timesteps: CausalConfig::self_forcing().timesteps,
+        memory: Memory::MemRope {
+            alpha_long: 0.01,
+            alpha_short: 0.1,
+        },
+    };
+    let gd = WanDit::load(be, cfg.clone(), &src).unwrap();
+    let cd = WanDit::load(cpu, cfg, &src).unwrap();
+    let (gpr, cpr) = (
+        gd.prepare_prompt(be, &embeds),
+        cd.prepare_prompt(cpu, &embeds),
+    );
+    let mut g = CausalRollout::new(be, &gd, ccfg.clone(), (4, 6), 7, 21).unwrap();
+    let mut c = CausalRollout::new(cpu, &cd, ccfg, (4, 6), 7, 21).unwrap();
+    let (mut gl, mut cl) = (Vec::new(), Vec::new());
+    for _ in 0..6 {
+        let x = g.next_block(be, &gpr).unwrap();
+        gl.extend(be.download(x));
+        let x = c.next_block(cpu, &cpr).unwrap();
+        cl.extend(cpu.download(x));
+    }
+    p.record(
+        "tiny MemRoPE rollout, 6 blocks, EMA memory (latent)",
         gl,
         cl,
     );

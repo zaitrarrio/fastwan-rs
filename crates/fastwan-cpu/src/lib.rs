@@ -539,6 +539,73 @@ impl Backend for Cpu {
         }
     }
 
+    fn rope_heads(
+        &self,
+        src: &CpuBuf,
+        src_off: usize,
+        src_stride: usize,
+        dst: &CpuBuf,
+        dst_off: usize,
+        dst_stride: usize,
+        heads: usize,
+        rows: usize,
+        hd: usize,
+        rope: (&CpuBuf, &CpuBuf),
+    ) {
+        let (src, c, s) = (src.r(), rope.0.r(), rope.1.r());
+        let mut dst = dst.w();
+        let half = hd / 2;
+        for h in 0..heads {
+            for r in 0..rows {
+                let x = &src[src_off + h * src_stride + r * hd..][..hd];
+                let y = &mut dst[dst_off + h * dst_stride + r * hd..][..hd];
+                for i in 0..half {
+                    let (cv, sv) = (c[r * half + i], s[r * half + i]);
+                    let (x1, x2) = (x[2 * i], x[2 * i + 1]);
+                    y[2 * i] = x1 * cv - x2 * sv;
+                    y[2 * i + 1] = x1 * sv + x2 * cv;
+                }
+            }
+        }
+    }
+
+    fn kv_ema(
+        &self,
+        buf: &CpuBuf,
+        heads: usize,
+        head_stride: usize,
+        hd: usize,
+        src_row: usize,
+        src_rows: usize,
+        dst_row: usize,
+        frame_rows: usize,
+        alphas: [f32; 2],
+    ) {
+        assert!(
+            src_row + src_rows <= dst_row || dst_row + 2 * frame_rows <= src_row,
+            "kv_ema: source and memory rows overlap"
+        );
+        let mut b = buf.w();
+        for h in 0..heads {
+            let base = h * head_stride;
+            let mut m = vec![0f64; hd];
+            for r in 0..src_rows {
+                for (j, mj) in m.iter_mut().enumerate() {
+                    *mj += b[base + (src_row + r) * hd + j] as f64;
+                }
+            }
+            let m: Vec<f32> = m.iter().map(|&v| (v / src_rows as f64) as f32).collect();
+            for (i, &a) in alphas.iter().enumerate() {
+                for r in 0..frame_rows {
+                    let row = &mut b[base + (dst_row + i * frame_rows + r) * hd..][..hd];
+                    for (x, &mj) in row.iter_mut().zip(&m) {
+                        *x = a * mj + (1.0 - a) * *x;
+                    }
+                }
+            }
+        }
+    }
+
     fn conv2d(
         &self,
         a: &CpuBuf,
