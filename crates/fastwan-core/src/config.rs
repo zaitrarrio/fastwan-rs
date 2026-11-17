@@ -138,7 +138,22 @@ pub struct TaeConfig {
     pub mem_blocks: usize,
     /// Pixel-shuffle factor after the last conv (1 for taew2_1, 2 for taew2_2).
     pub patch: usize,
+    /// Undo the Wan 2.1 VAE latent normalisation (`z·std + mean` per channel)
+    /// before the decoder: LightX2V's LightTAE (`lighttaew2_1`) was distilled
+    /// on raw VAE latents (its `need_scaled`), TAEHV on normalised ones.
+    pub denormalize: bool,
 }
+
+/// The Wan 2.1 VAE's per-channel latent statistics (`latents_mean` /
+/// `latents_std` of its config; LightX2V's `WanVAE_tiny`).
+pub const WAN21_LATENT_MEAN: [f32; 16] = [
+    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517,
+    -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
+];
+pub const WAN21_LATENT_STD: [f32; 16] = [
+    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579,
+    1.6382, 1.1253, 2.8251, 1.9160,
+];
 
 impl TaeConfig {
     pub fn taew2_1() -> Self {
@@ -148,6 +163,17 @@ impl TaeConfig {
             tgrow: [1, 2, 2],
             mem_blocks: 3,
             patch: 1,
+            denormalize: false,
+        }
+    }
+
+    /// LightX2V's LightTAE for Wan 2.1 (`lightx2v/Autoencoders`,
+    /// `lighttaew2_1.safetensors` / `_v2`, Apache-2.0): TAEHV's network and
+    /// tensor names, distilled further, decoding raw (denormalised) latents.
+    pub fn lighttaew2_1() -> Self {
+        Self {
+            denormalize: true,
+            ..Self::taew2_1()
         }
     }
 
@@ -169,6 +195,7 @@ impl TaeConfig {
             tgrow: [1, 2, 2],
             mem_blocks: 3,
             patch: 1,
+            denormalize: false,
         }
     }
 
@@ -193,7 +220,13 @@ impl TaeConfig {
 
     pub fn from_file_name(name: &str) -> Option<Self> {
         let n = name.to_ascii_lowercase();
-        if n.contains("taew2_1") {
+        // LightX2V's files share TAEHV's names after a `light` prefix; their
+        // Wan 2.2 LightTAE is not supported (no Wan 2.2 DiT here).
+        if n.contains("lighttaew2_1") {
+            Some(Self::lighttaew2_1())
+        } else if n.contains("lighttae") {
+            None
+        } else if n.contains("taew2_1") {
             Some(Self::taew2_1())
         } else if n.contains("taew2_2") {
             Some(Self::taew2_2())
@@ -206,6 +239,17 @@ impl TaeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tae_kind_follows_the_file_name() {
+        assert_eq!(
+            TaeConfig::from_file_name("x/taew2_1.safetensors"),
+            Some(TaeConfig::taew2_1())
+        );
+        let l = TaeConfig::from_file_name("x/lighttaew2_1_v2.safetensors").unwrap();
+        assert!(l.denormalize && l.latent_channels == 16);
+        assert_eq!(TaeConfig::from_file_name("lighttaew2_2.safetensors"), None);
+    }
 
     #[test]
     fn fastwan_1_3b_is_1_4b_params() {

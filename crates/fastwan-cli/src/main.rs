@@ -847,7 +847,7 @@ fn generate_causal<B: Backend>(
 ) -> Result<()> {
     use fastwan_model::causal::{CausalRollout, frame_major};
     let cfg = WanConfig::fastwan_1_3b();
-    let tcfg = TaeConfig::taew2_1();
+    let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
     println!("{}", be.name());
     let t0 = std::time::Instant::now();
     let wsrc = SafetensorsDir::open(transformer)?;

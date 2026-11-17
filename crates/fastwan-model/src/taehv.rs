@@ -230,8 +230,23 @@ impl<B: Backend> TaeHv<B> {
         let cfg = &self.cfg;
         let nf = cfg.widths;
         assert_eq!(z.len(), frames * cfg.latent_channels * h * w);
+        let x0 = if cfg.denormalize {
+            assert_eq!(
+                cfg.latent_channels, 16,
+                "LightTAE denormalises Wan 2.1 latents"
+            );
+            let plane = h * w;
+            let mut d = z.to_vec();
+            for (i, v) in d.iter_mut().enumerate() {
+                let c = (i / plane) % 16;
+                *v = *v * fastwan_core::config::WAN21_LATENT_STD[c]
+                    + fastwan_core::config::WAN21_LATENT_MEAN[c];
+            }
+            be.upload(&d)
+        } else {
+            be.upload(z)
+        };
         let (mut f, mut h, mut w) = (frames, h, w);
-        let x0 = be.upload(z);
         be.tanh_clamp(&x0, z.len(), 3.0);
         let shape = |f, cin_a, cin_b, cout, h, w, upsample, k| ConvShape {
             frames: f,
