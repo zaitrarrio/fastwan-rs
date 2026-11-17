@@ -46,6 +46,13 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (`docs/runs/2026-11-14-vast-4090-self-forcing-long`). Below ~320×192 the
   model gives noise (out of distribution, not a bug). A 60 s video drifts
   (a subject leaves and returns) but stays one scene.
+- History Forcing's `dmd/model.pt` (same architecture; weights have **no
+  stated licence**: evaluation only) runs with `--cache-frames 21
+  --sink-frames 3`, its trained window. 60 s on an RTX 4090: same speed as
+  Self-Forcing at 21/3 (7.9 fps; 21 frames cost ~30% more than 12), keeps
+  the prompted subject and moves more, but over-saturates and shows light
+  streaks (`docs/runs/2026-11-17-runpod-4090-history-forcing`). MemRoPE (its
+  optional demo cache) is not implemented; the vendored code is CC-BY-NC-SA.
 - Browser long videos (`Engine.generateLong` / `stop`; Prompt Studio offers
   them for manifest variants with `"causal": true`, 480×272 and 640×352,
   desktop only: the f32 K/V cache is ~2.3 GB at 480×272). Correct in Chrome
