@@ -117,9 +117,12 @@ State and invariants only; the reasoning is in `docs/design.md`.
   NVIDIA and SwiftShader were exact: every 5 s clip was noise there. It is now
   a radix select (4-bit passes, byte counters packed per thread, two-level
   sums), with the picks written by all threads after a prefix scan and one
-  exp per tile. lavapipe, 832×480 grid, 6 heads: 459 ms/call vs 445 (atomic)
-  and 619 (a 32-pass tree search); 0.8% of a VSA call, flash3 is the rest
-  (`examples/vsa_bench.rs`). The browser self-test
+  exp per tile, and the query mean in workgroup memory. RTX 4090 (Vulkan),
+  832×480, 12 heads: 3.25 ms/call vs 5.96 (atomic) and 9.38 (radix without
+  the shared query mean); a 30-layer VSA step 7.54 → 7.39 s, coarse 3.5 →
+  1.2% (`docs/runs/2026-11-17-vast-4090-vsa-coarse`). lavapipe ranked these
+  wrongly: time kernels on a real GPU (`examples/vsa_bench.rs`,
+  `FASTWAN_WGPU_SHADER_<kernel>=file.wgsl` swaps one without a rebuild). The browser self-test
   (`?selftest=1`: `check::ops_deferred` + VSA stage by stage against
   `vsa::coarse_reference`) finds such per-GPU failures; ask for its output.
 - WGSL auto layouts drop unused bindings, so every declared binding must be
