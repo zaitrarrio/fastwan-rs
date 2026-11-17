@@ -153,8 +153,11 @@ struct Prof {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WgpuOptions {
     /// Use the f16 math kernels where the adapter has `shader-f16`
-    /// (`FASTWAN_WGPU_F16=1`).
+    /// (`FASTWAN_WGPU_F16=1`, or `=attn` for attention only).
     pub f16: bool,
+    /// With `f16`: f16 attention only, f32 GEMMs. On an AMD RDNA1 Mac
+    /// (Chrome → Metal) f16 attention is 1.33× faster but the f16 GEMM 0.90×.
+    pub f16_attn_only: bool,
     /// GEMM kernel (`FASTWAN_WGPU_LINEAR`, see `Backend::linear`); `None` =
     /// the default.
     pub linear: Option<u32>,
@@ -172,7 +175,8 @@ impl WgpuOptions {
     pub fn from_env() -> Self {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
         Self {
-            f16: std::env::var("FASTWAN_WGPU_F16").is_ok_and(|v| v == "1"),
+            f16: std::env::var("FASTWAN_WGPU_F16").is_ok_and(|v| v == "1" || v == "attn"),
+            f16_attn_only: std::env::var("FASTWAN_WGPU_F16").is_ok_and(|v| v == "attn"),
             linear: num("FASTWAN_WGPU_LINEAR"),
             flash: num("FASTWAN_WGPU_FLASH"),
             submit_every: None,
@@ -225,6 +229,8 @@ pub struct Wgpu {
     batch: usize,
     /// f16 math kernels (adapter has `shader-f16` and f16 mode is on).
     f16: bool,
+    /// f16 GEMMs too (f16 mode is not attention-only).
+    f16_linear: bool,
     pipelines: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
     /// Pipeline name by address, for the profiler.
     names: Mutex<HashMap<usize, String>>,
@@ -358,6 +364,7 @@ impl Wgpu {
             linear_variant,
             batch: opts.submit_every.unwrap_or(BATCH).max(1),
             f16,
+            f16_linear: f16 && !opts.f16_attn_only,
             pipelines: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             tag: Mutex::new(None),
@@ -872,7 +879,7 @@ impl Backend for Wgpu {
             } else {
                 format!(" {}", self.info.driver_info)
             },
-            if self.f16 { " +f16" } else { "" }
+            if !self.f16 { "" } else if self.f16_linear { " +f16" } else { " attn+f16" }
         )
     }
 
@@ -1090,7 +1097,7 @@ impl Backend for Wgpu {
             1 => (LINEAR, 64, "linear"),
             _ => (LINEAR3, 64, "linear3"),
         };
-        let half = self.f16 && f16 && (variant == 3 || variant == 4) && rows >= F16_MIN_ROWS;
+        let half = self.f16_linear && f16 && (variant == 3 || variant == 4) && rows >= F16_MIN_ROWS;
         let pipe = if let Some((kind, ..)) = &w.quant {
             match kind {
                 Quant::Q8 => self.pipeline(&format!("{name}_q8"), || Self::q8_src(src)),

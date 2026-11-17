@@ -111,7 +111,10 @@ State and invariants only; the reasoning is in `docs/design.md`.
   opt-in. Current kernels: `linear4h` / `flash3h` (vec4<f16> tiles, 16-term
   f16 partial sums flushed into f32): 62/62 checks; RTX 4090 Chrome GEMMs
   1.11–1.24×, attention 1.62×, native step −7%
-  (`docs/runs/2026-11-17-vast-4090-stalls-f16-phones`). The old `linear3h` /
+  (`docs/runs/2026-11-17-vast-4090-stalls-f16-phones`). AMD RDNA1 Mac
+  (Chrome → Metal): attention 1.33×, cached attention 1.34×, but GEMMs
+  0.90×, hence `FASTWAN_WGPU_F16=attn` / `?f16=attn` (f16 attention, f32
+  GEMMs). Bench FLOP counts are f64: usize is 32 bits on wasm. The old `linear3h` /
   `flash_h` were 8.5% slower (`docs/runs/2026-11-03-vast-4090-f16`). Default
   it on only after a real-clip PSNR check and AMD / Apple numbers (Prompt
   Studio `?selftest=1` → Benchmark f32 vs f16).

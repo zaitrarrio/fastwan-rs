@@ -227,8 +227,9 @@ function longCache(w, h) { return MOBILE && w * h > 320 * 192 ? 9 : LONG_CACHE; 
 const PUBLIC_WEIGHTS = "https://weights.fastwan.dev/v1";
 // The in-browser engine's build hash; web/build.py stamps it into the site copy.
 const PKG_V = "dev";
-// ?f16=1: f16 math kernels (linear4h / flash3h) where the GPU has shader-f16.
-const F16 = new URLSearchParams(location.search).get("f16") === "1";
+// ?f16=1: f16 math kernels (linear4h / flash3h) where the GPU has shader-f16;
+// ?f16=attn: f16 attention only (f32 GEMMs).
+const F16 = ((v) => (v === "1" || v === "attn" ? v : ""))(new URLSearchParams(location.search).get("f16"));
 const WEIGHTS = (new URLSearchParams(location.search).get("weights") || PUBLIC_WEIGHTS).replace(/\/+$/, "");
 const CAN_BROWSER = !SAME && "gpu" in navigator;
 // Hosted page with WebGPU: run in the tab unless the visitor chose their engine.
@@ -868,11 +869,11 @@ async function benchF16() {
     log(`browser: ${navigator.userAgent}`);
     const runs = {};
     for (const f16 of [false, true]) {
-      const eng = await bw.mod.createEngine("fastwan", "", MOBILE, f16);
+      const eng = await bw.mod.createEngine("fastwan", "", MOBILE, f16 ? "1" : "");
       if (f16 && !eng.isF16()) { log("f16: this GPU has no shader-f16; nothing to compare."); eng.free(); break; }
       log(`${f16 ? "f16" : "f32"} kernels…`);
       runs[f16 ? "f16" : "f32"] = {};
-      await wasmCall(eng.bench(MOBILE ? 3 : 10, (ev) => { runs[f16 ? "f16" : "f32"][ev.name] = ev; log(`  ${ev.name}: ${ev.ms.toFixed(2)} ms (${ev.gflops.toFixed(0)} GFLOP/s)`); }));
+      await wasmCall(eng.bench(MOBILE ? 3 : 10, (ev) => { runs[f16 ? "f16" : "f32"][ev.name] = ev; log(`  ${ev.name}: ${ev.ms.toFixed(2)} ms (${ev.tflops.toFixed(2)} TFLOP/s)`); }));
       eng.free();
     }
     if (runs.f16) {

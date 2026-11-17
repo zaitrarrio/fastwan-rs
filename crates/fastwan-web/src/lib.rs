@@ -74,7 +74,7 @@ mod web {
         model: String,
         kernels: Option<String>,
         mobile: Option<bool>,
-        f16: Option<bool>,
+        f16: Option<String>,
     ) -> Result<Engine, JsValue> {
         console_error_panic_hook::set_once();
         let (cfg, tcfg) = match model.as_str() {
@@ -97,9 +97,12 @@ mod web {
         if mobile {
             opts.submit_every = Some(8);
         }
-        // f16 math kernels (linear4h / flash3h) where the adapter has
-        // `shader-f16`; fixed for the device's lifetime.
-        opts.f16 = f16.unwrap_or(false);
+        // f16 math kernels where the adapter has `shader-f16`, fixed for the
+        // device's lifetime: "1" = linear4h + flash3h, "attn" = flash3h only
+        // (f32 GEMMs), anything else = off.
+        let f16 = f16.unwrap_or_default();
+        opts.f16 = f16 == "1" || f16 == "attn";
+        opts.f16_attn_only = f16 == "attn";
         let be = Wgpu::with_options_async(opts).await.map_err(err)?;
         Ok(Engine {
             inner: Rc::new(Inner {
@@ -560,6 +563,7 @@ mod web {
                     set(&o, "name", name);
                     set(&o, "ms", ms);
                     set(&o, "gflops", flop / ms / 1e6);
+                    set(&o, "tflops", flop / ms / 1e9);
                     let _ = on_event.call1(&JsValue::NULL, &o);
                 };
                 // Rows: 3 latent frames at 480×272 (one long-video block) ≈
@@ -571,7 +575,8 @@ mod web {
                 let h = be.alloc(m * f);
                 let y = be.alloc(m * d);
                 let mut results: Vec<(String, f64, f64)> = Vec::new();
-                let ffn = 2.0 * (m * d * f) as f64;
+                // In f64: usize is 32 bits on wasm and these products overflow it.
+                let ffn = 2.0 * m as f64 * d as f64 * f as f64;
                 let ms = time_it(be, &fence, reps, &|| {
                     be.linear(
                         &x,
@@ -602,7 +607,7 @@ mod web {
                 .await?;
                 results.push((
                     "attention 12×4096×4096 d128".into(),
-                    4.0 * (heads * s * s * hd) as f64,
+                    4.0 * heads as f64 * s as f64 * s as f64 * hd as f64,
                     ms,
                 ));
                 if be.kv_caps(hd).1 {
@@ -620,7 +625,7 @@ mod web {
                     .await?;
                     results.push((
                         "attention over 16-bit cache 1530×6120".into(),
-                        4.0 * (heads * sq * sk * hd) as f64,
+                        4.0 * heads as f64 * sq as f64 * sk as f64 * hd as f64,
                         ms,
                     ));
                 }
