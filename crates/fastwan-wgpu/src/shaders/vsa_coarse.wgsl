@@ -16,8 +16,12 @@
 // written by all threads at once after a prefix scan of per-thread counts
 // over contiguous index slices (the old code had thread 0 write them alone).
 // exp(s − max) is computed once per tile, after the selection, not once per
-// tile per output column. Workgroup memory: 8 + 1 + 4 + 1 KiB (+64 B), under
-// WebGPU's 16 KiB default.
+// tile per output column. The scores read this query tile's mean q from
+// workgroup memory (once, not once per key tile) with four independent
+// accumulators: on an RTX 4090 (Vulkan) 3.25 ms per call at 832×480 with 12
+// heads vs 9.38 without that and 5.96 for the atomic version
+// (docs/runs/2026-11-17-vast-4090-vsa-coarse). Workgroup memory:
+// 8 + 1 + 4 + 1 + 0.5 KiB (+64 B), under WebGPU's 16 KiB default.
 struct P { heads: u32, d: u32, nb: u32, topk: u32, scale: f32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> pooled: array<f32>;
@@ -31,6 +35,8 @@ var<workgroup> hist: array<u32, 1024>;
 // Partial digit sums (bucket · 16 + chunk), then the prefix scan.
 var<workgroup> part: array<u32, 256>;
 var<workgroup> tot: array<u32, 16>;
+// This query tile's mean q (d ≤ 128), read once instead of once per key tile.
+var<workgroup> qm: array<f32, 128>;
 
 // Float → u32 with the same order.
 fn okey(x: f32) -> u32 {
@@ -45,12 +51,23 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wid: v
     let nb = p.nb;
     let plane = p.heads * nb * p.d;
     let qb = (h * nb + qt) * p.d;
+    if (tid < p.d) { qm[tid] = pooled[qb + tid]; }
+    workgroupBarrier();
     var mx = -3.0e38;
     for (var kt = tid; kt < nb; kt = kt + 256u) {
         let kb = plane + (h * nb + kt) * p.d;
-        var dot = 0.0;
-        for (var c = 0u; c < p.d; c = c + 1u) { dot = fma(pooled[qb + c], pooled[kb + c], dot); }
-        let s = dot * p.scale;
+        // Four independent accumulators (d % 4 == 0): the loads overlap.
+        var a0 = 0.0;
+        var a1 = 0.0;
+        var a2 = 0.0;
+        var a3 = 0.0;
+        for (var c = 0u; c < p.d; c = c + 4u) {
+            a0 = fma(qm[c], pooled[kb + c], a0);
+            a1 = fma(qm[c + 1u], pooled[kb + c + 1u], a1);
+            a2 = fma(qm[c + 2u], pooled[kb + c + 2u], a2);
+            a3 = fma(qm[c + 3u], pooled[kb + c + 3u], a3);
+        }
+        let s = ((a0 + a1) + (a2 + a3)) * p.scale;
         sc[kt] = s;
         mx = max(mx, s);
     }
