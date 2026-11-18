@@ -3,10 +3,9 @@
 Vast instance 61318610 (RTX 4090, Indiana, driver 595.99.02, 450 W limit),
 ~25 min. Binaries: the merge acf28f4 ("merged"), the same plus the check fix
 731cd52 ("fix"), main 387d81e ("main") and the History Forcing branch before
-the merge (e72ff08 code, "PR"). Weights as in
-`docs/runs/2026-11-17-vast-4090-history-forcing` (same driver; sha256 of the
-converted History Forcing file identical across conversions is not needed:
-every comparison below runs on one file).
+the merge (e72ff08 code, "PR"). Weights converted as in
+`docs/runs/2026-11-17-vast-4090-history-forcing` (same driver); every
+comparison below runs on the same converted files.
 
 ## Conformance
 
