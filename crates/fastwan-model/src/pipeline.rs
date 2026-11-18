@@ -95,7 +95,7 @@ impl<B: Backend> Pipeline<B> {
             .schedule
             .timesteps
             .iter()
-            .map(|&ts| self.dit.step_mods(be, ts as f32))
+            .map(|&ts| self.dit.step_mods(be, ts))
             .collect();
         let ws = self
             .dit
@@ -110,11 +110,11 @@ impl<B: Backend> Pipeline<B> {
         for (i, m) in mods.iter().enumerate() {
             let t0 = Instant::now();
             self.dit.forward(be, &ws, &x, m, &prompt, &v);
-            let (st, next) = self.schedule.coeffs(i);
-            if next.is_some() {
+            let (st, sn, renoise) = self.schedule.step_args(i);
+            if renoise {
                 be.write(&noise, &rng.normal(n));
             }
-            be.dmd_step(&x, &v, next.map(|_| &noise), st, next.unwrap_or(0.0), n);
+            be.dmd_step(&x, &v, renoise.then_some(&noise), st, sn, n);
             be.sync();
             t.steps_s.push(t0.elapsed().as_secs_f64());
             on(Event::Step {

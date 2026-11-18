@@ -17,7 +17,7 @@ use fastwan_core::{
     quant::WeightQuant,
     rng::Rng,
     schedule::DmdSchedule,
-    weights::Synthetic,
+    weights::{Synthetic, WeightSource},
 };
 use fastwan_cpu::Cpu;
 
@@ -187,6 +187,7 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     causal_memrope(&mut p);
     pack(&mut p, &mut rng);
     unpack(&mut p, &mut rng);
+    model_lora(&mut p);
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
     model_vsa(
@@ -686,6 +687,22 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         let (g, c) = (p.dl(gx), cpu.download(&cx));
         p.record("dmd_step + tanh_clamp", g, c);
     }
+    // add_act (a LoRA branch's delta before the linear's activation), at
+    // offsets into both buffers; its own RNG so the cases after it keep
+    // their draws.
+    {
+        let mut r = Rng::new(77);
+        let (ny, nd, n, yo, dof) = (1500, 1300, 1001, 211, 97);
+        let (y, d) = (r.normal(ny), r.normal(nd));
+        for act in [Act::None, Act::GeluTanh] {
+            let (gy, gd) = (be.upload(&y), be.upload(&d));
+            be.add_act(&gy, yo, &gd, dof, n, act);
+            let (cy, cd) = (cpu.upload(&y), cpu.upload(&d));
+            cpu.add_act(&cy, yo, &cd, dof, n, act);
+            let (g, c) = (p.dl(gy), cpu.download(&cy));
+            p.record(format!("add_act {act:?} at offsets"), g, c);
+        }
+    }
 
     // MemRoPE cache ops: rope_heads between strided head layouts, kv_ema
     // (initialising and blending) on a [heads, rows, d] cache.
@@ -978,6 +995,187 @@ fn model<B: Backend>(p: &mut Pair<'_, B>) {
         .decode_chunk(cpu, &mut cp.tae.state(), &z, lt, lh, lw)
         .data;
     p.record("tiny TAEHV decode (frames)", gf, cf);
+}
+
+/// The tiny DiT's block linears with every module name an adapter may use:
+/// one adapter in Wan's names (LongLive-Plug's few-step file), one in PEFT /
+/// Diffusers names with a per-module alpha (its CFG file), written once per
+/// process.
+fn tiny_adapters(cfg: &WanConfig) -> Vec<fastwan_core::lora::Adapter> {
+    use fastwan_core::export::{f32_bytes, write};
+    let shapes: std::collections::HashMap<String, Vec<usize>> =
+        fastwan_core::weights::wan_manifest(cfg)
+            .into_iter()
+            .collect();
+    let dir = std::env::temp_dir().join(format!("fw-check-lora-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wan = [
+        ("self_attn.q", "attn1.to_q"),
+        ("self_attn.k", "attn1.to_k"),
+        ("self_attn.v", "attn1.to_v"),
+        ("self_attn.o", "attn1.to_out.0"),
+        ("cross_attn.q", "attn2.to_q"),
+        ("cross_attn.k", "attn2.to_k"),
+        ("cross_attn.v", "attn2.to_v"),
+        ("cross_attn.o", "attn2.to_out.0"),
+        ("ffn.0", "ffn.net.0.proj"),
+        ("ffn.2", "ffn.net.2"),
+    ];
+    let mut out = Vec::new();
+    for (k, (rank, strength, wan_names)) in [(3usize, 1.0f32, true), (2, 0.5, false)]
+        .into_iter()
+        .enumerate()
+    {
+        let path = dir.join(format!("a{k}.safetensors"));
+        if !path.is_file() {
+            let mut r = Rng::new(100 + k as u64);
+            let mut t = Vec::new();
+            for l in 0..cfg.layers {
+                for (w, d) in wan {
+                    let sh = &shapes[&format!("blocks.{l}.{d}.weight")];
+                    let (o, i) = (sh[0], sh[1]);
+                    let name = if wan_names {
+                        format!("blocks.{l}.{w}")
+                    } else {
+                        format!("base_model.model.blocks.{l}.{d}")
+                    };
+                    t.push((
+                        format!("{name}.lora_A.weight"),
+                        fastwan_core::export::Dtype::F32,
+                        vec![rank, i],
+                        f32_bytes(&r.uniform(rank * i, 0.3)),
+                    ));
+                    t.push((
+                        format!("{name}.lora_B.weight"),
+                        fastwan_core::export::Dtype::F32,
+                        vec![o, rank],
+                        f32_bytes(&r.uniform(o * rank, 0.3)),
+                    ));
+                    if !wan_names {
+                        t.push((
+                            format!("{name}.alpha"),
+                            fastwan_core::export::Dtype::F32,
+                            vec![1],
+                            f32_bytes(&[4.0]),
+                        ));
+                    }
+                }
+            }
+            write(&path, &t, Default::default()).unwrap();
+        }
+        out.push(fastwan_core::lora::Adapter::open(&path, strength).unwrap());
+    }
+    out
+}
+
+/// A weight source with the adapters merged into the block linears in f32:
+/// what the unmerged branch means.
+struct Merged<'a> {
+    inner: &'a dyn WeightSource,
+    adapters: Vec<fastwan_core::lora::Adapter>,
+}
+
+impl WeightSource for Merged<'_> {
+    fn get(&self, name: &str, shape: &[usize]) -> fastwan_core::Result<Vec<f32>> {
+        let mut w = self.inner.get(name, shape)?;
+        if let Some(m) = name.strip_suffix(".weight") {
+            let (o, i) = (shape[0], shape[1..].iter().product::<usize>());
+            for a in &self.adapters {
+                if let Some((fa, fb, r)) = a.factors(m, o, i)? {
+                    for row in 0..o {
+                        for col in 0..i {
+                            w[row * i + col] += (0..r)
+                                .map(|k| fb[row * r + k] * fa[k * i + col])
+                                .sum::<f32>();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(w)
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.inner.contains(name)
+    }
+}
+
+/// Unmerged LoRA branches on the tiny DiT (two stacked adapters, a fused QKV
+/// and KV, the FFN's GELU after the delta): the backend against the CPU, and
+/// on the CPU the branch against merging both in f32.
+fn model_lora<B: Backend>(p: &mut Pair<'_, B>) {
+    let (be, cpu) = (p.be, &Cpu);
+    let cfg = WanConfig::tiny();
+    let src = Synthetic { seed: 3 };
+    let g = Geometry {
+        width: 64,
+        height: 32,
+        frames: 9,
+    };
+    let embeds = Rng::new(5).normal(cfg.text_len * cfg.text_dim);
+    let opt = Options {
+        geometry: g,
+        seed: 11,
+        ffn_chunk: 7,
+        tae_chunk: 2,
+        attention: Some(crate::dit::Attention::Dense),
+    };
+    let tae = TaeConfig::tiny();
+    let run = |dit: WanDit<Cpu>| {
+        let pl = Pipeline {
+            dit,
+            tae: TaeHv::load(cpu, tae.clone(), &src).unwrap(),
+            schedule: DmdSchedule::fastwan_1_3b(),
+        };
+        pl.denoise(cpu, &embeds, &opt, &mut Timings::default())
+            .unwrap()
+    };
+    let gp = Pipeline {
+        dit: WanDit::load_with_adapters(
+            be,
+            cfg.clone(),
+            &src,
+            WeightQuant::Native,
+            tiny_adapters(&cfg),
+        )
+        .unwrap(),
+        tae: TaeHv::load(be, tae.clone(), &src).unwrap(),
+        schedule: DmdSchedule::fastwan_1_3b(),
+    };
+    let got = gp
+        .denoise(be, &embeds, &opt, &mut Timings::default())
+        .unwrap();
+    let branch = run(WanDit::load_with_adapters(
+        cpu,
+        cfg.clone(),
+        &src,
+        WeightQuant::Native,
+        tiny_adapters(&cfg),
+    )
+    .unwrap());
+    p.record(
+        "tiny DiT + two stacked LoRA branches, 3 DMD steps (latent)",
+        got,
+        branch.clone(),
+    );
+    let merged_src = Merged {
+        inner: &src,
+        adapters: tiny_adapters(&cfg),
+    };
+    let merged = run(WanDit::load(cpu, cfg.clone(), &merged_src).unwrap());
+    let plain = run(WanDit::load(cpu, cfg.clone(), &src).unwrap());
+    let e = rel(&branch, &merged);
+    p.out.push(CheckResult {
+        name: "tiny DiT LoRA branches == merged weights (CPU, f32)".into(),
+        rel_err: e,
+        ok: e <= 1e-4,
+    });
+    let moved = rel(&branch, &plain);
+    p.out.push(CheckResult {
+        name: "tiny DiT LoRA changes the latent (CPU)".into(),
+        rel_err: moved,
+        ok: moved > 1e-2,
+    });
 }
 
 /// `unpack_rgba8` (8-bit RGBA words → planar RGB in [0, 1], the upscaler's
@@ -1375,7 +1573,7 @@ mod tests {
                 let v = syn.get(n, s).unwrap();
                 (
                     n.clone(),
-                    safetensors::Dtype::F32,
+                    fastwan_core::export::Dtype::F32,
                     s.clone(),
                     export::f32_bytes(&v),
                 )

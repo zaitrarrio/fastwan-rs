@@ -8,6 +8,7 @@ pub mod backend;
 pub mod config;
 pub mod export;
 pub mod geometry;
+pub mod lora;
 pub mod plan;
 pub mod quant;
 pub mod rng;

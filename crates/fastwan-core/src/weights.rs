@@ -133,6 +133,49 @@ impl SafetensorsDir {
     }
 }
 
+impl SafetensorsDir {
+    /// The Wan architecture a checkpoint holds, read from its shapes: width
+    /// from `patch_embedding`, depth from the `blocks.N` indices, FFN width
+    /// from block 0 (plain or stored int8 / int4), text width from the text
+    /// embedder. Head dim is 128 for every Wan 2.1 DiT (1.3B: 12 heads,
+    /// 14B: 40). `None` when the names are not a Wan DiT's.
+    pub fn wan_config(&self) -> Option<WanConfig> {
+        let shape = |n: &str| self.raw(n).ok().map(|t| t.1);
+        let pe = shape("patch_embedding.weight")?;
+        let (dim, in_channels) = (pe[0], pe[1]);
+        let layers = self
+            .names()
+            .filter_map(|n| {
+                n.strip_prefix("blocks.")?
+                    .split('.')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .max()?
+            + 1;
+        let k = "blocks.0.ffn.net.0.proj.weight";
+        let ffn_dim = shape(k)
+            .or_else(|| shape(&format!("{k}.q8")))
+            .or_else(|| shape(&format!("{k}.q4")))?[0];
+        let text_dim = shape("condition_embedder.text_embedder.linear_1.weight")?[1];
+        let out = shape("proj_out.weight")?[0];
+        let base = WanConfig::fastwan_1_3b();
+        if dim % base.head_dim != 0 {
+            return None;
+        }
+        Some(WanConfig {
+            heads: dim / base.head_dim,
+            in_channels,
+            out_channels: out / (base.patch * base.patch),
+            text_dim,
+            ffn_dim,
+            layers,
+            ..base
+        })
+    }
+}
+
 #[allow(unsafe_code)]
 fn map_readonly(file: &std::fs::File) -> Result<memmap2::Mmap> {
     // SAFETY: weights are read-only inputs; concurrent truncation by another
@@ -387,6 +430,66 @@ pub fn missing(src: &dyn WeightSource, manifest: &[(String, Vec<usize>)]) -> Vec
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wan_config_from_shapes() {
+        use crate::export::{f32_bytes, write};
+        let dir = std::env::temp_dir().join(format!("fw-infer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("dit.safetensors");
+        let z = |n: usize| f32_bytes(&vec![0.0; n]);
+        let (dim, ffn, text, layers) = (256, 64, 16, 3);
+        let mut t = vec![
+            (
+                "patch_embedding.weight".to_string(),
+                safetensors::Dtype::F32,
+                vec![dim, 16, 1, 2, 2],
+                z(dim * 64),
+            ),
+            (
+                "condition_embedder.text_embedder.linear_1.weight".into(),
+                safetensors::Dtype::F32,
+                vec![dim, text],
+                z(dim * text),
+            ),
+            (
+                "proj_out.weight".into(),
+                safetensors::Dtype::F32,
+                vec![64, dim],
+                z(64 * dim),
+            ),
+            (
+                "blocks.0.ffn.net.0.proj.weight".into(),
+                safetensors::Dtype::F32,
+                vec![ffn, dim],
+                z(ffn * dim),
+            ),
+        ];
+        for l in 0..layers {
+            t.push((
+                format!("blocks.{l}.norm2.weight"),
+                safetensors::Dtype::F32,
+                vec![dim],
+                z(dim),
+            ));
+        }
+        write(&p, &t, Default::default()).unwrap();
+        let c = SafetensorsDir::open(&p).unwrap().wan_config().unwrap();
+        assert_eq!(
+            (
+                c.heads,
+                c.head_dim,
+                c.layers,
+                c.ffn_dim,
+                c.text_dim,
+                c.in_channels,
+                c.out_channels
+            ),
+            (2, 128, 3, 64, 16, 16, 16)
+        );
+        assert_eq!(WanConfig::wan21_14b().dim(), 5120);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     #[test]

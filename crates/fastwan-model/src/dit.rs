@@ -23,6 +23,7 @@ use fastwan_core::{
     Result,
     backend::{Act, Backend, NormKind},
     config::WanConfig,
+    lora::Adapter,
     quant::{Q4, Q8, Stored, WeightQuant},
     rope::rope_table,
     timestep::{matvec, silu, sinusoid},
@@ -39,6 +40,58 @@ const GATE_FFN: usize = 5;
 struct Linear<B: Backend> {
     w: B::Weight,
     b: B::Buf,
+    /// Unmerged LoRA branch ([`fastwan_core::lora`]): `A [r, cols]` and the
+    /// scaled `B [rows, r]` (block-diagonal over a fused linear's keys), so
+    /// `y = act(W x + b + B (A x))`.
+    lora: Option<LoraBranch<B>>,
+    rows: usize,
+}
+
+struct LoraBranch<B: Backend> {
+    a: B::Weight,
+    b: B::Weight,
+    rank: usize,
+}
+
+/// Rows per pass of a LoRA branch (bounds its `[rows, out]` scratch).
+const LORA_CHUNK: usize = 2048;
+
+/// The scratch a LoRA branch needs: `t [LORA_CHUNK, rank]`, `d
+/// [LORA_CHUNK, out]`.
+pub struct LoraScratch<B: Backend> {
+    t: B::Buf,
+    d: B::Buf,
+}
+
+impl<B: Backend> Linear<B> {
+    /// `y[y_row..] = act(x[x_row..] · Wᵀ + b)`, plus the LoRA branch.
+    #[allow(clippy::too_many_arguments)]
+    fn apply(
+        &self,
+        be: &B,
+        x: &B::Buf,
+        x_row: usize,
+        rows: usize,
+        act: Act,
+        y: &B::Buf,
+        y_row: usize,
+        scratch: Option<&LoraScratch<B>>,
+    ) {
+        let Some(l) = &self.lora else {
+            be.linear(x, x_row, rows, &self.w, Some(&self.b), act, y, y_row);
+            return;
+        };
+        let sc = scratch.expect("a linear with a LoRA branch needs its scratch");
+        be.linear(x, x_row, rows, &self.w, Some(&self.b), Act::None, y, y_row);
+        let mut r = 0;
+        while r < rows {
+            let n = LORA_CHUNK.min(rows - r);
+            be.linear(x, x_row + r, n, &l.a, None, Act::None, &sc.t, 0);
+            be.linear(&sc.t, 0, n, &l.b, None, Act::None, &sc.d, 0);
+            be.add_act(y, (y_row + r) * self.rows, &sc.d, 0, n * self.rows, act);
+            r += n;
+        }
+    }
 }
 
 type Shapes = std::collections::HashMap<String, Vec<usize>>;
@@ -51,6 +104,7 @@ fn load_linear<B: Backend>(
     shapes: &Shapes,
     keys: &[&str],
     quant: WeightQuant,
+    adapters: &[Adapter],
 ) -> Result<Linear<B>> {
     let err = |m: String| fastwan_core::Error::Weights(m);
     let (mut w, mut b, mut stored, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new(), 0, 0);
@@ -111,10 +165,57 @@ fn load_linear<B: Backend>(
     } else {
         return Err(err(format!("{keys:?}: mixed int8 / int4 storage")));
     };
+    let lora = lora_branch(be, shapes, keys, adapters)?;
     Ok(Linear {
         w,
         b: be.upload(&b),
+        lora,
+        rows,
     })
+}
+
+/// The adapters' pairs on `keys` (stacked by rows like the fused weight) as
+/// one branch: A's rows concatenated, B block-diagonal over the keys.
+fn lora_branch<B: Backend>(
+    be: &B,
+    shapes: &Shapes,
+    keys: &[&str],
+    adapters: &[Adapter],
+) -> Result<Option<LoraBranch<B>>> {
+    // (row offset, rows, A [r, cols], B [rows, r], r) per key and adapter.
+    let mut parts = Vec::new();
+    let (mut rows, mut cols) = (0, 0);
+    for k in keys {
+        let shape = &shapes[&format!("{k}.weight")];
+        let (o, i) = (shape[0], shape[1..].iter().product::<usize>());
+        for a in adapters {
+            if let Some((fa, fb, r)) = a.factors(k, o, i)? {
+                parts.push((rows, o, fa, fb, r));
+            }
+        }
+        rows += o;
+        cols = i;
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let rank: usize = parts.iter().map(|p| p.4).sum();
+    let mut a = Vec::with_capacity(rank * cols);
+    let mut b = vec![0.0f32; rows * rank];
+    let mut c0 = 0;
+    for (r0, o, fa, fb, r) in &parts {
+        a.extend_from_slice(fa);
+        for i in 0..*o {
+            b[(r0 + i) * rank + c0..(r0 + i) * rank + c0 + r]
+                .copy_from_slice(&fb[i * r..(i + 1) * r]);
+        }
+        c0 += r;
+    }
+    Ok(Some(LoraBranch {
+        a: be.weight(&a, rank, cols),
+        b: be.weight(&b, rows, rank),
+        rank,
+    }))
 }
 
 struct Block<B: Backend> {
@@ -206,6 +307,8 @@ pub struct Workspace<B: Backend> {
     patches: B::Buf,
     rope_cos: B::Buf,
     rope_sin: B::Buf,
+    /// The LoRA branches' scratch, when the DiT has any.
+    lora: Option<LoraScratch<B>>,
 }
 
 /// Loads a [`WanDit`] one transformer block at a time, so a caller holding
@@ -217,6 +320,7 @@ pub struct DitBuilder<B: Backend> {
     quant: WeightQuant,
     shapes: Shapes,
     blocks: Vec<Block<B>>,
+    adapters: Vec<Adapter>,
 }
 
 impl<B: Backend> DitBuilder<B> {
@@ -233,7 +337,19 @@ impl<B: Backend> DitBuilder<B> {
             cfg,
             quant,
             shapes,
+            adapters: Vec::new(),
         }
+    }
+
+    /// LoRA adapters on the block linears, kept as unmerged branches (set
+    /// before the first [`Self::add_block`]).
+    pub fn with_adapters(mut self, adapters: Vec<Adapter>) -> Self {
+        assert!(
+            self.blocks.is_empty(),
+            "adapters must be set before any block loads"
+        );
+        self.adapters = adapters;
+        self
     }
 
     /// Blocks loaded so far.
@@ -253,7 +369,8 @@ impl<B: Backend> DitBuilder<B> {
         // `quant.for_key` picks each linear's format; a stored quantized
         // checkpoint overrides it.
         let shapes = &self.shapes;
-        let lin = |keys: &[&str]| load_linear(be, src, shapes, keys, quant);
+        let adapters = &self.adapters;
+        let lin = |keys: &[&str]| load_linear(be, src, shapes, keys, quant, adapters);
         let vec = |k: &str, n: usize| -> Result<B::Buf> { Ok(be.upload(&src.get(k, &[n])?)) };
         let p = |s: &str| format!("blocks.{l}.{s}");
         self.blocks.push(Block {
@@ -292,7 +409,7 @@ impl<B: Backend> DitBuilder<B> {
                 cfg.layers
             )));
         }
-        let lin = |keys: &[&str]| load_linear(be, src, &self.shapes, keys, self.quant);
+        let lin = |keys: &[&str]| load_linear(be, src, &self.shapes, keys, self.quant, &[]);
         let ce = "condition_embedder";
         let time = TimeEmbed {
             l1w: src.get(
@@ -332,7 +449,18 @@ impl<B: Backend> WanDit<B> {
         src: &dyn WeightSource,
         quant: WeightQuant,
     ) -> Result<Self> {
-        let mut b = DitBuilder::new(cfg, quant);
+        Self::load_with_adapters(be, cfg, src, quant, Vec::new())
+    }
+
+    /// [`Self::load_with`] plus LoRA adapters on the block linears.
+    pub fn load_with_adapters(
+        be: &B,
+        cfg: WanConfig,
+        src: &dyn WeightSource,
+        quant: WeightQuant,
+        adapters: Vec<Adapter>,
+    ) -> Result<Self> {
+        let mut b = DitBuilder::new(cfg, quant).with_adapters(adapters);
         while b.blocks.len() < b.cfg.layers {
             b.add_block(be, src)?;
         }
@@ -395,11 +523,13 @@ impl<B: Backend> WanDit<B> {
             0,
         );
         let kv = be.alloc(l * 2 * d);
+        let scratch = self.lora_scratch(be);
         let kv = self
             .blocks
             .iter()
             .map(|b| {
-                be.linear(&ctx, 0, l, &b.kv2.w, Some(&b.kv2.b), Act::None, &kv, 0);
+                b.kv2
+                    .apply(be, &ctx, 0, l, Act::None, &kv, 0, scratch.as_ref());
                 let (k, v) = (be.alloc(l * d), be.alloc(l * d));
                 be.head_split(
                     &kv,
@@ -418,6 +548,32 @@ impl<B: Backend> WanDit<B> {
             })
             .collect();
         Prompt { kv }
+    }
+
+    /// Scratch for the LoRA branches (`None` without adapters).
+    fn lora_scratch(&self, be: &B) -> Option<LoraScratch<B>> {
+        let (mut rank, mut out) = (0, 0);
+        for b in &self.blocks {
+            for l in [&b.qkv, &b.out1, &b.q2, &b.kv2, &b.out2, &b.ffn1, &b.ffn2] {
+                if let Some(br) = &l.lora {
+                    rank = rank.max(br.rank);
+                    out = out.max(l.rows);
+                }
+            }
+        }
+        (rank > 0).then(|| LoraScratch {
+            t: be.alloc(LORA_CHUNK * rank),
+            d: be.alloc(LORA_CHUNK * out),
+        })
+    }
+
+    /// Total LoRA rank over the block linears (0 without adapters).
+    pub fn lora_rank(&self) -> usize {
+        self.blocks
+            .iter()
+            .flat_map(|b| [&b.qkv, &b.out1, &b.q2, &b.kv2, &b.out2, &b.ffn1, &b.ffn2])
+            .filter_map(|l| l.lora.as_ref().map(|br| br.rank))
+            .sum()
     }
 
     /// Whether every block carries `to_gate_compress` (a VSA checkpoint).
@@ -487,6 +643,7 @@ impl<B: Backend> WanDit<B> {
             patches: be.alloc(s * c.patch_features_in().max(c.patch_features_out())),
             rope_cos: be.upload_table(&rope.cos),
             rope_sin: be.upload_table(&rope.sin),
+            lora: self.lora_scratch(be),
         }
     }
 
@@ -578,15 +735,15 @@ impl<B: Backend> WanDit<B> {
                 eps,
                 &ws.normed,
             );
-            be.linear(
+            bl.qkv.apply(
+                be,
                 &ws.normed,
                 0,
                 s,
-                &bl.qkv.w,
-                Some(&bl.qkv.b),
                 Act::None,
                 &ws.qkv,
                 0,
+                ws.lora.as_ref(),
             );
             be.head_split(
                 &ws.qkv,
@@ -636,16 +793,8 @@ impl<B: Backend> WanDit<B> {
                 }
                 _ => be.attention(&ws.q, &ws.k, &ws.v, nh, s, s, hd, &ws.attn),
             }
-            be.linear(
-                &ws.attn,
-                0,
-                s,
-                &bl.out1.w,
-                Some(&bl.out1.b),
-                Act::None,
-                &ws.tmp,
-                0,
-            );
+            bl.out1
+                .apply(be, &ws.attn, 0, s, Act::None, &ws.tmp, 0, ws.lora.as_ref());
             let norm2 = NormKind::Affine {
                 w: &bl.norm2_w,
                 b: &bl.norm2_b,
@@ -663,15 +812,15 @@ impl<B: Backend> WanDit<B> {
             );
             // Cross-attention against the prompt's cached K/V.
             let (k2, v2) = &prompt.kv[li];
-            be.linear(
+            bl.q2.apply(
+                be,
                 &ws.normed,
                 0,
                 s,
-                &bl.q2.w,
-                Some(&bl.q2.b),
                 Act::None,
                 &ws.tmp,
                 0,
+                ws.lora.as_ref(),
             );
             be.head_split(
                 &ws.tmp,
@@ -686,16 +835,8 @@ impl<B: Backend> WanDit<B> {
                 &ws.q,
             );
             be.attention(&ws.q, k2, v2, nh, s, c.text_len, hd, &ws.attn);
-            be.linear(
-                &ws.attn,
-                0,
-                s,
-                &bl.out2.w,
-                Some(&bl.out2.b),
-                Act::None,
-                &ws.tmp,
-                0,
-            );
+            bl.out2
+                .apply(be, &ws.attn, 0, s, Act::None, &ws.tmp, 0, ws.lora.as_ref());
             let ffn_norm = NormKind::Mod {
                 scale: SCALE_FFN,
                 shift: SHIFT_FFN,
@@ -706,26 +847,18 @@ impl<B: Backend> WanDit<B> {
             let mut r = 0;
             while r < s {
                 let n = ws.ffn_chunk.min(s - r);
-                be.linear(
+                bl.ffn1.apply(
+                    be,
                     &ws.normed,
                     r,
                     n,
-                    &bl.ffn1.w,
-                    Some(&bl.ffn1.b),
                     Act::GeluTanh,
                     &ws.hid,
                     0,
+                    ws.lora.as_ref(),
                 );
-                be.linear(
-                    &ws.hid,
-                    0,
-                    n,
-                    &bl.ffn2.w,
-                    Some(&bl.ffn2.b),
-                    Act::None,
-                    &ws.tmp,
-                    r,
-                );
+                bl.ffn2
+                    .apply(be, &ws.hid, 0, n, Act::None, &ws.tmp, r, ws.lora.as_ref());
                 r += n;
             }
             be.gate_residual(&ws.h, &ws.tmp, s, d, m, GATE_FFN);

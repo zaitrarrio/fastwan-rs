@@ -585,6 +585,18 @@ impl Backend for Cpu {
         }
     }
 
+    fn add_act(&self, y: &CpuBuf, y_off: usize, d: &CpuBuf, d_off: usize, n: usize, act: Act) {
+        let d = d.r();
+        let mut y = y.w();
+        for (o, &a) in y[y_off..y_off + n].iter_mut().zip(&d[d_off..d_off + n]) {
+            let s = *o + a;
+            *o = match act {
+                Act::None => s,
+                Act::GeluTanh => gelu_tanh(s),
+            };
+        }
+    }
+
     fn dmd_step(&self, x: &CpuBuf, v: &CpuBuf, noise: Option<&CpuBuf>, st: f32, sn: f32, n: usize) {
         let v = v.r();
         let noise = noise.map(|b| b.r());
