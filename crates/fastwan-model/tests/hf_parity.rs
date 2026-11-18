@@ -73,13 +73,14 @@ fn causal_blocks_match_reference() {
         sink_frames: 1,
         timesteps: vec![],
         half_kv: false,
+        memory: fastwan_model::causal::Memory::Window,
     };
     let tpf = (h / cfg.patch) * (w / cfg.patch);
     let mut cache = KvCache::new(&be, cfg.layers, cfg.heads, cfg.head_dim, tpf, &ccfg).unwrap();
     let out = be.alloc(4 * h * w);
     let mut worst = 0f32;
     for b in 0..4 {
-        cache.begin_block(b, 1).unwrap();
+        cache.begin_block(&be, b, 1).unwrap();
         let rope = rope_table(&cfg, (1, h / cfg.patch, w / cfg.patch), b);
         let (cos, sin) = (be.upload_table(&rope.cos), be.upload_table(&rope.sin));
         for (i, t) in [757.0f32, 500.0, 0.0].into_iter().enumerate() {
@@ -104,5 +105,79 @@ fn causal_blocks_match_reference() {
     assert!(
         worst < 1e-4,
         "causal forward differs from the reference: rel {worst:e}"
+    );
+}
+
+/// MemRoPE (History Forcing's memory) against the transcribed PyTorch
+/// reference on the same tiny model: six 2-frame blocks through a 7-frame
+/// cache (1 sink, 2 EMA memory frames, 2 recent, the block), three forwards
+/// per block (t = 757, 500, 0); the fourth block initialises the memory, the
+/// fifth and sixth blend it. scripts/reference/make_memrope_fixture.py.
+#[test]
+fn memrope_blocks_match_reference() {
+    use fastwan_core::rope::rope_table;
+    use fastwan_model::causal::{CausalConfig, KvCache, Memory};
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wan_memrope_tiny.safetensors");
+    let src = SafetensorsDir::open(&path).unwrap();
+    let cfg = WanConfig::tiny();
+    let (nf, h, w) = (2, 8, 12);
+    let ctx = src.get("input.context", &[8, 16]).unwrap();
+    let be = Cpu;
+    let dit = WanDit::load(&be, cfg.clone(), &src).unwrap();
+    let prompt = dit.prepare_prompt(&be, &ctx);
+    let ws = dit.workspace(
+        &be,
+        (nf, h, w),
+        usize::MAX,
+        Some(fastwan_model::Attention::Dense),
+    );
+    let ccfg = CausalConfig {
+        block_frames: nf,
+        cap_frames: 7,
+        sink_frames: 1,
+        timesteps: vec![],
+        half_kv: false,
+        memory: Memory::MemRope {
+            alpha_long: 0.01,
+            alpha_short: 0.1,
+        },
+    };
+    let (gh, gw) = (h / cfg.patch, w / cfg.patch);
+    let tpf = gh * gw;
+    let mut cache = KvCache::new(&be, cfg.layers, cfg.heads, cfg.head_dim, tpf, &ccfg).unwrap();
+    let kt = rope_table(&cfg, (7, gh, gw), 0);
+    cache.set_key_rope(be.upload_table(&kt.cos), be.upload_table(&kt.sin));
+    let n = 4 * nf * h * w;
+    let out = be.alloc(n);
+    let mut worst = 0f32;
+    for b in 0..6 {
+        cache.begin_block(&be, b * nf, nf).unwrap();
+        let rope = rope_table(&cfg, (nf, gh, gw), cache.query_frame(b * nf));
+        let (cos, sin) = (be.upload_table(&rope.cos), be.upload_table(&rope.sin));
+        for (i, t) in [757.0f32, 500.0, 0.0].into_iter().enumerate() {
+            let x = src
+                .get(&format!("input.x.{b}.{i}"), &[4, nf, h, w])
+                .unwrap();
+            let want = src
+                .get(&format!("expected.v.{b}.{i}"), &[4, nf, h, w])
+                .unwrap();
+            let mods = dit.step_mods(&be, t);
+            let xb = be.upload(&x);
+            dit.forward_causal(&be, &ws, &xb, &mods, &prompt, &out, (&cos, &sin), &cache);
+            let got = be.download(&out);
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let err = got
+                .iter()
+                .zip(&want)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
+                / scale;
+            eprintln!("memrope block {b} forward {i} (t={t}): rel {err:e}");
+            worst = worst.max(err);
+        }
+    }
+    assert!(
+        worst < 1e-4,
+        "MemRoPE forward differs from the reference: rel {worst:e}"
     );
 }

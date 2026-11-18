@@ -558,6 +558,12 @@ impl<B: Backend> WanDit<B> {
             0,
         );
         let rope = Some(rope);
+        // MemRoPE caches keep K unrotated and rotate it at its slot.
+        let krope = if cache.is_some_and(|c| c.rotates_keys()) {
+            None
+        } else {
+            rope
+        };
         for (li, (bl, m)) in self.blocks.iter().zip(&mods.blocks).enumerate() {
             // Self-attention.
             be.layer_norm(
@@ -602,7 +608,7 @@ impl<B: Backend> WanDit<B> {
                 nh,
                 hd,
                 Some(&bl.norm_k1),
-                rope,
+                krope,
                 eps,
                 &ws.k,
             );

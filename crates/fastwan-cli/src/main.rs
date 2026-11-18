@@ -261,7 +261,22 @@ enum Cmd {
         /// Causal: first latent frames kept in the cache for the whole video.
         #[arg(long, default_value_t = 3)]
         sink_frames: usize,
+        /// Causal: what the full cache keeps. `memrope` is History Forcing's
+        /// memory (its checkpoint: scripts/convert_self_forcing.py on
+        /// dmd/model.pt): 2 EMA frames after the sink, unrotated keys
+        /// rotated at their slot (block-relative RoPE).
+        #[arg(long, value_enum, default_value_t = CausalMemory::Window)]
+        memory: CausalMemory,
     },
+}
+
+/// `generate --causal --memory`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum CausalMemory {
+    /// Sink + rolling window (Self-Forcing, LongLive).
+    Window,
+    /// MemRoPE: sink + long / short EMA memory frames + recent window.
+    Memrope,
 }
 
 /// Run `f` with the selected backend.
@@ -506,6 +521,7 @@ fn main() -> Result<()> {
             causal,
             cache_frames,
             sink_frames,
+            memory,
         } => {
             let g = shape.geometry()?;
             let cfg = WanConfig::fastwan_1_3b();
@@ -534,7 +550,10 @@ fn main() -> Result<()> {
                 if runs > 1 {
                     bail!("--causal does not take --runs");
                 }
-                let mut ccfg = fastwan_model::causal::CausalConfig::self_forcing();
+                let mut ccfg = match memory {
+                    CausalMemory::Window => fastwan_model::causal::CausalConfig::self_forcing(),
+                    CausalMemory::Memrope => fastwan_model::causal::CausalConfig::history_forcing(),
+                };
                 ccfg.cache_frames(cache_frames, sink_frames);
                 return with_backend!(backend, |be| generate_causal(
                     &be,
@@ -814,7 +833,7 @@ fn generate_causal<B: Backend>(
 ) -> Result<()> {
     use fastwan_model::causal::CausalRollout;
     let cfg = WanConfig::fastwan_1_3b();
-    let tcfg = TaeConfig::taew2_1();
+    let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
     println!("{}", be.name());
     let t0 = std::time::Instant::now();
     let wsrc = SafetensorsDir::open(transformer)?;
@@ -837,8 +856,8 @@ fn generate_causal<B: Backend>(
     let bf = ccfg.block_frames;
     let blocks = lt.div_ceil(bf);
     println!(
-        "causal: {blocks} blocks of {bf} latent frames, cache {} (sink {}), timesteps {:?}",
-        ccfg.cap_frames, ccfg.sink_frames, ccfg.timesteps
+        "causal: {blocks} blocks of {bf} latent frames, cache {} (sink {}, {:?}), timesteps {:?}",
+        ccfg.cap_frames, ccfg.sink_frames, ccfg.memory, ccfg.timesteps
     );
     let t0 = std::time::Instant::now();
     let prompt = dit.prepare_prompt(be, e);
