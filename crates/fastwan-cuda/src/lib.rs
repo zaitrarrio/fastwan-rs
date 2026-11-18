@@ -557,15 +557,21 @@ impl Backend for Cuda {
         if len == 0 {
             return;
         }
-        assert!(!src.f32 && !dst.f32 && so + len <= src.len && d + len <= dst.len);
+        // bf16 activations (2 bytes) or f32-flagged buffers such as packed
+        // RGBA words (4 bytes); both sides must be the same kind.
+        assert!(
+            src.f32 == dst.f32 && so + len <= src.len && d + len <= dst.len,
+            "copy: mixed bf16 / f32 buffers or out of range"
+        );
+        let e = if src.f32 { 4 } else { 2 };
         // SAFETY: both ranges are inside their allocations (asserted above).
         self.timed(
             || "copy (dtod)".into(),
             || unsafe {
                 cudarc::driver::result::memcpy_dtod_async(
-                    self.ptr(dst) + (d * 2) as u64,
-                    self.ptr(src) + (so * 2) as u64,
-                    len * 2,
+                    self.ptr(dst) + (d * e) as u64,
+                    self.ptr(src) + (so * e) as u64,
+                    len * e,
                     self.stream.cu_stream(),
                 )
                 .expect("dtod");

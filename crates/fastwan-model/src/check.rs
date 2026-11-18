@@ -879,6 +879,15 @@ fn unpack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
     be.unpack_rgba8(&gs, frames, plane, &go);
     cpu.unpack_rgba8(&cs, frames, plane, &co);
     p.record("unpack_rgba8 3 frames", p.dl(go), cpu.download(&co));
+    // A frame range of packed words copied out (the upscaler's batches).
+    let (gw, cw) = (be.alloc_words(2 * plane), cpu.alloc_words(2 * plane));
+    be.copy(&gs, plane, &gw, 0, 2 * plane);
+    cpu.copy(&cs, plane, &cw, 0, 2 * plane);
+    p.record_rgba8(
+        "copy of packed words (frames 1..3)",
+        p.dl(gw),
+        cpu.download(&cw),
+    );
 }
 
 /// `pack_rgba8` (decoder / upscaler output → 8-bit RGBA), with and without

@@ -446,19 +446,29 @@ function draw() {
     if (clip.up && bw.eng) { try { if (bw.eng.isUpscaled(f)) { bw.eng.showUpscaled(f); up = true; } } catch {} }
     $("canvas-up").hidden = !up;
     if (!up) paint(ctx, clip.frames[f]);
+    if (UP_DEBUG) up ? upStats.shownUp++ : upStats.shownLow++;
     if (clip.up) upPump();
   }
   $("counter").textContent = `${clip.frames.length ? frame + 1 : 0} / ${clip.total || clip.frames.length}`;
   $("scrub").value = frame;
 }
+// ?updebug=1: playback counters for the GPU tests (window.upStats).
+const UP_DEBUG = new URLSearchParams(location.search).has("updebug");
+window.upStats = { ticks: 0, waits: 0, draws: 0, drawMs: 0, maxDrawMs: 0, shownUp: 0, shownLow: 0, pumpMs: 0, pumpCalls: 0 };
 function tick(t) {
+  if (UP_DEBUG) upStats.ticks++;
   if (playing && clip.frames.length && t - lastTick >= 1000 / FPS) {
     lastTick = t;
     const next = frame + 1 < clip.frames.length ? frame + 1 : (recording || clip.streaming ? frame : 0);
     // Upscaling: wait for the next frame's upscale rather than flash the
     // low-res frame (like a video buffering).
-    if (clip.up && bw.eng && next !== frame && !bw.eng.isUpscaled(next)) { clip.up.waiting = true; upPump(); }
-    else { frame = next; draw(); }
+    if (clip.up && bw.eng && next !== frame && !bw.eng.isUpscaled(next)) { clip.up.waiting = true; if (UP_DEBUG) upStats.waits++; upPump(); }
+    else {
+      frame = next;
+      const t0 = UP_DEBUG ? performance.now() : 0;
+      draw();
+      if (UP_DEBUG) { const d = performance.now() - t0; upStats.draws++; upStats.drawMs += d; upStats.maxDrawMs = Math.max(upStats.maxDrawMs, d); }
+    }
   }
   requestAnimationFrame(tick);
 }
@@ -762,10 +772,13 @@ async function upPump() {
       if (f0 < 0) break;
       let m = 1;
       while (m < u.batch && f0 + m < n && inWin(f0 + m) && !bw.eng.isUpscaled(f0 + m)) m++;
+      const tj = UP_DEBUG ? performance.now() : 0;
       const px = u.w * u.h * 4, rgba = new Uint8Array(m * px);
       for (let i = 0; i < m; i++) rgba.set(clip.frames[f0 + i].data, i * px);
       const t = performance.now();
-      await wasmCall(bw.eng.upscaleFrames(rgba, f0, m, u.h, u.w));
+      const call = bw.eng.upscaleFrames(rgba, f0, m, u.h, u.w);
+      if (UP_DEBUG) { upStats.pumpMs += performance.now() - tj; upStats.pumpCalls++; }
+      await wasmCall(call);
       if (clip.id !== id || clip.up !== u) break;
       const dt = performance.now() - t;
       u.done += m; u.ms += dt;
