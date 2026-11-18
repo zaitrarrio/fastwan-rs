@@ -227,6 +227,18 @@ pub fn ops_deferred<B: Backend>(be: &B, tol: f32) -> Deferred<B> {
 /// VSA at the token grids the browser runs (480×272×81 and 832×480×81 after
 /// the 2×2 patch), d = 128 like the model, few heads to keep the CPU
 /// reference cheap. The small cases in `ops` never exceed 256 key tiles.
+/// `x` rounded to bf16 (nearest even on the top 16 bits, finite inputs):
+/// the values CUDA's uploads hold, so a VSA case's top-k sees the same
+/// scores on both sides.
+fn bf(x: Vec<f32>) -> Vec<f32> {
+    x.into_iter()
+        .map(|v| {
+            let b = v.to_bits();
+            f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        })
+        .collect()
+}
+
 fn vsa_real<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
     let (be, cpu) = (p.be, &Cpu);
     for &(grid, heads) in &[((21, 17, 30), 2), ((21, 30, 52), 1)] {
@@ -238,15 +250,6 @@ fn vsa_real<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         // rounding alone flips top-k picks (the CPU oracle on bf16-rounded
         // inputs moves 0.41 / 0.21 from its f32 self), which the backend
         // would be charged for. Both sides get the same rounded values.
-        let bf = |x: Vec<f32>| -> Vec<f32> {
-            // Round to nearest even on the top 16 bits (finite inputs).
-            x.into_iter()
-                .map(|v| {
-                    let b = v.to_bits();
-                    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
-                })
-                .collect()
-        };
         let (q, k, v, g) = (
             bf(rng.normal(heads * s * d)),
             bf(rng.normal(heads * s * d)),
@@ -608,7 +611,10 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         );
     }
 
-    // VSA: partial tiles in every axis, two head dims, two sparsities.
+    // VSA: partial tiles in every axis, two head dims, two sparsities. The
+    // inputs are bf16-representable like the model-grid cases': bf16 upload
+    // rounding alone moved (5, 6, 9) by 0.29 from its f32 oracle once the
+    // RNG draw changed (a top-k near-tie), which CUDA was charged for.
     for &(grid, heads, d, sparsity) in &[
         ((5, 6, 9), 2, 128, 0.75),
         ((4, 8, 8), 3, 16, 0.5),
@@ -617,10 +623,10 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         let spec = fastwan_core::vsa::VsaSpec::new(grid, heads, d, sparsity);
         let s = spec.plan.seq;
         let (q, k, v, g) = (
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
+            bf(rng.normal(heads * s * d)),
+            bf(rng.normal(heads * s * d)),
+            bf(rng.normal(heads * s * d)),
+            bf(rng.normal(heads * s * d)),
         );
         let (gq, gk, gv, gg, go) = (
             be.upload(&q),
