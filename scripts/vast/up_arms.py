@@ -41,7 +41,9 @@ with sync_playwright() as p:
     f1 = pg.evaluate("frame"); w1 = pg.evaluate("clip.up ? [clip.up.done, clip.up.ms] : [0, 0]")
     st = pg.evaluate("clip.up ? `batch ${clip.up.batch}/${clip.up.max}, kept ${bw.eng.upscaledCount()} of ${clip.frames.length}, canvas ${document.getElementById('canvas-up').width}x${document.getElementById('canvas-up').height}` : 'no upscale'")
     d = w1[0] - w0[0]
-    print(f"{arm} playback: {(f1 - f0) / 10:.1f} fps over 10 s (frames {f0}->{f1}); upscaled {d} frames in that time"
+    # Frames drawn, not the playhead's movement: a clip loops (81 → 0).
+    drawn = pg.evaluate("upStats.draws")
+    print(f"{arm} playback: {drawn / 10:.1f} fps over 10 s ({drawn} frames drawn, playhead {f0}->{f1}); upscaled {d} frames in that time"
           f" ({(w1[1] - w0[1]) / max(d, 1):.0f} ms/frame); total {w1[0]} frames at {w1[1] / max(w1[0], 1):.0f} ms/frame; {st}", flush=True)
     print(f"{arm} upStats:", pg.evaluate("JSON.stringify(upStats)"), flush=True)
     pg.evaluate("() => { playing = false; }"); pg.wait_for_timeout(1500)

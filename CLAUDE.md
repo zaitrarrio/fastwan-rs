@@ -190,11 +190,23 @@ State and invariants only; the reasoning is in `docs/design.md`.
   size whose largest buffer exceeds the binding cap before denoising, and the
   page fails the call on a wasm `RuntimeError`. Tiny-model parity vs the CPU (SwiftShader Chrome): f4/f16
   clips and the upscaler 99.9% byte-exact, max 1 level.
-- Upscaler (`upscale.rs`, Real-ESRGAN `realesr-animevideov3`, BSD-3): convs on
-  the backend with `ConvEpilogue::Prelu`, pixel-shuffle + nearest skip in
-  `pack_rgba8` (below). Real weights match a numpy SRVGGNetCompact 100%
-  (`scripts/upscale/parity.py`). `generate --upscale`, Prompt Studio checkbox.
-  4090 CUDA: 81 frames 480×272 → 1920×1088 in 0.87 s, of which 285 ms is GPU.
+- Upscaler (`upscale.rs`, Real-ESRGAN `realesr-animevideov3`, BSD-3, ×4):
+  convs on the backend with `ConvEpilogue::Prelu`, pixel-shuffle + nearest
+  skip in `pack_rgba8` (below). ×2 is the same network then a 2×2 box filter
+  in `pack_rgba8` (`PackShape::down`; `Upscaler::set_output_scale`): no fast
+  ×2 model beat bicubic. `unpack_rgba8` feeds packed frames (a decoder's
+  output, or uploaded RGBA) to `Upscaler::launch_words` on the device. Real
+  weights match a numpy SRVGGNetCompact 100% (`scripts/upscale/parity.py`).
+  CLI `generate --upscale <file> --upscale-x 2|4`, clips and `--causal` (per
+  block); `serve --upscaler <file>`, `upscale: 2|4` per request. RTX 4090
+  CUDA: 81 frames 832×480 ×4 in 2.99 s, ×2 1.39 s; long 832×480 ×2 8.2 fps
+  (10.8 without). Browser: upscaled as it plays into a window of at most
+  768 MB (96 MB on phones, ×2 only) from the playhead forward, any size and
+  long videos; playback waits for each upscaled frame; frames per call adapt
+  (one at first: a long submission trips the GPU watchdog). Chrome on a
+  4090: 16-26 ms/frame (480×272), 43-53 ms (832×480), ~14.5 fps playback,
+  long-video generation unchanged (`docs/runs/2026-11-18-vast-4090-upscale-everywhere`).
+  CUDA `copy` takes f32-flagged (packed word) buffers too.
 - `pack_rgba8` (+ `alloc_words` / `upload_words` / `download_rgba8`): TAEHV's
   and the upscaler's last step on the device, frames out as packed RGBA. A
   packed word is not a valid f32 in general: WGSL writes it through a u32
@@ -210,7 +222,8 @@ State and invariants only; the reasoning is in `docs/design.md`.
   first 1080p frame 0.5 s after the decode, all 81 in 1.4–1.7 s (was 2.4–2.6
   s with readback; `docs/runs/2026-11-13-vast-4090-browser-upscale-gpu`). In
   a browser dropping a buffer destroys it: drop the upscaler's intermediates
-  only after a fence. Upscale is offered for 480×272 only. Playwright's headless
+  only after a fence. Headless screenshots do not capture that WebGPU
+  canvas: check what is shown by reading the frame back. Playwright's headless
   *shell* has no `navigator.gpu`: use the full Chromium build. Vast hosts
   differ in whether they expose Vulkan; `fastwan check --backend wgpu` must
   name NVIDIA, not llvmpipe. `fastwan serve` marks its page
@@ -218,11 +231,14 @@ State and invariants only; the reasoning is in `docs/design.md`.
 - Phones (`MOBILE` in `web/demo.html`: iPhone / iPad / Android UA): the tab's
   memory limit covers GPU memory and iOS resets the tab when it is crossed
   (reported: reset during step 1 at the defaults, ~2 GB: 0.9 GB weights + 1 GB
-  activations + decode). There: 4-bit only, 480×272 only, ≤ 33 frames, no
-  upscale; the engine (`createEngine(…, mobile)`) runs the FFN in 1024-token
+  activations + decode). There: 4-bit only, 480×272 only, ≤ 33 frames, upscale
+  ×2 only; the engine (`createEngine(…, mobile)`) runs the FFN in 1024-token
   chunks, decodes one latent frame at a time and submits every 8 dispatches.
   Not yet measured on a real phone. A `fastwan.run` breadcrumb in
   localStorage names the stage if the tab dies; the next visit shows it.
+- Headless Chrome on SwiftShader needs `--use-vulkan=swiftshader
+  --use-webgpu-adapter=swiftshader --use-angle=swiftshader`: with only the
+  adapter flag, drawing on a WebGPU canvas loses the device ("Destroyed").
 - Tests: `cargo test --workspace` (needs a Vulkan driver for the WebGPU suite:
   `mesa-vulkan-drivers`); NVRTC kernel compile needs libnvrtc on
   `LD_LIBRARY_PATH` (`pip install nvidia-cuda-nvrtc-cu12`).
