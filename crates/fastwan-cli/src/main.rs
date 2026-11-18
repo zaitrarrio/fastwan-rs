@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 mod gallery;
 mod serve;
+mod upscale;
 
 #[derive(Parser)]
 #[command(
@@ -167,6 +168,10 @@ enum Cmd {
         /// https://fastwan.pages.dev for the hosted demo page.
         #[arg(long)]
         allow_origin: Option<String>,
+        /// Offer ×2 / ×4 upscaling with this Real-ESRGAN compact model
+        /// (`realesr-animevideov3.safetensors`).
+        #[arg(long)]
+        upscaler: Option<PathBuf>,
     },
     /// Write a quantized copy of the DiT: block linears as int8 / 4-bit codes,
     /// everything else f16 (the browser download format; see
@@ -369,6 +374,7 @@ fn main() -> Result<()> {
             max_frames,
             tae_chunk,
             allow_origin,
+            upscaler,
         } => {
             let weights = if synthetic {
                 serve::Weights::Synthetic { gallery }
@@ -395,6 +401,7 @@ fn main() -> Result<()> {
                 allow_origin,
                 attention: attn.get(),
                 quant: attn.weights,
+                upscaler,
             };
             serve::serve(settings, move |s, shared, rx| {
                 with_backend!(backend, |be| serve::engine(be, s, shared, rx))
@@ -748,7 +755,7 @@ fn generate<B: Backend>(
     }
     let mut video = last.expect("at least one run");
     if let Some((path, x)) = upscale {
-        let up = load_upscaler(be, path, x)?;
+        let up = upscale::load(be, path, x)?;
         let (h, w) = (video.height, video.width);
         be.profile_reset();
         let t0 = std::time::Instant::now();
@@ -757,7 +764,7 @@ fn generate<B: Backend>(
             .chunks_exact(3)
             .map(|p| p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16)
             .collect();
-        let rgb = upscale_words(be, &up, &be.upload_words(&words), video.frames, h, w);
+        let rgb = upscale::frames(be, &up, &be.upload_words(&words), video.frames, h, w);
         let s = up.output_scale();
         println!(
             "upscale x{s} {:.2}s ({}x{} -> {}x{})",
@@ -823,7 +830,7 @@ fn generate_causal<B: Backend>(
     let tsrc = SafetensorsDir::open(tae)?;
     let dit = WanDit::load_with(be, cfg.clone(), &wsrc, quant)?;
     let taehv = TaeHv::load(be, tcfg, &tsrc)?;
-    let up = upscale.map(|(p, x)| load_upscaler(be, p, x)).transpose()?;
+    let up = upscale.map(|(p, x)| upscale::load(be, p, x)).transpose()?;
     be.sync();
     println!("load {:.1}s", t0.elapsed().as_secs_f64());
     let (lt, lh, lw) = g.latent();
@@ -861,7 +868,7 @@ fn generate_causal<B: Backend>(
         let (rgb, h, w) = match &up {
             Some(up) => {
                 let s = up.output_scale();
-                (upscale_words(be, up, &packed, n, h, w), h * s, w * s)
+                (upscale::frames(be, up, &packed, n, h, w), h * s, w * s)
             }
             None => {
                 let raw = be.download_rgba8(&packed);
@@ -903,64 +910,6 @@ fn generate_causal<B: Backend>(
     );
     println!("wrote {}", out.display());
     Ok(())
-}
-
-/// The ×4 Real-ESRGAN compact model from `path`, set to output ×`x` (2 or 4).
-fn load_upscaler<B: Backend>(
-    be: &B,
-    path: &Path,
-    x: usize,
-) -> Result<fastwan_model::upscale::Upscaler<B>> {
-    use fastwan_model::upscale::{UpConfig, Upscaler, up_manifest};
-    let ucfg = UpConfig::anime_video_v3();
-    let usrc = SafetensorsDir::open(path)?;
-    let miss = missing(&usrc, &up_manifest(&ucfg));
-    if !miss.is_empty() {
-        bail!(
-            "{} is not realesr-animevideov3 (missing {:?})",
-            path.display(),
-            &miss[..miss.len().min(3)]
-        );
-    }
-    let mut up = Upscaler::load(be, ucfg, &usrc)?;
-    up.set_output_scale(x)?;
-    Ok(up)
-}
-
-/// Upscale `frames` packed RGBA frames on the device (`[frames, h, w]`
-/// words) and return them as RGB bytes. Batches of a few frames (the
-/// activations are 64 channels at full size), pipelined like the decode:
-/// batch i+1 is queued before batch i is read back and converted.
-fn upscale_words<B: Backend>(
-    be: &B,
-    up: &fastwan_model::upscale::Upscaler<B>,
-    words: &B::Buf,
-    frames: usize,
-    h: usize,
-    w: usize,
-) -> Vec<u8> {
-    let s = up.output_scale();
-    let batch = up.batch(h, w, 1 << 30).min(8);
-    let plane = h * w;
-    let launch = |f0: usize| {
-        let n = batch.min(frames - f0);
-        let part = be.alloc_words(n * plane);
-        be.copy(words, f0 * plane, &part, 0, n * plane);
-        let c = up.launch_words(be, &part, n, h, w);
-        (part, c)
-    };
-    let starts: Vec<usize> = (0..frames).step_by(batch).collect();
-    let mut rgb = Vec::with_capacity(frames * plane * s * s * 3);
-    let mut cur = launch(starts[0]);
-    for i in 0..starts.len() {
-        let next = starts.get(i + 1).map(|&f0| launch(f0));
-        let rgba = be.download_rgba8(&cur.1.out);
-        rgb.extend(fastwan_core::backend::rgba_to_rgb(&rgba));
-        if let Some(n) = next {
-            cur = n;
-        }
-    }
-    rgb
 }
 
 /// A YUV4MPEG2 file written frame by frame (see [`write_y4m`]).
