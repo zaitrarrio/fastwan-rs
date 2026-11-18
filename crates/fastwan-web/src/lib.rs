@@ -334,7 +334,7 @@ mod web {
         ) -> js_sys::Promise {
             let inner = self.inner.clone();
             wasm_bindgen_futures::future_to_promise(async move {
-                run(
+                let r = run(
                     &inner,
                     embeds,
                     Geometry {
@@ -345,8 +345,10 @@ mod web {
                     seed as u64,
                     &on_event,
                 )
-                .await
-                .map(|()| JsValue::UNDEFINED)
+                .await;
+                // Free the buffers kept for reuse: the next run may use other sizes.
+                inner.be.trim_pool();
+                r.map(|()| JsValue::UNDEFINED)
             })
         }
 
@@ -369,7 +371,7 @@ mod web {
         ) -> js_sys::Promise {
             let inner = self.inner.clone();
             wasm_bindgen_futures::future_to_promise(async move {
-                run_long(
+                let r = run_long(
                     &inner,
                     embeds,
                     Geometry {
@@ -382,8 +384,10 @@ mod web {
                     sink_frames,
                     &on_event,
                 )
-                .await
-                .map(|()| JsValue::UNDEFINED)
+                .await;
+                // Free the buffers kept for reuse: the next run may use other sizes.
+                inner.be.trim_pool();
+                r.map(|()| JsValue::UNDEFINED)
             })
         }
 
@@ -778,10 +782,11 @@ mod web {
                 set(&o, "total", blocks as u32);
                 set(&o, "ms", now - t_last);
                 set(&o, "denoise_ms", now - t_last);
-                let (n, created, live) = fastwan_wgpu::mem_stats();
-                set(&o, "buffers_created", n as f64);
-                set(&o, "mb_created", created as f64 / 1e6);
-                set(&o, "mb_live", live as f64 / 1e6);
+                let m = fastwan_wgpu::mem_stats();
+                set(&o, "buffers_created", m.created as f64);
+                set(&o, "buffers_reused", m.reused as f64);
+                set(&o, "mb_created", m.created_bytes as f64 / 1e6);
+                set(&o, "mb_held", m.held_bytes as f64 / 1e6);
                 emit(o);
                 t_last = now;
                 let o = Object::new();

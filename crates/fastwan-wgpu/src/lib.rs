@@ -60,46 +60,24 @@ pub struct GBuf {
     len: usize,
 }
 
-/// A device buffer that is freed when the last [`GBuf`] handle goes. Native
-/// wgpu frees on drop. wgpu's WebGPU backend does not: a dropped buffer lives
-/// until the JS garbage collector finds its handle, which a wasm program that
-/// makes little JS garbage rarely triggers. A long video drops thousands of
-/// buffers and dispatch uniforms per block, and Chrome slowed from 1.7 s to
-/// 10-16 s per block as they piled up. So in the browser a dropped buffer is
-/// queued and `destroy()`ed right after the next submission of the pending
-/// encoder (every command that could use it is then submitted, and WebGPU
-/// lets submitted work finish before freeing).
-pub(crate) struct Owned(Option<wgpu::Buffer>);
-
-impl Owned {
-    fn new(b: wgpu::Buffer) -> Self {
-        Self(Some(tracked(b)))
-    }
-}
-
-/// Buffer accounting for diagnosing allocation churn: buffers created, bytes
-/// created, bytes still live (created and not yet released by us).
-static MEM_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static MEM_CREATED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static MEM_LIVE_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn tracked(b: wgpu::Buffer) -> wgpu::Buffer {
-    use std::sync::atomic::Ordering::Relaxed;
-    MEM_CREATED.fetch_add(1, Relaxed);
-    MEM_CREATED_BYTES.fetch_add(b.size(), Relaxed);
-    MEM_LIVE_BYTES.fetch_add(b.size() as i64, Relaxed);
-    b
-}
-
-/// (buffers created, bytes created, bytes live) since start.
-pub fn mem_stats() -> (u64, u64, i64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (
-        MEM_CREATED.load(Relaxed),
-        MEM_CREATED_BYTES.load(Relaxed),
-        MEM_LIVE_BYTES.load(Relaxed),
-    )
-}
+/// A device buffer that goes back to its device's [`Recycler`] when the last
+/// [`GBuf`] handle goes.
+///
+/// Why not create and free per use: a long video creates and drops thousands
+/// of activation buffers and dispatch uniforms per block (several GB at
+/// 480×272). wgpu's WebGPU backend never frees a dropped buffer (the JS
+/// garbage collector does, rarely), and even `destroy()` only releases the
+/// memory once the GPU has finished every submission that used it. With the
+/// next block queued before the previous one's frames are read back, Chrome
+/// then holds about two blocks of activations at once, and on an RTX 4090
+/// blocks ran ~20× slower in bursts (35.5 s vs 1.6 s) while native wgpu stayed
+/// flat (docs/runs/2026-11-17-vast-4090-stalls-f16-phones). So dropped
+/// buffers are recycled instead: retired on drop, moved to a free list right
+/// after the next submission (every command that could use them is then
+/// submitted, and later commands and queue writes are ordered after it), and
+/// handed out again for the same size and usage, cleared, so a buffer is
+/// zero-filled as from `create_buffer`.
+pub(crate) struct Owned(Option<wgpu::Buffer>, Arc<Recycler>);
 
 impl std::ops::Deref for Owned {
     type Target = wgpu::Buffer;
@@ -111,34 +89,101 @@ impl std::ops::Deref for Owned {
 impl Drop for Owned {
     fn drop(&mut self) {
         if let Some(b) = self.0.take() {
-            retire(b);
+            self.1.retire(b);
         }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-thread_local! {
-    static RETIRED: std::cell::RefCell<Vec<wgpu::Buffer>> = const { std::cell::RefCell::new(Vec::new()) };
+/// Buffer accounting for diagnosing allocation churn: buffers created, bytes
+/// created, buffers reused from the free list, bytes held (live + free list).
+static MEM_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEM_CREATED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEM_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEM_HELD_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn tracked(b: wgpu::Buffer) -> wgpu::Buffer {
+    use std::sync::atomic::Ordering::Relaxed;
+    MEM_CREATED.fetch_add(1, Relaxed);
+    MEM_CREATED_BYTES.fetch_add(b.size(), Relaxed);
+    MEM_HELD_BYTES.fetch_add(b.size() as i64, Relaxed);
+    b
 }
 
-/// Free `b` once it can no longer be in an unsubmitted command (see [`Owned`]).
-fn retire(b: wgpu::Buffer) {
-    MEM_LIVE_BYTES.fetch_sub(b.size() as i64, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(target_arch = "wasm32")]
-    RETIRED.with(|r| r.borrow_mut().push(b));
-    #[cfg(not(target_arch = "wasm32"))]
-    drop(b);
+/// Allocation counters since start: buffers created, bytes created, buffers
+/// reused, bytes held (in use or on a free list).
+#[derive(Debug, Clone, Copy)]
+pub struct MemStats {
+    pub created: u64,
+    pub created_bytes: u64,
+    pub reused: u64,
+    pub held_bytes: i64,
 }
 
-/// Destroy the retired buffers; call only right after the pending encoder was
-/// submitted (nothing unsubmitted can refer to them then).
-fn destroy_retired() {
-    #[cfg(target_arch = "wasm32")]
-    RETIRED.with(|r| {
-        for b in r.borrow_mut().drain(..) {
-            b.destroy();
+pub fn mem_stats() -> MemStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    MemStats {
+        created: MEM_CREATED.load(Relaxed),
+        created_bytes: MEM_CREATED_BYTES.load(Relaxed),
+        reused: MEM_REUSED.load(Relaxed),
+        held_bytes: MEM_HELD_BYTES.load(Relaxed),
+    }
+}
+
+const STORAGE_RW: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::COPY_SRC)
+    .union(wgpu::BufferUsages::COPY_DST);
+const UNIFORM_W: wgpu::BufferUsages =
+    wgpu::BufferUsages::UNIFORM.union(wgpu::BufferUsages::COPY_DST);
+
+/// Per-device buffer recycling (see [`Owned`]).
+#[derive(Default)]
+pub(crate) struct Recycler {
+    retired: Mutex<Vec<wgpu::Buffer>>,
+    free: Mutex<HashMap<(u64, u32), Vec<wgpu::Buffer>>>,
+}
+
+impl Recycler {
+    /// `b` is no longer referenced by anything not yet recorded.
+    fn retire(&self, b: wgpu::Buffer) {
+        self.retired.lock().unwrap().push(b);
+    }
+
+    /// Call only right after the pending encoder was submitted: nothing
+    /// unsubmitted can refer to a retired buffer then. Activation and uniform
+    /// buffers go to the free list, the rest (readback staging) are freed.
+    fn recycle(&self) {
+        let retired = std::mem::take(&mut *self.retired.lock().unwrap());
+        if retired.is_empty() {
+            return;
         }
-    });
+        let mut free = self.free.lock().unwrap();
+        for b in retired {
+            let u = b.usage();
+            if u == STORAGE_RW || u == UNIFORM_W {
+                free.entry((b.size(), u.bits())).or_default().push(b);
+            } else {
+                MEM_HELD_BYTES.fetch_sub(b.size() as i64, std::sync::atomic::Ordering::Relaxed);
+                b.destroy();
+            }
+        }
+    }
+
+    fn take(&self, size: u64, usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+        let b = self.free.lock().unwrap().get_mut(&(size, usage.bits()))?.pop()?;
+        MEM_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(b)
+    }
+
+    /// Free every buffer on the free list (between runs: the next one may use
+    /// other sizes).
+    fn trim(&self) {
+        for (_, v) in self.free.lock().unwrap().drain() {
+            for b in v {
+                MEM_HELD_BYTES.fetch_sub(b.size() as i64, std::sync::atomic::Ordering::Relaxed);
+                b.destroy();
+            }
+        }
+    }
 }
 
 /// VSA state for one token grid.
@@ -234,6 +279,8 @@ struct Pending {
 }
 
 pub struct Wgpu {
+    /// Free lists of dropped buffers, reused instead of reallocated.
+    recycler: Arc<Recycler>,
     /// For canvas surfaces (browser only).
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     instance: wgpu::Instance,
@@ -354,13 +401,17 @@ impl Wgpu {
             _ => 1,
         };
         let linear_variant = opts.linear.unwrap_or(4);
+        let recycler = Arc::new(Recycler::default());
         let dummy = GBuf {
-            buf: Arc::new(Owned::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("dummy"),
-                size: 16,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            }))),
+            buf: Arc::new(Owned(
+                Some(tracked(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dummy"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                }))),
+                recycler.clone(),
+            )),
             len: 4,
         };
         let prof = profile.then(|| {
@@ -383,6 +434,7 @@ impl Wgpu {
             adapter,
             device,
             queue,
+            recycler,
             attn_bk,
             flash_ok,
             flash_variant,
@@ -586,13 +638,20 @@ impl Wgpu {
         while words.len() % 4 != 0 {
             words.push(0);
         }
-        let ubuf = tracked(self.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
+        let bytes = bytemuck_cast(&words);
+        let ubuf = match self.recycler.take(bytes.len() as u64, UNIFORM_W) {
+            // Ordered before the pending encoder, which is the first to use it
+            // again (it was retired only after the last one was submitted).
+            Some(b) => {
+                self.queue.write_buffer(&b, 0, bytes);
+                b
+            }
+            None => tracked(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
-                contents: bytemuck_cast(&words),
-                usage: wgpu::BufferUsages::UNIFORM,
-            },
-        ));
+                contents: bytes,
+                usage: UNIFORM_W,
+            })),
+        };
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
             resource: ubuf.as_entire_binding(),
@@ -630,14 +689,14 @@ impl Wgpu {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, groups.2);
         }
-        retire(ubuf);
+        self.recycler.retire(ubuf);
         pend.n += 1;
         if pend.n >= self.batch {
             let enc = pend.enc.take().unwrap();
             pend.n = 0;
             drop(pend);
             self.queue.submit([enc.finish()]);
-            destroy_retired();
+            self.recycler.recycle();
         }
     }
 
@@ -675,7 +734,7 @@ impl Wgpu {
         if let Some(enc) = enc {
             self.queue.submit([enc.finish()]);
         }
-        destroy_retired();
+        self.recycler.recycle();
         #[cfg(not(target_arch = "wasm32"))]
         if let (Some(read), Some(prof)) = (readback, &self.prof) {
             let slice = read.slice(..);
@@ -778,10 +837,22 @@ fn bytemuck_cast(w: &[u32]) -> &[u8] {
 }
 
 impl Wgpu {
+    fn owned(&self, b: wgpu::Buffer) -> Arc<Owned> {
+        Arc::new(Owned(Some(tracked(b)), self.recycler.clone()))
+    }
+
+    /// Free the buffers kept for reuse (call between runs: the next one may
+    /// use other sizes).
+    pub fn trim_pool(&self) {
+        // Submitting moves everything dropped so far onto the free list.
+        self.flush();
+        self.recycler.trim();
+    }
+
     fn upload_u32(&self, data: &[u32]) -> GBuf {
         let data = if data.is_empty() { &[0u32][..] } else { data };
         GBuf {
-            buf: Arc::new(Owned::new(self.device.create_buffer_init(
+            buf: self.owned(self.device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: bytemuck::cast_slice(data),
@@ -789,7 +860,7 @@ impl Wgpu {
                         | wgpu::BufferUsages::COPY_SRC
                         | wgpu::BufferUsages::COPY_DST,
                 },
-            ))),
+            )),
             len: data.len(),
         }
     }
@@ -909,17 +980,26 @@ impl Backend for Wgpu {
     }
 
     fn alloc(&self, len: usize) -> GBuf {
+        let size = (len.max(1) * 4) as u64;
+        let b = match self.recycler.take(size, STORAGE_RW) {
+            // Zero it as `create_buffer` would, in command order: after every
+            // submitted use, before anything recorded from now on.
+            Some(b) => {
+                let mut pend = self.pending.lock().unwrap();
+                pend.enc
+                    .get_or_insert_with(|| self.device.create_command_encoder(&Default::default()))
+                    .clear_buffer(&b, 0, None);
+                b
+            }
+            None => tracked(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size,
+                usage: STORAGE_RW,
+                mapped_at_creation: false,
+            })),
+        };
         GBuf {
-            buf: Arc::new(Owned::new(self.device.create_buffer(
-                &wgpu::BufferDescriptor {
-                    label: None,
-                    size: (len.max(1) * 4) as u64,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                },
-            ))),
+            buf: Arc::new(Owned(Some(b), self.recycler.clone())),
             len,
         }
     }
@@ -933,7 +1013,7 @@ impl Backend for Wgpu {
             bytemuck::cast_slice(data)
         };
         GBuf {
-            buf: Arc::new(Owned::new(self.device.create_buffer_init(
+            buf: self.owned(self.device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: bytes,
@@ -941,7 +1021,7 @@ impl Backend for Wgpu {
                         | wgpu::BufferUsages::COPY_SRC
                         | wgpu::BufferUsages::COPY_DST,
                 },
-            ))),
+            )),
             len: data.len(),
         }
     }
@@ -1003,13 +1083,13 @@ impl Backend for Wgpu {
                 })
                 .collect();
             let buf = GBuf {
-                buf: Arc::new(Owned::new(self.device.create_buffer_init(
+                buf: self.owned(self.device.create_buffer_init(
                     &wgpu::util::BufferInitDescriptor {
                         label: None,
                         contents: bytemuck::cast_slice(&packed),
                         usage: wgpu::BufferUsages::STORAGE,
                     },
-                ))),
+                )),
                 len: packed.len(),
             };
             GWeight {
@@ -1630,7 +1710,7 @@ impl Wgpu {
         let out = f(&data);
         drop(data);
         staging.unmap();
-        retire(staging);
+        self.recycler.retire(staging);
         out
     }
 
@@ -1722,7 +1802,7 @@ impl Wgpu {
         let out = bytemuck::cast_slice::<u8, f32>(&data)[..buf.len].to_vec();
         drop(data);
         staging.unmap();
-        retire(staging);
+        self.recycler.retire(staging);
         out
     }
 }
@@ -1765,7 +1845,7 @@ impl Readback {
         let out = bytemuck::cast_slice::<u8, f32>(&data)[..self.len].to_vec();
         drop(data);
         self.staging.unmap();
-        retire(self.staging);
+        be.recycler.retire(self.staging);
         Ok(out)
     }
 }
