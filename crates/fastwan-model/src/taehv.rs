@@ -83,6 +83,7 @@ impl<B: Backend> Chunk<B> {
             h: self.h,
             w: self.w,
             p: self.p,
+            down: 1,
         };
         let out = be.alloc_words(s.pixels());
         be.pack_rgba8(&self.rgb, None, &s, &out);

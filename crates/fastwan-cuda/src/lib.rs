@@ -108,6 +108,7 @@ struct Kernels {
     dmd_step: CudaFunction,
     tanh_clamp: CudaFunction,
     pack_rgba8: CudaFunction,
+    unpack_rgba8: CudaFunction,
     patch: CudaFunction,
     conv2d: CudaFunction,
     conv2d_mma: CudaFunction,
@@ -281,6 +282,7 @@ impl Cuda {
             dmd_step: get("fw_dmd_step")?,
             tanh_clamp: get("fw_tanh_clamp")?,
             pack_rgba8: get("fw_pack_rgba8")?,
+            unpack_rgba8: get("fw_unpack_rgba8")?,
             patch: get("fw_patch")?,
             conv2d: get("fw_conv2d")?,
             conv2d_mma: get("fw_conv2d_mma")?,
@@ -1178,6 +1180,26 @@ impl Backend for Cuda {
                 Arg::I(s.w as i32),
                 Arg::I(s.p as i32),
                 Arg::I(base.is_some() as i32),
+                Arg::I(s.down as i32),
+            ],
+        );
+    }
+
+    fn unpack_rgba8(&self, src: &CuBuf, frames: usize, plane: usize, out: &CuBuf) {
+        let n = frames * 3 * plane;
+        assert!(
+            src.f32 && src.len >= frames * plane && !out.f32 && out.len >= n,
+            "unpack_rgba8: src from alloc_words / upload_words, out an activation"
+        );
+        self.launch(
+            &self.f.unpack_rgba8,
+            Self::elems(n),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(src)),
+                Arg::P(self.ptr(out)),
+                Arg::L(n as i64),
+                Arg::L(plane as i64),
             ],
         );
     }

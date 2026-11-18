@@ -668,8 +668,8 @@ impl Backend for Cpu {
     }
 
     fn pack_rgba8(&self, src: &CpuBuf, base: Option<&CpuBuf>, s: &PackShape, out: &CpuBuf) {
-        let (h, w, p) = (s.h, s.w, s.p);
-        let (oh, ow) = (h * p, w * p);
+        let (h, w, p, d) = (s.h, s.w, s.p, s.down);
+        let (oh, ow) = s.out_hw();
         let src = src.r();
         let base = base.map(|b| b.r());
         let mut o = out.w();
@@ -677,20 +677,43 @@ impl Backend for Cpu {
             .par_chunks_mut(ow)
             .enumerate()
             .for_each(|(row, line)| {
-                let (f, y) = (row / oh + s.skip, row % oh);
-                let (sy, iy) = (y / p, y % p);
-                for (x, px) in line.iter_mut().enumerate() {
-                    let (sx, ix) = (x / p, x % p);
-                    let v = |c: usize| {
-                        let k = c * p * p + iy * p + ix;
+                let (f, oy) = (row / oh + s.skip, row % oh);
+                for (ox, px) in line.iter_mut().enumerate() {
+                    // One shuffled-image sample, residual added and clamped.
+                    let v = |c: usize, y: usize, x: usize| {
+                        let (sy, sx) = (y / p, x / p);
+                        let k = c * p * p + (y % p) * p + x % p;
                         let mut v = src[((f * 3 * p * p + k) * h + sy) * w + sx];
                         if let Some(b) = &base {
                             let word = b[(f * h + sy) * w + sx].to_bits();
                             v += ((word >> (8 * c)) & 0xff) as f32 / 255.0;
                         }
-                        v
+                        v.clamp(0.0, 1.0)
                     };
-                    *px = f32::from_bits(pack_pixel(v(0), v(1), v(2)));
+                    let avg = |c: usize| {
+                        let mut a = 0.0;
+                        for dy in 0..d {
+                            for dx in 0..d {
+                                a += v(c, oy * d + dy, ox * d + dx);
+                            }
+                        }
+                        a / (d * d) as f32
+                    };
+                    *px = f32::from_bits(pack_pixel(avg(0), avg(1), avg(2)));
+                }
+            });
+    }
+
+    fn unpack_rgba8(&self, src: &CpuBuf, frames: usize, plane: usize, out: &CpuBuf) {
+        let src = src.r();
+        let mut o = out.w();
+        o[..frames * 3 * plane]
+            .par_chunks_mut(plane)
+            .enumerate()
+            .for_each(|(fc, line)| {
+                let (f, c) = (fc / 3, fc % 3);
+                for (p, v) in line.iter_mut().enumerate() {
+                    *v = ((src[f * plane + p].to_bits() >> (8 * c)) & 0xff) as f32 / 255.0;
                 }
             });
     }

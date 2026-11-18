@@ -38,6 +38,7 @@ const NORM: &str = include_str!("shaders/norm.wgsl");
 const HEADS: &str = include_str!("shaders/head_split.wgsl");
 const ELEM: &str = include_str!("shaders/elementwise.wgsl");
 const PACK: &str = include_str!("shaders/pack.wgsl");
+const UNPACK: &str = include_str!("shaders/unpack.wgsl");
 const KV: &str = include_str!("shaders/kv.wgsl");
 const FLASH: &str = include_str!("shaders/flash.wgsl");
 const FLASH3: &str = include_str!("shaders/flash3.wgsl");
@@ -169,7 +170,12 @@ impl Recycler {
     }
 
     fn take(&self, size: u64, usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
-        let b = self.free.lock().unwrap().get_mut(&(size, usage.bits()))?.pop()?;
+        let b = self
+            .free
+            .lock()
+            .unwrap()
+            .get_mut(&(size, usage.bits()))?
+            .pop()?;
         MEM_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(b)
     }
@@ -646,11 +652,14 @@ impl Wgpu {
                 self.queue.write_buffer(&b, 0, bytes);
                 b
             }
-            None => tracked(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytes,
-                usage: UNIFORM_W,
-            })),
+            None => tracked(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytes,
+                        usage: UNIFORM_W,
+                    }),
+            ),
         };
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
@@ -852,15 +861,16 @@ impl Wgpu {
     fn upload_u32(&self, data: &[u32]) -> GBuf {
         let data = if data.is_empty() { &[0u32][..] } else { data };
         GBuf {
-            buf: self.owned(self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(data),
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::COPY_DST,
-                },
-            )),
+            buf: self.owned(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(data),
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_SRC
+                            | wgpu::BufferUsages::COPY_DST,
+                    }),
+            ),
             len: data.len(),
         }
     }
@@ -975,7 +985,13 @@ impl Backend for Wgpu {
             } else {
                 format!(" {}", self.info.driver_info)
             },
-            if !self.f16 { "" } else if self.f16_linear { " +f16" } else { " attn+f16" }
+            if !self.f16 {
+                ""
+            } else if self.f16_linear {
+                " +f16"
+            } else {
+                " attn+f16"
+            }
         )
     }
 
@@ -1013,15 +1029,16 @@ impl Backend for Wgpu {
             bytemuck::cast_slice(data)
         };
         GBuf {
-            buf: self.owned(self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytes,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::COPY_DST,
-                },
-            )),
+            buf: self.owned(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytes,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_SRC
+                            | wgpu::BufferUsages::COPY_DST,
+                    }),
+            ),
             len: data.len(),
         }
     }
@@ -1655,11 +1672,28 @@ impl Backend for Wgpu {
             s.w as u32,
             s.p as u32,
             base.is_some() as u32,
+            s.down as u32,
+            0,
         ];
         self.dispatch(
             &pipe,
             &p,
             &[out, src, base.unwrap_or(&self.dummy)],
+            Self::grid(n.div_ceil(256)),
+        );
+    }
+
+    fn unpack_rgba8(&self, src: &GBuf, frames: usize, plane: usize, out: &GBuf) {
+        let n = frames * 3 * plane;
+        assert!(
+            src.len >= frames * plane && out.len >= n,
+            "unpack_rgba8: sizes"
+        );
+        let pipe = self.pipeline("unpack", || UNPACK.to_string());
+        self.dispatch(
+            &pipe,
+            &[n as u32, plane as u32, 0, 0],
+            &[out, src],
             Self::grid(n.div_ceil(256)),
         );
     }
