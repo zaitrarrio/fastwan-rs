@@ -185,6 +185,7 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     upscaler(&mut p);
     causal(&mut p);
     pack(&mut p, &mut rng);
+    unpack(&mut p, &mut rng);
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
     model_vsa(
@@ -215,6 +216,7 @@ pub fn ops_deferred<B: Backend>(be: &B, tol: f32) -> Deferred<B> {
     ops(&mut p, &mut rng);
     vsa_real(&mut p, &mut rng);
     pack(&mut p, &mut rng);
+    unpack(&mut p, &mut rng);
     Deferred {
         done: p.out,
         pending: p.pending,
@@ -859,6 +861,35 @@ fn model<B: Backend>(p: &mut Pair<'_, B>) {
     p.record("tiny TAEHV decode (frames)", gf, cf);
 }
 
+/// `unpack_rgba8` (8-bit RGBA words → planar RGB in [0, 1], the upscaler's
+/// input): exact up to the backend's activation precision.
+fn unpack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
+    let (be, cpu) = (p.be, &Cpu);
+    let (frames, plane) = (3, 7 * 11);
+    let words: Vec<u32> = rng
+        .uniform(frames * plane * 3, 1.0)
+        .chunks_exact(3)
+        .map(|c| {
+            let q = |v: f32| ((v + 1.0) * 127.5) as u32;
+            q(c[0]) | q(c[1]) << 8 | q(c[2]) << 16 | 0xff00_0000
+        })
+        .collect();
+    let (gs, cs) = (be.upload_words(&words), cpu.upload_words(&words));
+    let (go, co) = (be.alloc(frames * 3 * plane), cpu.alloc(frames * 3 * plane));
+    be.unpack_rgba8(&gs, frames, plane, &go);
+    cpu.unpack_rgba8(&cs, frames, plane, &co);
+    p.record("unpack_rgba8 3 frames", p.dl(go), cpu.download(&co));
+    // A frame range of packed words copied out (the upscaler's batches).
+    let (gw, cw) = (be.alloc_words(2 * plane), cpu.alloc_words(2 * plane));
+    be.copy(&gs, plane, &gw, 0, 2 * plane);
+    cpu.copy(&cs, plane, &cw, 0, 2 * plane);
+    p.record_rgba8(
+        "copy of packed words (frames 1..3)",
+        p.dl(gw),
+        cpu.download(&cw),
+    );
+}
+
 /// `pack_rgba8` (decoder / upscaler output → 8-bit RGBA), with and without
 /// the residual, values straddling [0, 1]; compared as 8-bit levels.
 fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
@@ -872,6 +903,7 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
                 h: 5,
                 w: 7,
                 p: 2,
+                down: 1,
             },
             false,
         ),
@@ -882,6 +914,18 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
                 h: 6,
                 w: 9,
                 p: 4,
+                down: 1,
+            },
+            true,
+        ),
+        (
+            PackShape {
+                frames: 2,
+                skip: 1,
+                h: 5,
+                w: 6,
+                p: 4,
+                down: 2,
             },
             true,
         ),
@@ -914,8 +958,8 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         cpu.pack_rgba8(&cs, with_base.then_some(&cb), &s, &co);
         p.record_rgba8(
             format!(
-                "pack_rgba8 p{} skip {} base {with_base} (≤1 level)",
-                s.p, s.skip
+                "pack_rgba8 p{} down {} skip {} base {with_base} (≤1 level)",
+                s.p, s.down, s.skip
             ),
             p.dl(go),
             cpu.download(&co),
@@ -994,6 +1038,17 @@ fn upscaler<B: Backend>(p: &mut Pair<'_, B>) {
     // `conv2d … ep=3` case at f32 precision).
     p.record_rgba8(
         "tiny upscaler, packed RGBA (≤1 level)",
+        be.download(&gc.out),
+        cpu.download(&cc.out),
+    );
+    // Output scale below the network's: the box filter in pack_rgba8.
+    let (mut g, mut c) = (g, c);
+    g.set_output_scale(1).expect("÷2");
+    c.set_output_scale(1).expect("÷2");
+    let gc = g.launch(be, &rgb, frames, h, w);
+    let cc = c.launch(cpu, &rgb, frames, h, w);
+    p.record_rgba8(
+        "tiny upscaler box-filtered to ×1, packed RGBA (≤1 level)",
         be.download(&gc.out),
         cpu.download(&cc.out),
     );

@@ -43,7 +43,10 @@ pub enum ConvEpilogue<'a, T> {
 
 /// [`Backend::pack_rgba8`]: `src` is `[skip + frames, 3·p², h, w]` (a
 /// pixel-shuffled RGB map, as TAEHV and the upscaler end); the output is
-/// `frames` images of `h·p × w·p` packed pixels.
+/// `frames` images of `h·p/down × w·p/down` packed pixels. `down` (1, or a
+/// divisor of `p`) averages each `down × down` block of the shuffled image
+/// after the residual and clamp, before rounding: the ×2 upscale is the ×4
+/// network followed by a 2×2 box filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackShape {
     /// Frames written (the first `skip` source frames are dropped).
@@ -52,11 +55,23 @@ pub struct PackShape {
     pub h: usize,
     pub w: usize,
     pub p: usize,
+    pub down: usize,
 }
 
 impl PackShape {
+    /// Output image height and width.
+    pub fn out_hw(&self) -> (usize, usize) {
+        assert!(
+            self.down >= 1 && self.p % self.down == 0,
+            "pack down {} must divide p {}",
+            self.down,
+            self.p
+        );
+        (self.h * self.p / self.down, self.w * self.p / self.down)
+    }
     pub fn pixels(&self) -> usize {
-        self.frames * self.h * self.p * self.w * self.p
+        let (oh, ow) = self.out_hw();
+        self.frames * oh * ow
     }
 }
 
@@ -468,4 +483,9 @@ pub trait Backend {
     /// `byte / 255` exactly (bf16 activations would lose a level near 1).
     /// Frames leave the device at 4 bytes per pixel, ready to show.
     fn pack_rgba8(&self, src: &Self::Buf, base: Option<&Self::Buf>, s: &PackShape, out: &Self::Buf);
+    /// The inverse layout step: 8-bit RGBA words `[frames, plane]` (from
+    /// [`Backend::upload_words`] or [`Backend::pack_rgba8`]) to planar RGB
+    /// `[frames, 3, plane]` as `byte / 255`, the upscaler's input. Decoded
+    /// frames go straight into the upscaler without a host pass.
+    fn unpack_rgba8(&self, src: &Self::Buf, frames: usize, plane: usize, out: &Self::Buf);
 }

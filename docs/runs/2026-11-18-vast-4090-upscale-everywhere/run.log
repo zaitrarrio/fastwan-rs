@@ -1,0 +1,176 @@
+=== run 1: instance 61268316 (Netherlands, driver 595.99.02, 450 W)
+NVIDIA GeForce RTX 4090, 595.99.02, 450.00 W
+--- check cuda
+cuda NVIDIA GeForce RTX 4090 (sm_89)
+vsa (5, 6, 9) h2 d128 topk 3/12                  rel 2.93e-1  FAIL
+vsa (21, 17, 30) h2 d128 topk 48/240 (model grid) rel 2.83e-1  FAIL
+vsa (21, 30, 52) h1 d128 topk 125/624 (model grid) rel 2.80e-1  FAIL
+tiny upscaler, packed RGBA (≤1 level)            rel 3.92e-3  ok
+tiny upscaler box-filtered to ×1, packed RGBA (≤1 level) rel 3.92e-3  ok
+pack_rgba8 p2 down 1 skip 1 base false (≤1 level) rel 3.92e-3  ok
+pack_rgba8 p4 down 1 skip 0 base true (≤1 level) rel 3.92e-3  ok
+pack_rgba8 p4 down 2 skip 1 base true (≤1 level) rel 3.92e-3  ok
+unpack_rgba8 3 frames                            rel 1.95e-3  ok
+Error: 3 of 65 checks failed (tolerance 3e-2)
+--- check wgpu
+wgpu Vulkan: NVIDIA GeForce RTX 4090 (NVIDIA 595.99.02)
+tiny upscaler, packed RGBA (≤1 level)            rel 3.92e-3  ok
+tiny upscaler box-filtered to ×1, packed RGBA (≤1 level) rel 0.00e0  ok
+pack_rgba8 p2 down 1 skip 1 base false (≤1 level) rel 0.00e0  ok
+pack_rgba8 p4 down 1 skip 0 base true (≤1 level) rel 0.00e0  ok
+pack_rgba8 p4 down 2 skip 1 base true (≤1 level) rel 0.00e0  ok
+unpack_rgba8 3 frames                            rel 5.98e-8  ok
+all 65 checks pass (tolerance 2e-3)
+--- clip-832
+run 0: total 3.97s  prompt 0.26s  denoise 3.26s (["1.09", "1.09", "1.09"])  decode 0.40s
+--- clip-832-x4
+run 0: total 3.97s  prompt 0.26s  denoise 3.26s (["1.08", "1.09", "1.09"])  decode 0.39s
+thread 'main' (10930) panicked at crates/fastwan-cuda/src/lib.rs:560:9:
+--- clip-832-x2
+run 0: total 3.97s  prompt 0.26s  denoise 3.27s (["1.09", "1.09", "1.09"])  decode 0.39s
+thread 'main' (11165) panicked at crates/fastwan-cuda/src/lib.rs:560:9:
+[in#0 @ 0x619688ab9380] Error opening input: No such file or directory
+Error opening input file /w/clip-832-x2.y4m.
+Error opening input files: No such file or directory
+[in#0 @ 0x64cb02e29380] Error opening input: No such file or directory
+Error opening input file /w/clip-832-x4.y4m.
+Error opening input files: No such file or directory
+--- long-cuda-832
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3), timesteps [1000.0, 937.5, 833.3333, 625.0]
+block 0: denoise 0.60s  decode 0.14s  9 frames (9 total, 9.3 fps so far)
+block 1: denoise 0.71s  decode 0.17s  12 frames (21 total, 11.4 fps so far)
+block 5: denoise 0.92s  decode 0.21s  12 frames (69 total, 11.0 fps so far)
+block 10: denoise 0.92s  decode 0.21s  12 frames (129 total, 10.8 fps so far)
+causal: 165 frames in 15.33s (10.8 fps, first frames at 0.97s)
+197684246 bytes
+--- long-cuda-832-x2
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3), timesteps [1000.0, 937.5, 833.3333, 625.0]
+thread 'main' (11844) panicked at crates/fastwan-cuda/src/lib.rs:560:9:
+ls: cannot access '/w/long-cuda-832-x2.y4m': No such file or directory
+--- long-cuda-832-x4
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3), timesteps [1000.0, 937.5, 833.3333, 625.0]
+thread 'main' (11882) panicked at crates/fastwan-cuda/src/lib.rs:560:9:
+ls: cannot access '/w/long-cuda-832-x4.y4m': No such file or directory
+--- long-wgpu-480-x2
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3), timesteps [1000.0, 937.5, 833.3333, 625.0]
+block 0: denoise 1.24s  decode 0.08s  upscale 1.67s  9 frames (9 total, 2.6 fps so far)
+block 1: denoise 0.07s  decode 0.10s  upscale 2.01s  12 frames (21 total, 3.7 fps so far)
+block 5: denoise 0.07s  decode 0.10s  upscale 2.27s  12 frames (69 total, 4.5 fps so far)
+block 10: denoise 0.07s  decode 0.11s  upscale 2.25s  12 frames (129 total, 4.7 fps so far)
+causal: 165 frames in 34.68s (4.8 fps, first frames at 3.45s)
+258509846 bytes
+playwright ok
+--- chrome f16-832x480-81-x4
+load: Model ready in 229.2 s.
+hint: (832×480 → 3328×1920, as it plays; Real-ESRGAN compact video model, 2.5 MB)
+f16-832x480-81-x4: generated in 20.7s | 81 frames · 832×480 · seed 7 · prompt 0.3 s · denoise 15.7 s · decode 2.8 s · total 20.7 s · shown ×4 (3328×1920, 66 ms/frame) | err: 
+f16-832x480-81-x4 playback: 6.2 fps over 10 s (frames 0->62); upscaled 174 frames in that time (49 ms/frame); total 210 frames at 52 ms/frame; batch 4/8, kept 29 of 81, canvas 3328x1920
+--- chrome f16-832x480-81-x2
+load: Model ready in 136.7 s.
+hint: (832×480 → 1664×960, as it plays; Real-ESRGAN compact video model, 2.5 MB)
+f16-832x480-81-x2: generated in 20.7s | 81 frames · 832×480 · seed 7 · prompt 0.4 s · denoise 15.5 s · decode 2.6 s · total 20.7 s · shown ×2 (1664×960, 63 ms/frame) | err: 
+f16-832x480-81-x2 playback: 6.3 fps over 10 s (frames 0->63); upscaled 75 frames in that time (48 ms/frame); total 111 frames at 53 ms/frame; batch 4/8, kept 81 of 81, canvas 1664x960
+--- chrome f16-480x272-81-x4
+load: Model ready in 161.9 s.
+hint: (480×272 → 1920×1088, as it plays; Real-ESRGAN compact video model, 2.5 MB)
+f16-480x272-81-x4: generated in 7.2s | 81 frames · 480×272 · seed 7 · prompt 0.4 s · denoise 4.0 s · decode 1.2 s · total 7.2 s · shown ×4 (1920×1088, 18 ms/frame) | err: 
+f16-480x272-81-x4 playback: 6.4 fps over 10 s (frames 0->64); upscaled 33 frames in that time (20 ms/frame); total 88 frames at 19 ms/frame; batch 8/8, kept 81 of 81, canvas 1920x1088
+--- chrome sf16-480x272-321-x2
+load: Model ready in 187.2 s.
+hint: (480×272 → 960×544, as it plays; Real-ESRGAN compact video model, 2.5 MB)
+sf16-480x272-321-x2: generated in 37.3s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 3.1 s · total 37.2 s · shown ×2 (960×544, 2623 ms/frame) | err: 
+sf16-480x272-321-x2 block s: 1.5 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+sf16-480x272-321-x2 playback: 14.5 fps over 10 s (frames 0->145); upscaled 318 frames in that time (16 ms/frame); total 331 frames at 118 ms/frame; batch 8/8, kept 321 of 321, canvas 960x544
+--- chrome sf16-480x272-321-x4
+load: Model ready in 205.1 s.
+hint: (480×272 → 1920×1088, as it plays; Real-ESRGAN compact video model, 2.5 MB)
+sf16-480x272-321-x4: generated in 37.1s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.9 s · total 37.1 s · shown ×4 (1920×1088, 2624 ms/frame) | err: 
+sf16-480x272-321-x4 block s: 1.3 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+sf16-480x272-321-x4 playback: 14.7 fps over 10 s (frames 0->147); upscaled 236 frames in that time (26 ms/frame); total 249 frames at 161 ms/frame; batch 8/8, kept 91 of 321, canvas 1920x1088
+--- chrome sf16-640x352-321-x2
+load: Model ready in 134.7 s.
+hint: (640×352 → 1280×704, as it plays; Real-ESRGAN compact video model, 2.5 MB)
+sf16-640x352-321-x2: generated in 61.0s | 321 frames (20.1 s) · 640×352 · seed 7 · 27 blocks · first frames 3.4 s · total 60.9 s · shown ×2 (1280×704, 4430 ms/frame) | err: 
+sf16-640x352-321-x2 block s: 1.8 1.7 2.0 2.3 2.2 2.2 2.2 2.3 2.2 2.3 2.2 2.3 2.2 2.3 2.2 2.3 2.2 2.3 2.2 2.3 2.2 2.3 2.2 2.3 2.3 2.2 2.2
+sf16-640x352-321-x2 playback: 14.6 fps over 10 s (frames 0->146); upscaled 357 frames in that time (26 ms/frame); total 370 frames at 181 ms/frame; batch 8/8, kept 217 of 321, canvas 1280x704
+uploaded
+exit 0
+
+
+=== run 2: instance 61275108 (Japan, driver 615.71.09, 450 W)
+NVIDIA GeForce RTX 4090, 615.71.09, 450.00 W
+--- check cuda
+cuda NVIDIA GeForce RTX 4090 (sm_89)
+vsa (5, 6, 9) h2 d128 topk 3/12                  rel 2.93e-1  FAIL
+vsa (21, 17, 30) h2 d128 topk 48/240 (model grid) rel 2.83e-1  FAIL
+vsa (21, 30, 52) h1 d128 topk 125/624 (model grid) rel 2.80e-1  FAIL
+tiny upscaler, packed RGBA (≤1 level)            rel 3.92e-3  ok
+tiny upscaler box-filtered to ×1, packed RGBA (≤1 level) rel 3.92e-3  ok
+pack_rgba8 p2 down 1 skip 1 base false (≤1 level) rel 3.92e-3  ok
+pack_rgba8 p4 down 1 skip 0 base true (≤1 level) rel 3.92e-3  ok
+pack_rgba8 p4 down 2 skip 1 base true (≤1 level) rel 3.92e-3  ok
+unpack_rgba8 3 frames                            rel 1.95e-3  ok
+copy of packed words (frames 1..3)               rel 0.00e0  ok
+Error: 3 of 66 checks failed (tolerance 3e-2)
+--- clip-832-x4
+run 0: total 3.84s  prompt 0.17s  denoise 3.29s (["1.09", "1.10", "1.10"])  decode 0.35s
+upscale x4 2.99s (832x480 -> 3328x1920)
+--- clip-832-x2
+run 0: total 3.83s  prompt 0.17s  denoise 3.28s (["1.09", "1.10", "1.10"])  decode 0.35s
+upscale x2 1.39s (832x480 -> 1664x960)
+--- long-cuda-832-x2
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3), timesteps [1000.0, 937.5, 833.3333, 625.0]
+block 0: denoise 0.58s  decode 0.15s  upscale 0.23s  9 frames (9 total, 8.0 fps so far)
+block 1: denoise 0.72s  decode 0.20s  upscale 0.30s  12 frames (21 total, 8.9 fps so far)
+block 5: denoise 0.96s  decode 0.20s  upscale 0.33s  12 frames (69 total, 8.5 fps so far)
+block 10: denoise 0.96s  decode 0.19s  upscale 0.33s  12 frames (129 total, 8.3 fps so far)
+causal: 165 frames in 20.04s (8.2 fps, first frames at 1.12s)
+790733847 bytes
+--- long-cuda-832-x4
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3), timesteps [1000.0, 937.5, 833.3333, 625.0]
+block 0: denoise 0.59s  decode 0.60s  upscale 0.39s  9 frames (9 total, 5.2 fps so far)
+block 1: denoise 0.73s  decode 0.80s  upscale 0.52s  12 frames (21 total, 5.5 fps so far)
+block 5: denoise 0.96s  decode 0.79s  upscale 0.57s  12 frames (69 total, 5.3 fps so far)
+block 10: denoise 0.96s  decode 0.80s  upscale 0.58s  12 frames (129 total, 5.2 fps so far)
+causal: 165 frames in 31.84s (5.2 fps, first frames at 1.74s)
+3162932248 bytes
+playwright ok
+--- chrome f16-480x272-81-x0
+--- chrome f16-480x272-81-x4
+--- chrome sf16-480x272-321-x0
+--- chrome sf16-480x272-321-x4
+load: Model ready in 68.8 s.
+hint: (480×272 → 1920×1088, as it plays; Real-ESRGAN compact video model, 2.5 MB)
+sf16-480x272-321-x4: generated in 37.1s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.6 s · total 37.1 s · shown ×4 (1920×1088, 2651 ms/frame) | err: 
+sf16-480x272-321-x4 block s: 1.6 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+sf16-480x272-321-x4 playback: 14.9 fps over 10 s (frames 0->149); upscaled 238 frames in that time (22 ms/frame); total 251 frames at 159 ms/frame; batch 8/8, kept 91 of 321, canvas 1920x1088
+sf16-480x272-321-x4 upStats: {"ticks":599,"waits":1,"draws":149,"drawMs":163.89999997615814,"maxDrawMs":2.100000023841858,"shownUp":149,"shownLow":1,"pumpMs":131.39999961853027,"pumpCalls":142}
+sf16-480x272-321-x4 shown: frame 149: upscaled 1920x1088 (canvas-up hidden=false), box-filtered vs low-res mean |d| 4.77
+--- chrome f16-832x480-81-x2
+load: Model ready in 30.0 s.
+hint: (832×480 → 1664×960, as it plays; Real-ESRGAN compact video model, 2.5 MB)
+f16-832x480-81-x2: generated in 21.3s | 81 frames · 832×480 · seed 7 · prompt 0.3 s · denoise 17.5 s · decode 2.5 s · total 21.3 s · shown ×2 (1664×960, 63 ms/frame) | err: 
+f16-832x480-81-x2 playback: 6.4 fps over 10 s (frames 0->64); upscaled 75 frames in that time (43 ms/frame); total 112 frames at 49 ms/frame; batch 4/8, kept 81 of 81, canvas 1664x960
+f16-832x480-81-x2 upStats: {"ticks":601,"waits":5,"draws":145,"drawMs":77.70000076293945,"maxDrawMs":1,"shownUp":147,"shownLow":1,"pumpMs":56.99999952316284,"pumpCalls":20}
+f16-832x480-81-x2 shown: frame 64: upscaled 1664x960 (canvas-up hidden=false), box-filtered vs low-res mean |d| 3.29
+NVIDIA GeForce RTX 4090, 615.71.09
+model name	: Intel(R) Core(TM) i9-10900KF CPU @ 3.70GHz
+--- chrome long old
+load: Model ready in 76.0 s. | sizes ['480x272', '640x352']
+old: 36.5s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.2 s · total 36.4 s
+old block s: 1.4 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+--- chrome long plain
+load: Model ready in 64.7 s. | sizes ['480x272', '640x352']
+plain: 36.3s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.1 s · total 36.2 s
+plain block s: 1.3 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+--- chrome long old2
+load: Model ready in 67.9 s. | sizes ['480x272', '640x352']
+old2: 36.6s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.2 s · total 36.5 s
+old2 block s: 1.3 1.5 1.0 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+--- chrome long plain2
+load: Model ready in 71.3 s. | sizes ['480x272', '640x352']
+plain2: 36.3s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.1 s · total 36.3 s
+plain2 block s: 1.3 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+uploaded
+exit 0
+

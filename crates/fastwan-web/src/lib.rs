@@ -47,9 +47,10 @@ mod web {
         tae: RefCell<Option<TaeHv<Wgpu>>>,
         up: RefCell<Option<Upscaler<Wgpu>>>,
         /// The canvas upscaled frames are drawn on, and the frames kept on
-        /// the GPU: (packed buffer, frames in it), one entry per batch.
+        /// the GPU, one entry per batch: the page keeps a window of them
+        /// around the playhead (`upscaleFrames` / `dropUpscaled`).
         view: RefCell<Option<fastwan_wgpu::CanvasView>>,
-        kept: RefCell<Vec<(fastwan_wgpu::GBuf, usize)>>,
+        kept: RefCell<Vec<Kept>>,
         kept_dims: std::cell::Cell<(u32, u32)>,
         /// Lower-memory settings for phones (see `create_engine`).
         mobile: bool,
@@ -60,6 +61,13 @@ mod web {
         /// Long videos keep the K/V cache as 16-bit values (half its memory);
         /// on by default on phones.
         half_kv: std::cell::Cell<bool>,
+    }
+
+    /// A batch of upscaled frames on the GPU: frames `first..first + n`.
+    struct Kept {
+        buf: fastwan_wgpu::GBuf,
+        first: usize,
+        n: usize,
     }
 
     #[wasm_bindgen]
@@ -238,45 +246,93 @@ mod web {
             Ok(())
         }
 
-        /// Upscale `frames` RGB frames and keep the result on the GPU (no
-        /// readback); resolves to the number of frames kept so far, once this
-        /// batch has finished. Show them with `showUpscaled`.
-        #[wasm_bindgen(js_name = upscaleKeep)]
-        pub fn upscale_keep(
+        /// The upscaler's output scale: 4 (the network's), or 2 (the ×4
+        /// network, then a 2×2 box filter on the GPU). Returns the scale.
+        #[wasm_bindgen(js_name = setUpscale)]
+        pub fn set_upscale(&self, x: usize) -> Result<usize, JsValue> {
+            let mut up = self.inner.up.borrow_mut();
+            let up = up
+                .as_mut()
+                .ok_or_else(|| err("the upscaler is not loaded"))?;
+            up.set_output_scale(x).map_err(err)?;
+            Ok(up.output_scale())
+        }
+
+        /// Upscale frames `first..first + frames` given as RGBA bytes
+        /// (`[frames, h, w, 4]`, as decoded) and keep them on the GPU (no
+        /// readback); resolves once the batch is done. Show them with
+        /// `showUpscaled`, free them with `dropUpscaled`.
+        #[wasm_bindgen(js_name = upscaleFrames)]
+        pub fn upscale_frames(
             &self,
-            rgb: Vec<u8>,
+            rgba: Vec<u8>,
+            first: usize,
             frames: usize,
             h: usize,
             w: usize,
         ) -> js_sys::Promise {
             let inner = self.inner.clone();
             wasm_bindgen_futures::future_to_promise(async move {
+                if rgba.len() != frames * h * w * 4 {
+                    return Err(err("rgba is not frames × h × w × 4"));
+                }
+                let words: Vec<u32> = rgba
+                    .chunks_exact(4)
+                    .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+                    .collect();
+                let base = inner.be.upload_words(&words);
                 let chunk = {
                     let up = inner.up.borrow();
                     let up = up
                         .as_ref()
                         .ok_or_else(|| err("the upscaler is not loaded"))?;
-                    if rgb.len() != frames * h * w * 3 {
-                        return Err(err("rgb is not frames × h × w × 3"));
-                    }
-                    up.launch(&inner.be, &rgb, frames, h, w)
+                    up.launch_words(&inner.be, &base, frames, h, w)
                 };
                 let s = chunk.scale as u32;
                 // Wait for the batch: progress for the page, and the
-                // intermediates may only be dropped (destroyed) after it.
+                // intermediates may only be dropped after it.
                 let fence = inner.be.alloc(1);
                 inner.be.try_download_async(&fence).await.map_err(err)?;
+                drop(base);
                 let mut kept = inner.kept.borrow_mut();
-                kept.push((chunk.into_out(), frames));
+                kept.retain(|k| k.first + k.n <= first || k.first >= first + frames);
+                kept.push(Kept {
+                    buf: chunk.into_out(),
+                    first,
+                    n: frames,
+                });
                 inner.kept_dims.set((w as u32 * s, h as u32 * s));
-                Ok(JsValue::from(kept.iter().map(|k| k.1).sum::<usize>() as u32))
+                Ok(JsValue::from(kept.iter().map(|k| k.n).sum::<usize>() as u32))
             })
+        }
+
+        /// Whether frame `i` is upscaled and kept on the GPU.
+        #[wasm_bindgen(js_name = isUpscaled)]
+        pub fn is_upscaled(&self, i: usize) -> bool {
+            self.locate(i).is_some()
+        }
+
+        /// The kept batches as `[first, n, first, n, …]`.
+        #[wasm_bindgen(js_name = upscaledRanges)]
+        pub fn upscaled_ranges(&self) -> Vec<u32> {
+            self.inner
+                .kept
+                .borrow()
+                .iter()
+                .flat_map(|k| [k.first as u32, k.n as u32])
+                .collect()
+        }
+
+        /// Free the kept batch that starts at frame `first`.
+        #[wasm_bindgen(js_name = dropUpscaled)]
+        pub fn drop_upscaled(&self, first: usize) {
+            self.inner.kept.borrow_mut().retain(|k| k.first != first);
         }
 
         /// Upscaled frames kept on the GPU.
         #[wasm_bindgen(js_name = upscaledCount)]
         pub fn upscaled_count(&self) -> usize {
-            self.inner.kept.borrow().iter().map(|k| k.1).sum()
+            self.inner.kept.borrow().iter().map(|k| k.n).sum()
         }
 
         /// Free the kept upscaled frames.
@@ -952,14 +1008,12 @@ mod web {
     impl Engine {
         fn locate(&self, i: usize) -> Option<(fastwan_wgpu::GBuf, usize)> {
             let (w, h) = self.inner.kept_dims.get();
-            let mut i = i;
-            for (buf, n) in self.inner.kept.borrow().iter() {
-                if i < *n {
-                    return Some((buf.clone(), i * (w * h) as usize));
-                }
-                i -= n;
-            }
-            None
+            self.inner
+                .kept
+                .borrow()
+                .iter()
+                .find(|k| (k.first..k.first + k.n).contains(&i))
+                .map(|k| (k.buf.clone(), (i - k.first) * (w * h) as usize))
         }
     }
 
