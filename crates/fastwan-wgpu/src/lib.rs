@@ -73,8 +73,32 @@ pub(crate) struct Owned(Option<wgpu::Buffer>);
 
 impl Owned {
     fn new(b: wgpu::Buffer) -> Self {
-        Self(Some(b))
+        Self(Some(tracked(b)))
     }
+}
+
+/// Buffer accounting for diagnosing allocation churn: buffers created, bytes
+/// created, bytes still live (created and not yet released by us).
+static MEM_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEM_CREATED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEM_LIVE_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn tracked(b: wgpu::Buffer) -> wgpu::Buffer {
+    use std::sync::atomic::Ordering::Relaxed;
+    MEM_CREATED.fetch_add(1, Relaxed);
+    MEM_CREATED_BYTES.fetch_add(b.size(), Relaxed);
+    MEM_LIVE_BYTES.fetch_add(b.size() as i64, Relaxed);
+    b
+}
+
+/// (buffers created, bytes created, bytes live) since start.
+pub fn mem_stats() -> (u64, u64, i64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        MEM_CREATED.load(Relaxed),
+        MEM_CREATED_BYTES.load(Relaxed),
+        MEM_LIVE_BYTES.load(Relaxed),
+    )
 }
 
 impl std::ops::Deref for Owned {
@@ -99,6 +123,7 @@ thread_local! {
 
 /// Free `b` once it can no longer be in an unsubmitted command (see [`Owned`]).
 fn retire(b: wgpu::Buffer) {
+    MEM_LIVE_BYTES.fetch_sub(b.size() as i64, std::sync::atomic::Ordering::Relaxed);
     #[cfg(target_arch = "wasm32")]
     RETIRED.with(|r| r.borrow_mut().push(b));
     #[cfg(not(target_arch = "wasm32"))]
@@ -561,13 +586,13 @@ impl Wgpu {
         while words.len() % 4 != 0 {
             words.push(0);
         }
-        let ubuf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let ubuf = tracked(self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck_cast(&words),
                 usage: wgpu::BufferUsages::UNIFORM,
-            });
+            },
+        ));
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
             resource: ubuf.as_entire_binding(),
@@ -1575,12 +1600,12 @@ impl Wgpu {
     #[cfg(not(target_arch = "wasm32"))]
     fn read_with<T>(&self, buf: &GBuf, f: impl FnOnce(&[u8]) -> T) -> T {
         let size = (buf.len.max(1) * 4) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let staging = tracked(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        }));
         {
             let mut pend = self.pending.lock().unwrap();
             let enc = pend
@@ -1641,12 +1666,12 @@ impl Wgpu {
             return Err(f);
         }
         let size = (buf.len.max(1) * 4) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let staging = tracked(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        }));
         {
             let mut pend = self.pending.lock().unwrap();
             let enc = pend
@@ -1669,12 +1694,12 @@ impl Wgpu {
     /// Non-blocking readback for the browser (and usable natively).
     pub async fn download_async(&self, buf: &GBuf) -> Vec<f32> {
         let size = (buf.len.max(1) * 4) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let staging = tracked(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        }));
         {
             let mut pend = self.pending.lock().unwrap();
             let enc = pend

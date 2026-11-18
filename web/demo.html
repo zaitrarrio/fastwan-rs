@@ -785,6 +785,7 @@ async function browserGenerateLong(width, height, frames, entry, seed) {
       if (ev.type === "prepared") { s.stage = "generating"; crumb(null, "block 1"); }
       else if (ev.type === "block") {
         s.blocks.push(ev.ms / 1000); s.total_blocks = ev.total; clip.blockMs = s.blocks; (clip.denoiseMs ||= []).push(ev.denoise_ms / 1000); crumb(null, `block ${ev.index + 2}`);
+        (clip.blockMem ||= []).push({ n: ev.buffers_created, created: ev.mb_created, live: ev.mb_live });
         // Diagnostics: Chrome started with --js-flags=--expose-gc collects after every block.
         if (typeof gc === "function" && new URLSearchParams(location.search).has("gc")) gc();
       }

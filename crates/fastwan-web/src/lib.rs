@@ -778,6 +778,10 @@ mod web {
                 set(&o, "total", blocks as u32);
                 set(&o, "ms", now - t_last);
                 set(&o, "denoise_ms", now - t_last);
+                let (n, created, live) = fastwan_wgpu::mem_stats();
+                set(&o, "buffers_created", n as f64);
+                set(&o, "mb_created", created as f64 / 1e6);
+                set(&o, "mb_live", live as f64 / 1e6);
                 emit(o);
                 t_last = now;
                 let o = Object::new();
