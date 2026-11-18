@@ -683,6 +683,7 @@ async function bwLoad() {
   bw.entries = (await (await fetch(gurl, { cache: "no-store" })).json()).prompts;
   bw.galleryBase = gurl.slice(0, gurl.lastIndexOf("/") + 1);
   bw.long = !!v.causal;
+  bw.memrope = v.memory === "memrope"; // History Forcing's MemRoPE memory
   bw.loaded = `${v.name || bw.manifest.name || "FastWan2.1-T2V-1.3B"} · ${v.label} · in this browser`;
   $("go").textContent = bw.long ? "Generate video" : "Generate clip";
   $("steps-hint").textContent = bw.long ? "Long video: 4 denoising steps per block of 12 frames, shown as each block is done; Stop ends it early. 16 fps." : "3 denoising steps, 16 fps.";
@@ -857,7 +858,7 @@ async function browserGenerateLong(width, height, frames, entry, seed) {
   try {
     const eurl = bw.galleryBase + entry.file;
     const emb = await cached(eurl, () => fetchBytes(eurl, null));
-    await wasmCall(bw.eng.generateLong(emb, width, height, frames, seed, longCache(width, height), LONG_SINK, (ev) => {
+    await wasmCall(bw.eng.generateLong(emb, width, height, frames, seed, longCache(width, height), LONG_SINK, !!bw.memrope, (ev) => {
       if (ev.type === "prepared") { s.stage = "generating"; crumb(null, "block 1"); }
       else if (ev.type === "block") {
         s.blocks.push(ev.ms / 1000); s.total_blocks = ev.total; clip.blockMs = s.blocks; (clip.denoiseMs ||= []).push(ev.denoise_ms / 1000); crumb(null, `block ${ev.index + 2}`);

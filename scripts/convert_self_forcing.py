@@ -1,5 +1,6 @@
 """Self-Forcing-style checkpoint (.pt) -> Diffusers-named safetensors, no torch.
-Also reads History Forcing's dmd/model.pt (tensors saved with attributes).
+Also reads History Forcing's dmd/model.pt (tensors saved with attributes),
+which runs with `generate --causal --memory memrope`.
 
     python3 -I scripts/convert_self_forcing.py self_forcing_dmd.pt transformer.safetensors
 
