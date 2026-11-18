@@ -66,15 +66,16 @@ State and invariants only; the reasoning is in `docs/design.md`.
   loop is pipelined (block b queued before block b−1's frames are awaited,
   `Wgpu::readback_begin` / `Readback::wait`) and the latent never leaves the
   GPU (`TaeHv::launch_chunk_dev`). SwiftShader parity 99.93%, max 1 level,
-  desktop and phone settings. **Headless Chrome on an RTX 4090 still stalls
-  some blocks** (8–42 s vs 1.6 s; native wgpu flat): not the copies, the
-  latent readback or GPU idling (all removed), and the slow blocks shrink
-  with faster kernels (35.5 → 24.8 s with f16), so the GPU itself runs slow
-  then; next step is Chrome GPU timestamps / a trace
-  (`docs/runs/2026-11-17-vast-4090-stalls-f16-phones`). wgpu's web backend
-  never frees a dropped buffer: `Owned` / `retire` destroy them after the
-  next submit; `KeepAlive` submits an empty batch every 20 ms during
-  readbacks.
+  desktop and phone settings. Headless Chrome on one RTX 4090 host (Japan,
+  615.71.09) stalled some blocks (8–42 s vs 1.6 s); two other 4090s (595.71
+  and 615.71.09) ran flat with and without the buffer pool, so it looked host-
+  specific, cause unknown (`docs/runs/2026-11-18-vast-4090-buffer-pool`).
+  WebGPU buffers are recycled per device (`Recycler`: dropped storage buffers
+  and uniforms go to a free list after the next submit, reused for the same
+  size and usage, zero-filled with `clear_buffer`): 2,772 → 3 allocations per
+  block, 17% faster on one host. Staging buffers are destroyed after the next
+  submit (wgpu's web backend never frees a dropped buffer); `KeepAlive`
+  submits an empty batch every 20 ms during readbacks.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does) **and the clip has ≥ 21 latent frames
   (81 frames)**; `--attention dense` to compare. Shorter clips under VSA
