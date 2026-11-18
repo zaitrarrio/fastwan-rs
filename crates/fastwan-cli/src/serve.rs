@@ -7,7 +7,7 @@
 //! ```text
 //! GET  /                         the demo page (web/demo.html)
 //! GET  /api/info                 backend, model, limits, ready / error
-//! POST /api/generate             {prompt, width, height, frames, seed?} → {id}
+//! POST /api/generate             {prompt, width, height, frames, seed?, upscale?} → {id}
 //! GET  /api/jobs/<id>            status, per-stage timings, frames decoded so far
 //! GET  /api/jobs/<id>/frames?from=N
 //!                                binary: u32 LE width, height, first, count; then RGB8
@@ -39,6 +39,9 @@ use std::time::Instant;
 const PAGE: &str = include_str!("../../../web/demo.html");
 const KEEP_JOBS: usize = 8;
 const MAX_QUEUE: usize = 3;
+/// Finished jobs' frames kept in memory at most (an 832×480 clip upscaled ×4
+/// is 1.55 GB of RGB): the oldest are dropped first.
+const KEEP_BYTES: usize = 4 << 30;
 
 pub enum Weights {
     /// Tiny random model: exercises the engine and the page without a download.
@@ -75,6 +78,20 @@ pub struct Settings {
     pub allow_origin: Option<String>,
     pub attention: Option<fastwan_model::Attention>,
     pub quant: fastwan_core::quant::WeightQuant,
+    /// `realesr-animevideov3.safetensors`: offer ×2 / ×4 upscaling.
+    pub upscaler: Option<PathBuf>,
+}
+
+impl Settings {
+    /// Upscale factors a request may ask for (the synthetic model's tiny
+    /// upscaler is ×2).
+    fn upscales(&self) -> Vec<usize> {
+        match (&self.weights, &self.upscaler) {
+            (Weights::Synthetic { .. }, _) => vec![2],
+            (_, Some(_)) => vec![2, 4],
+            _ => vec![],
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -121,6 +138,9 @@ struct Job {
     frames: usize,
     rgb: Vec<u8>,
     error: Option<String>,
+    /// 0 = off, else the output scale; frames are stored upscaled.
+    upscale: usize,
+    upscale_s: f64,
 }
 
 impl Job {
@@ -132,6 +152,7 @@ impl Job {
             "steps": self.steps, "total_steps": self.total_steps, "decode_s": self.decode_s,
             "elapsed_s": self.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0),
             "total_s": self.total_s, "frames": self.frames, "error": self.error,
+            "upscale": self.upscale, "upscale_s": self.upscale_s,
         })
     }
 }
@@ -329,6 +350,18 @@ pub fn engine<B: Backend>(
             (pipe, text, model)
         }
     };
+    let mut up = match (&s.weights, &s.upscaler) {
+        (Weights::Synthetic { .. }, _) => Some(fastwan_model::upscale::Upscaler::load(
+            &be,
+            fastwan_model::upscale::UpConfig::tiny(),
+            &Synthetic { seed: 2 },
+        )?),
+        (_, Some(p)) => {
+            stage("loading the upscaler");
+            Some(crate::upscale::load(&be, p, 4)?)
+        }
+        _ => None,
+    };
     stage("waiting for the GPU");
     be.sync();
     {
@@ -336,6 +369,7 @@ pub fn engine<B: Backend>(
         info["ready"] = json!(true);
         info["model"] = json!(model);
         info["backend"] = json!(be.name());
+        info["upscale"] = json!(s.upscales());
         info["load_s"] = json!(t0.elapsed().as_secs_f64());
     }
     eprintln!(
@@ -345,13 +379,16 @@ pub fn engine<B: Backend>(
     );
 
     for id in rx {
-        let Some((prompt, geometry, seed)) = shared.with(id, |j| {
+        let Some((prompt, geometry, seed, upscale)) = shared.with(id, |j| {
             j.started = Some(Instant::now());
             j.stage = Stage::Encoding;
-            (j.prompt.clone(), j.geometry, j.seed)
+            (j.prompt.clone(), j.geometry, j.seed, j.upscale)
         }) else {
             continue;
         };
+        if let (Some(u), true) = (up.as_mut(), upscale > 0) {
+            u.set_output_scale(upscale)?;
+        }
         let t = Instant::now();
         let run = || -> Result<()> {
             let (embeds, tokens) = text.encode(&prompt)?;
@@ -390,15 +427,47 @@ pub fn engine<B: Backend>(
                     rgb,
                     ..
                 } => {
+                    // Upscaled per decoded chunk, on the device, as it arrives.
+                    let tu = Instant::now();
+                    let upscaled = match (&up, upscale > 0) {
+                        (Some(u), true) => {
+                            let words: Vec<u32> = rgb
+                                .chunks_exact(3)
+                                .map(|p| p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16)
+                                .collect();
+                            let out = crate::upscale::frames(
+                                &be,
+                                u,
+                                &be.upload_words(&words),
+                                count,
+                                height,
+                                width,
+                            );
+                            Some((out, width * upscale, height * upscale))
+                        }
+                        _ => None,
+                    };
+                    let up_s = tu.elapsed().as_secs_f64();
                     shared.with(id, |j| {
-                        j.width = width;
-                        j.height = height;
-                        j.rgb.extend_from_slice(rgb);
+                        match &upscaled {
+                            Some((out, w, h)) => {
+                                j.width = *w;
+                                j.height = *h;
+                                j.rgb.extend_from_slice(out);
+                                j.upscale_s += up_s;
+                            }
+                            None => {
+                                j.width = width;
+                                j.height = height;
+                                j.rgb.extend_from_slice(rgb);
+                            }
+                        }
                         j.frames += count;
                         j.decode_s = j.started.unwrap().elapsed().as_secs_f64()
                             - j.encode_s
                             - j.prepare_s
-                            - j.steps.iter().sum::<f64>();
+                            - j.steps.iter().sum::<f64>()
+                            - j.upscale_s;
                     });
                 }
             })?;
@@ -464,7 +533,7 @@ fn cors_for(req: &tiny_http::Request, allow: Option<&str>) -> Vec<tiny_http::Hea
     }
 }
 
-fn parse_request(body: &str, s: &Settings) -> Result<(String, Geometry, u64), String> {
+fn parse_request(body: &str, s: &Settings) -> Result<(String, Geometry, u64, usize), String> {
     let v: Value = serde_json::from_str(body).map_err(|e| format!("body is not JSON: {e}"))?;
     let prompt = v["prompt"].as_str().unwrap_or("").trim().to_string();
     if prompt.is_empty() {
@@ -493,13 +562,26 @@ fn parse_request(body: &str, s: &Settings) -> Result<(String, Geometry, u64), St
             g.frames, s.max_frames
         ));
     }
+    let upscale = v["upscale"].as_u64().unwrap_or(0) as usize;
+    if upscale != 0 && !s.upscales().contains(&upscale) {
+        return Err(match s.upscales().as_slice() {
+            [] => "This engine has no upscaler (start it with --upscaler).".to_string(),
+            u => format!(
+                "Upscale ×{upscale} is not offered here (only {}).",
+                u.iter()
+                    .map(|k| format!("×{k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
     let seed = v["seed"].as_u64().unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64 % 1_000_000_000)
             .unwrap_or(7)
     });
-    Ok((prompt, g, seed))
+    Ok((prompt, g, seed, upscale))
 }
 
 /// Serve until killed. `start_engine` builds the backend on the engine thread.
@@ -663,7 +745,7 @@ pub fn serve(
                 });
                 match parsed {
                     Err(e) => respond_json(req, 400, &json!({"error": e}), &cors),
-                    Ok((prompt, geometry, seed)) => {
+                    Ok((prompt, geometry, seed, upscale)) => {
                         let mut jobs = shared.jobs.lock().unwrap();
                         if jobs
                             .iter()
@@ -704,9 +786,13 @@ pub fn serve(
                             frames: 0,
                             rgb: Vec::new(),
                             error: None,
+                            upscale,
+                            upscale_s: 0.0,
                         });
                         // Drop the oldest finished jobs (their frames are the memory).
-                        while jobs.len() > KEEP_JOBS {
+                        while jobs.len() > KEEP_JOBS
+                            || jobs.iter().map(|j| j.rgb.len()).sum::<usize>() > KEEP_BYTES
+                        {
                             match jobs
                                 .iter()
                                 .position(|j| matches!(j.stage, Stage::Done | Stage::Failed))

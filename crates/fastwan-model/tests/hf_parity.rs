@@ -72,6 +72,7 @@ fn causal_blocks_match_reference() {
         cap_frames: 3,
         sink_frames: 1,
         timesteps: vec![],
+        half_kv: false,
         memory: fastwan_model::causal::Memory::Window,
     };
     let tpf = (h / cfg.patch) * (w / cfg.patch);
@@ -136,6 +137,7 @@ fn memrope_blocks_match_reference() {
         cap_frames: 7,
         sink_frames: 1,
         timesteps: vec![],
+        half_kv: false,
         memory: Memory::MemRope {
             alpha_long: 0.01,
             alpha_short: 0.1,

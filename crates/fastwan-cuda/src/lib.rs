@@ -110,6 +110,7 @@ struct Kernels {
     rope_heads: CudaFunction,
     kv_ema: CudaFunction,
     pack_rgba8: CudaFunction,
+    unpack_rgba8: CudaFunction,
     patch: CudaFunction,
     conv2d: CudaFunction,
     conv2d_mma: CudaFunction,
@@ -285,6 +286,7 @@ impl Cuda {
             rope_heads: get("fw_rope_heads")?,
             kv_ema: get("fw_kv_ema")?,
             pack_rgba8: get("fw_pack_rgba8")?,
+            unpack_rgba8: get("fw_unpack_rgba8")?,
             patch: get("fw_patch")?,
             conv2d: get("fw_conv2d")?,
             conv2d_mma: get("fw_conv2d_mma")?,
@@ -561,15 +563,21 @@ impl Backend for Cuda {
         if len == 0 {
             return;
         }
-        assert!(!src.f32 && !dst.f32 && so + len <= src.len && d + len <= dst.len);
+        // bf16 activations (2 bytes) or f32-flagged buffers such as packed
+        // RGBA words (4 bytes); both sides must be the same kind.
+        assert!(
+            src.f32 == dst.f32 && so + len <= src.len && d + len <= dst.len,
+            "copy: mixed bf16 / f32 buffers or out of range"
+        );
+        let e = if src.f32 { 4 } else { 2 };
         // SAFETY: both ranges are inside their allocations (asserted above).
         self.timed(
             || "copy (dtod)".into(),
             || unsafe {
                 cudarc::driver::result::memcpy_dtod_async(
-                    self.ptr(dst) + (d * 2) as u64,
-                    self.ptr(src) + (so * 2) as u64,
-                    len * 2,
+                    self.ptr(dst) + (d * e) as u64,
+                    self.ptr(src) + (so * e) as u64,
+                    len * e,
                     self.stream.cu_stream(),
                 )
                 .expect("dtod");
@@ -1184,6 +1192,26 @@ impl Backend for Cuda {
                 Arg::I(s.w as i32),
                 Arg::I(s.p as i32),
                 Arg::I(base.is_some() as i32),
+                Arg::I(s.down as i32),
+            ],
+        );
+    }
+
+    fn unpack_rgba8(&self, src: &CuBuf, frames: usize, plane: usize, out: &CuBuf) {
+        let n = frames * 3 * plane;
+        assert!(
+            src.f32 && src.len >= frames * plane && !out.f32 && out.len >= n,
+            "unpack_rgba8: src from alloc_words / upload_words, out an activation"
+        );
+        self.launch(
+            &self.f.unpack_rgba8,
+            Self::elems(n),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(src)),
+                Arg::P(self.ptr(out)),
+                Arg::L(n as i64),
+                Arg::L(plane as i64),
             ],
         );
     }

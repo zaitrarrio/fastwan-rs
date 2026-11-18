@@ -246,15 +246,8 @@ extern "C" __global__ void fw_tanh_clamp(u64 x_, long n, float s) {
 __device__ __forceinline__ unsigned int fw_q8(float v) {
     return (unsigned int)(fminf(fmaxf(v, 0.0f), 1.0f) * 255.0f + 0.5f);
 }
-extern "C" __global__ void fw_pack_rgba8(u64 src_, u64 base_, u64 out_, long n, int skip, int h, int w, int p, int has_base) {
-    const bf16_t* src = (const bf16_t*)src_;
-    const unsigned int* base = (const unsigned int*)base_;
-    unsigned int* out = (unsigned int*)out_;
-    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const long ow = (long)w * p, oh = (long)h * p, plane = (long)h * w;
-    const long f = i / (oh * ow) + skip;
-    const long y = (i / ow) % oh, x = i % ow;
+__device__ __forceinline__ float3 fw_pack_sample(const bf16_t* src, const unsigned int* base, long f, long y, long x, int h, int w, int p, int has_base) {
+    const long plane = (long)h * w;
     const long at = (y / p) * w + x / p;
     const long s0 = f * 3 * p * p + (y % p) * p + x % p;
     float r = ld(src, s0 * plane + at);
@@ -266,7 +259,37 @@ extern "C" __global__ void fw_pack_rgba8(u64 src_, u64 base_, u64 out_, long n, 
         g += (float)((wd >> 8) & 255u) / 255.0f;
         b += (float)((wd >> 16) & 255u) / 255.0f;
     }
-    out[i] = fw_q8(r) | (fw_q8(g) << 8) | (fw_q8(b) << 16) | 0xff000000u;
+    return make_float3(fminf(fmaxf(r, 0.0f), 1.0f), fminf(fmaxf(g, 0.0f), 1.0f), fminf(fmaxf(b, 0.0f), 1.0f));
+}
+// `down` (divides p) averages each down×down block after the clamp (×2 = ×4 net + 2×2 box).
+extern "C" __global__ void fw_pack_rgba8(u64 src_, u64 base_, u64 out_, long n, int skip, int h, int w, int p, int has_base, int down) {
+    const bf16_t* src = (const bf16_t*)src_;
+    const unsigned int* base = (const unsigned int*)base_;
+    unsigned int* out = (unsigned int*)out_;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long ow = (long)w * p / down, oh = (long)h * p / down;
+    const long f = i / (oh * ow) + skip;
+    const long y = ((i / ow) % oh) * down, x = (i % ow) * down;
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    for (int dy = 0; dy < down; dy++)
+        for (int dx = 0; dx < down; dx++) {
+            const float3 v = fw_pack_sample(src, base, f, y + dy, x + dx, h, w, p, has_base);
+            r += v.x; g += v.y; b += v.z;
+        }
+    const float inv = 1.0f / (float)(down * down);
+    out[i] = fw_q8(r * inv) | (fw_q8(g * inv) << 8) | (fw_q8(b * inv) << 16) | 0xff000000u;
+}
+
+// Backend::unpack_rgba8: packed RGBA words [frames, plane] (u32) -> planar
+// RGB [frames, 3, plane] bf16 as byte / 255.
+extern "C" __global__ void fw_unpack_rgba8(u64 src_, u64 out_, long n, long plane) {
+    const unsigned int* src = (const unsigned int*)src_;
+    bf16_t* out = (bf16_t*)out_;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long p = i % plane, fc = i / plane, f = fc / 3, c = fc % 3;
+    out[i] = bf((float)((src[f * plane + p] >> (8 * c)) & 255u) / 255.0f);
 }
 
 // dir 0: patchify (tokens ← latent), dir 1: unpatchify (latent ← tokens).
