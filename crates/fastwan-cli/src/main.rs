@@ -826,7 +826,7 @@ fn generate_causal<B: Backend>(
     ccfg: fastwan_model::causal::CausalConfig,
     quant: fastwan_core::quant::WeightQuant,
 ) -> Result<()> {
-    use fastwan_model::causal::{CausalRollout, frame_major};
+    use fastwan_model::causal::CausalRollout;
     let cfg = WanConfig::fastwan_1_3b();
     let tcfg = TaeConfig::taew2_1();
     println!("{}", be.name());
@@ -865,15 +865,14 @@ fn generate_causal<B: Backend>(
     )?;
     let mut st = taehv.state();
     let mut y4m: Option<Y4m> = None;
-    let c = cfg.out_channels;
     let mut frames = 0;
     let mut first_frame = None;
     for b in 0..blocks {
         let tb = std::time::Instant::now();
-        let latent = be.download(roll.next_block(be, &prompt)?);
+        // The latent stays on the device: the decoder reads the block as is.
+        let x = roll.next_block(be, &prompt)?;
+        let chunk = taehv.launch_chunk_dev(be, &mut st, x, bf, lh, lw);
         let den = tb.elapsed().as_secs_f64();
-        let z = frame_major(&latent, c, bf, lh * lw);
-        let chunk = taehv.launch_chunk(be, &mut st, &z, bf, lh, lw);
         let packed = chunk.pack(be);
         let raw = be.download_rgba8(&packed);
         let (n, h, w) = chunk.dims();

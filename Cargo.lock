@@ -521,6 +521,7 @@ name = "fastwan-cpu"
 version = "0.1.0"
 dependencies = [
  "fastwan-core",
+ "half",
  "rayon",
 ]
 

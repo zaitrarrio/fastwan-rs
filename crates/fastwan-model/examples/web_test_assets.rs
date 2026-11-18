@@ -117,33 +117,45 @@ fn main() {
         let file = SafetensorsDir::open(&out.join("tiny-f16.safetensors")).unwrap();
         let dit = WanDit::load_with(&cpu, cfg.clone(), &file, WeightQuant::Native).unwrap();
         let tae = TaeHv::load(&cpu, tcfg.clone(), &tsrc).unwrap();
-        let g = Geometry {
-            width: 480,
-            height: 272,
-            frames: 165,
+        // Desktop default (480×272, cache 12, f32) and the phone settings
+        // (320×192, cache 12, 16-bit cache: CausalConfig::half_kv).
+        let long = |w: usize, h: usize, cache: usize, half: bool| {
+            let g = Geometry {
+                width: w,
+                height: h,
+                frames: 165,
+            };
+            let (lt, lh, lw) = g.latent();
+            let mut ccfg = CausalConfig::self_forcing();
+            ccfg.cache_frames(cache, 3);
+            ccfg.half_kv = half;
+            let bf = ccfg.block_frames;
+            let prompt = dit.prepare_prompt(&cpu, &padded);
+            let mut roll = CausalRollout::new(&cpu, &dit, ccfg, (lh, lw), usize::MAX, 7).unwrap();
+            let mut st = tae.state();
+            let mut rgb = Vec::new();
+            for _ in 0..lt.div_ceil(bf) {
+                let latent = cpu.download(roll.next_block(&cpu, &prompt).unwrap());
+                let z = frame_major(&latent, tcfg.latent_channels, bf, lh * lw);
+                let ck = tae.launch_chunk(&cpu, &mut st, &z, bf, lh, lw);
+                let raw = cpu.download_rgba8(&ck.pack(&cpu));
+                let (n, h, w) = ck.dims();
+                rgb.extend(fastwan_core::backend::rgba_to_rgb(&raw[..n * h * w * 4]));
+            }
+            rgb
         };
-        let (lt, lh, lw) = g.latent();
-        let mut ccfg = CausalConfig::self_forcing();
-        ccfg.cache_frames(12, 3);
-        let bf = ccfg.block_frames;
-        let prompt = dit.prepare_prompt(&cpu, &padded);
-        let mut roll = CausalRollout::new(&cpu, &dit, ccfg, (lh, lw), usize::MAX, 7).unwrap();
-        let mut st = tae.state();
-        let mut rgb = Vec::new();
-        for _ in 0..lt.div_ceil(bf) {
-            let latent = cpu.download(roll.next_block(&cpu, &prompt).unwrap());
-            let z = frame_major(&latent, tcfg.latent_channels, bf, lh * lw);
-            let ck = tae.launch_chunk(&cpu, &mut st, &z, bf, lh, lw);
-            let raw = cpu.download_rgba8(&ck.pack(&cpu));
-            let (n, h, w) = ck.dims();
-            rgb.extend(fastwan_core::backend::rgba_to_rgb(&raw[..n * h * w * 4]));
-        }
+        let rgb = long(480, 272, 12, false);
         println!(
             "tiny-f16 long: {} frames 480x272",
             rgb.len() / (480 * 272 * 3)
         );
         std::fs::write(out.join("tiny-f16.long.rgb"), &rgb).unwrap();
-        drop(roll);
+        let rgb = long(320, 192, 12, true);
+        println!(
+            "tiny-f16 long, phone settings: {} frames 320x192",
+            rgb.len() / (320 * 192 * 3)
+        );
+        std::fs::write(out.join("tiny-f16.long320h.rgb"), &rgb).unwrap();
         // Clip mode at Prompt Studio's 5 s length (21 latent frames: VSA).
         let pipe = Pipeline {
             dit,

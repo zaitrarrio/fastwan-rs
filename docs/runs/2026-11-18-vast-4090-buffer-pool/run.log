@@ -1,0 +1,207 @@
+=== host A: instance 61167209 (Michigan, driver 595.71.05, 450 W)
+NVIDIA GeForce RTX 4090, 595.71.05, 450.00 W
+adapter: wgpu Vulkan: NVIDIA GeForce RTX 4090 (NVIDIA 595.71.05)
+playwright ok
+--- chrome long old
+old gc available: undefined
+variants: ['f4', 'f16', 'sf16', 'sf4']
+load: Model ready in 215.1 s. | sizes ['480x272', '640x352']
+old: 45.0s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 4.6 s · total 44.9 s
+old block s: 2.6 1.6 1.6 1.5 1.6 1.6 1.5 1.5 1.6 1.5 1.5 1.5 1.5 1.5 1.5 1.6 1.6 1.5 1.6 1.5 1.5 1.6 1.5 1.5 1.6 1.5 1.5
+old denoise+readback s: 2.6 1.6 1.6 1.5 1.6 1.6 1.5 1.5 1.6 1.5 1.5 1.5 1.5 1.5 1.5 1.6 1.6 1.5 1.6 1.5 1.5 1.6 1.5 1.5 1.6 1.5 1.5
+Traceback (most recent call last):
+  File "/w/in/long_arms.py", line 32, in <module>
+    print(f"{arm} mem {i}: created +{m['n'] - prev['n']} ({m['created'] - prev['created']:.1f} MB) reused +{r - prev['reused']} held {m['held']:.1f} MB", flush=True)
+                                                                                                                                     ^^^^^^^^^^^^^^^
+TypeError: unsupported format string passed to NoneType.__format__
+--- chrome long plain
+plain gc available: undefined
+variants: ['f4', 'f16', 'sf16', 'sf4']
+load: Model ready in 177.7 s. | sizes ['480x272', '640x352']
+plain: 37.3s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.8 s · total 37.3 s
+plain block s: 1.3 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+plain denoise+readback s: 1.3 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+plain mem 0: created +1085 (6448.3 MB) reused +5551 held 6448.3 MB
+plain mem 1: created +3 (7.1 MB) reused +2769 held 6450.6 MB
+plain mem 2: created +3 (7.1 MB) reused +2769 held 6451.4 MB
+plain mem 3: created +3 (7.1 MB) reused +2769 held 6452.2 MB
+plain mem 4: created +3 (7.1 MB) reused +2769 held 6453.0 MB
+plain mem 5: created +3 (7.1 MB) reused +2769 held 6453.8 MB
+plain mem 6: created +3 (7.1 MB) reused +2769 held 6454.5 MB
+plain mem 7: created +3 (7.1 MB) reused +2769 held 6455.3 MB
+plain mem 8: created +3 (7.1 MB) reused +2769 held 6456.1 MB
+plain mem 9: created +3 (7.1 MB) reused +2769 held 6456.9 MB
+plain mem 10: created +3 (7.1 MB) reused +2769 held 6457.7 MB
+plain mem 11: created +3 (7.1 MB) reused +2769 held 6458.5 MB
+plain mem 12: created +3 (7.1 MB) reused +2769 held 6459.2 MB
+plain mem 13: created +3 (7.1 MB) reused +2769 held 6460.0 MB
+plain mem 14: created +3 (7.1 MB) reused +2769 held 6460.8 MB
+plain mem 15: created +3 (7.1 MB) reused +2769 held 6461.6 MB
+plain mem 16: created +3 (7.1 MB) reused +2769 held 6462.4 MB
+plain mem 17: created +3 (7.1 MB) reused +2769 held 6463.2 MB
+plain mem 18: created +3 (7.1 MB) reused +2769 held 6463.9 MB
+plain mem 19: created +3 (7.1 MB) reused +2769 held 6464.7 MB
+plain mem 20: created +3 (7.1 MB) reused +2769 held 6465.5 MB
+plain mem 21: created +3 (7.1 MB) reused +2769 held 6466.3 MB
+plain mem 22: created +3 (7.1 MB) reused +2769 held 6467.1 MB
+plain mem 23: created +3 (7.1 MB) reused +2769 held 6467.9 MB
+plain mem 24: created +3 (7.1 MB) reused +2769 held 6468.6 MB
+plain mem 25: created +3 (7.1 MB) reused +2769 held 6469.4 MB
+plain mem 26: created +0 (0.0 MB) reused +0 held 6469.4 MB
+plain 171 MB JS heap
+--- chrome long f16
+f16 gc available: undefined
+variants: ['f4', 'f16', 'sf16', 'sf4']
+load: Model ready in 144.6 s. | sizes ['480x272', '640x352']
+f16: 37.4s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.9 s · total 37.4 s
+f16 block s: 1.4 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+f16 denoise+readback s: 1.4 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+f16 mem 0: created +1085 (6448.3 MB) reused +5551 held 6448.3 MB
+f16 mem 1: created +3 (7.1 MB) reused +2769 held 6450.6 MB
+f16 mem 2: created +3 (7.1 MB) reused +2769 held 6451.4 MB
+f16 mem 3: created +3 (7.1 MB) reused +2769 held 6452.2 MB
+f16 mem 4: created +3 (7.1 MB) reused +2769 held 6453.0 MB
+f16 mem 5: created +3 (7.1 MB) reused +2769 held 6453.8 MB
+f16 mem 6: created +3 (7.1 MB) reused +2769 held 6454.5 MB
+f16 mem 7: created +3 (7.1 MB) reused +2769 held 6455.3 MB
+f16 mem 8: created +3 (7.1 MB) reused +2769 held 6456.1 MB
+f16 mem 9: created +3 (7.1 MB) reused +2769 held 6456.9 MB
+f16 mem 10: created +3 (7.1 MB) reused +2769 held 6457.7 MB
+f16 mem 11: created +3 (7.1 MB) reused +2769 held 6458.5 MB
+f16 mem 12: created +3 (7.1 MB) reused +2769 held 6459.2 MB
+f16 mem 13: created +3 (7.1 MB) reused +2769 held 6460.0 MB
+f16 mem 14: created +3 (7.1 MB) reused +2769 held 6460.8 MB
+f16 mem 15: created +3 (7.1 MB) reused +2769 held 6461.6 MB
+f16 mem 16: created +3 (7.1 MB) reused +2769 held 6462.4 MB
+f16 mem 17: created +3 (7.1 MB) reused +2769 held 6463.2 MB
+f16 mem 18: created +3 (7.1 MB) reused +2769 held 6463.9 MB
+f16 mem 19: created +3 (7.1 MB) reused +2769 held 6464.7 MB
+f16 mem 20: created +3 (7.1 MB) reused +2769 held 6465.5 MB
+f16 mem 21: created +3 (7.1 MB) reused +2769 held 6466.3 MB
+f16 mem 22: created +3 (7.1 MB) reused +2769 held 6467.1 MB
+f16 mem 23: created +3 (7.1 MB) reused +2769 held 6467.9 MB
+f16 mem 24: created +3 (7.1 MB) reused +2769 held 6468.6 MB
+f16 mem 25: created +3 (7.1 MB) reused +2769 held 6469.4 MB
+f16 mem 26: created +0 (0.0 MB) reused +0 held 6469.4 MB
+f16 171 MB JS heap
+--- chrome long halfkv
+halfkv gc available: undefined
+variants: ['f4', 'f16', 'sf16', 'sf4']
+load: Model ready in 152.5 s. | sizes ['480x272', '640x352']
+halfkv: 37.5s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 3.3 s · total 37.5 s
+halfkv block s: 1.7 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+halfkv denoise+readback s: 1.7 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+halfkv mem 0: created +1085 (5320.2 MB) reused +5551 held 5320.2 MB
+halfkv mem 1: created +3 (7.1 MB) reused +2769 held 5322.6 MB
+halfkv mem 2: created +3 (7.1 MB) reused +2769 held 5323.4 MB
+halfkv mem 3: created +3 (7.1 MB) reused +2769 held 5324.2 MB
+halfkv mem 4: created +3 (7.1 MB) reused +2769 held 5324.9 MB
+halfkv mem 5: created +3 (7.1 MB) reused +2769 held 5325.7 MB
+halfkv mem 6: created +3 (7.1 MB) reused +2769 held 5326.5 MB
+halfkv mem 7: created +3 (7.1 MB) reused +2769 held 5327.3 MB
+halfkv mem 8: created +3 (7.1 MB) reused +2769 held 5328.1 MB
+halfkv mem 9: created +3 (7.1 MB) reused +2769 held 5328.9 MB
+halfkv mem 10: created +3 (7.1 MB) reused +2769 held 5329.6 MB
+halfkv mem 11: created +3 (7.1 MB) reused +2769 held 5330.4 MB
+halfkv mem 12: created +3 (7.1 MB) reused +2769 held 5331.2 MB
+halfkv mem 13: created +3 (7.1 MB) reused +2769 held 5332.0 MB
+halfkv mem 14: created +3 (7.1 MB) reused +2769 held 5332.8 MB
+halfkv mem 15: created +3 (7.1 MB) reused +2769 held 5333.6 MB
+halfkv mem 16: created +3 (7.1 MB) reused +2769 held 5334.3 MB
+halfkv mem 17: created +3 (7.1 MB) reused +2769 held 5335.1 MB
+halfkv mem 18: created +3 (7.1 MB) reused +2769 held 5335.9 MB
+halfkv mem 19: created +3 (7.1 MB) reused +2769 held 5336.7 MB
+halfkv mem 20: created +3 (7.1 MB) reused +2769 held 5337.5 MB
+halfkv mem 21: created +3 (7.1 MB) reused +2769 held 5338.3 MB
+halfkv mem 22: created +3 (7.1 MB) reused +2769 held 5339.0 MB
+halfkv mem 23: created +3 (7.1 MB) reused +2769 held 5339.8 MB
+halfkv mem 24: created +3 (7.1 MB) reused +2769 held 5340.6 MB
+halfkv mem 25: created +3 (7.1 MB) reused +2769 held 5341.4 MB
+halfkv mem 26: created +0 (0.0 MB) reused +0 held 5341.4 MB
+halfkv 178 MB JS heap
+uploaded
+exit 0
+
+
+=== host B: instance 61169799 (Nevada, driver 615.71.09, 400 W)
+NVIDIA GeForce RTX 4090, 615.71.09, 400.00 W
+adapter: wgpu Vulkan: NVIDIA GeForce RTX 4090 (NVIDIA 615.71.09)
+playwright ok
+--- chrome long old
+old gc available: undefined
+variants: ['f4', 'f16', 'sf16', 'sf4']
+load: Loading failed: network error | sizes []
+--- chrome long plain
+plain gc available: undefined
+variants: ['f4', 'f16', 'sf16', 'sf4']
+load: Model ready in 211.2 s. | sizes ['480x272', '640x352']
+plain: 38.8s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 3.1 s · total 38.7 s
+plain block s: 1.6 1.2 1.3 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4
+plain denoise+readback s: 1.6 1.2 1.3 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4 1.4
+plain mem 0: created +1085 (6448.3 MB) reused +5551 held 6448.3 MB
+plain mem 1: created +3 (7.1 MB) reused +2769 held 6450.6 MB
+plain mem 2: created +3 (7.1 MB) reused +2769 held 6451.4 MB
+plain mem 3: created +3 (7.1 MB) reused +2769 held 6452.2 MB
+plain mem 4: created +3 (7.1 MB) reused +2769 held 6453.0 MB
+plain mem 5: created +3 (7.1 MB) reused +2769 held 6453.8 MB
+plain mem 6: created +3 (7.1 MB) reused +2769 held 6454.5 MB
+plain mem 7: created +3 (7.1 MB) reused +2769 held 6455.3 MB
+plain mem 8: created +3 (7.1 MB) reused +2769 held 6456.1 MB
+plain mem 9: created +3 (7.1 MB) reused +2769 held 6456.9 MB
+plain mem 10: created +3 (7.1 MB) reused +2769 held 6457.7 MB
+plain mem 11: created +3 (7.1 MB) reused +2769 held 6458.5 MB
+plain mem 12: created +3 (7.1 MB) reused +2769 held 6459.2 MB
+plain mem 13: created +3 (7.1 MB) reused +2769 held 6460.0 MB
+plain mem 14: created +3 (7.1 MB) reused +2769 held 6460.8 MB
+plain mem 15: created +3 (7.1 MB) reused +2769 held 6461.6 MB
+plain mem 16: created +3 (7.1 MB) reused +2769 held 6462.4 MB
+plain mem 17: created +3 (7.1 MB) reused +2769 held 6463.2 MB
+plain mem 18: created +3 (7.1 MB) reused +2769 held 6463.9 MB
+plain mem 19: created +3 (7.1 MB) reused +2769 held 6464.7 MB
+plain mem 20: created +3 (7.1 MB) reused +2769 held 6465.5 MB
+plain mem 21: created +3 (7.1 MB) reused +2769 held 6466.3 MB
+plain mem 22: created +3 (7.1 MB) reused +2769 held 6467.1 MB
+plain mem 23: created +3 (7.1 MB) reused +2769 held 6467.9 MB
+plain mem 24: created +3 (7.1 MB) reused +2769 held 6468.6 MB
+plain mem 25: created +3 (7.1 MB) reused +2769 held 6469.4 MB
+plain mem 26: created +0 (0.0 MB) reused +0 held 6469.4 MB
+plain 171 MB JS heap
+--- chrome long old2
+old2 gc available: undefined
+variants: ['f4', 'f16', 'sf16', 'sf4']
+load: Model ready in 119.9 s. | sizes ['480x272', '640x352']
+old2: 37.1s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.1 s · total 37.0 s
+old2 block s: 1.2 1.1 1.2 1.4 1.4 1.4 1.4 1.3 1.4 1.4 1.4 1.4 1.4 1.3 1.4 1.4 1.4 1.4 1.3 1.4 1.4 1.4 1.4 1.3 1.3 1.4 1.3
+old2 denoise+readback s: 1.2 1.1 1.2 1.4 1.4 1.4 1.4 1.3 1.4 1.4 1.4 1.4 1.4 1.3 1.4 1.4 1.4 1.4 1.3 1.4 1.4 1.4 1.4 1.3 1.3 1.4 1.3
+old2 mem 0: created +6636 (6448.9 MB) reused +0 held 0.0 MB
+old2 mem 1: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 2: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 3: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 4: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 5: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 6: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 7: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 8: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 9: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 10: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 11: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 12: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 13: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 14: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 15: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 16: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 17: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 18: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 19: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 20: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 21: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 22: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 23: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 24: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 25: created +2772 (32.6 MB) reused +0 held 0.0 MB
+old2 mem 26: created +0 (0.0 MB) reused +0 held 0.0 MB
+old2 178 MB JS heap
+--- chrome long plain2
+uploaded
+exit 0
+

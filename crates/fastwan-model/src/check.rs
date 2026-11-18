@@ -535,6 +535,62 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         p.record(format!("attention h{heads} {sq}x{sk} d{d}"), g, c);
     }
 
+    // K/V cache: stores in two runs (one landing mid-cache), attention over
+    // the valid prefix of a larger cache read in place, f32 and 16-bit.
+    for &(heads, sq, valid, cap, d, half) in &[
+        (3, 70, 130, 200, 128, false),
+        (3, 70, 130, 200, 128, true),
+        (2, 33, 64, 96, 64, true),
+        (12, 100, 300, 300, 128, true),
+    ] {
+        let (strided, can_half) = be.kv_caps(d);
+        let half = half && can_half;
+        let cap = if strided { cap } else { valid };
+        let n = valid + 7; // source rows; the store takes rows 3 .. 3 + valid
+        let (q, k, v) = (
+            rng.normal(heads * sq * d),
+            rng.normal(heads * n * d),
+            rng.normal(heads * n * d),
+        );
+        let a = valid / 3;
+        let (gq, gk, gv, gkc, gvc, go) = (
+            be.upload(&q),
+            be.upload(&k),
+            be.upload(&v),
+            be.alloc_kv(heads * cap * d, half),
+            be.alloc_kv(heads * cap * d, half),
+            be.alloc(sq * heads * d),
+        );
+        // rows 3 .. 3 + a to cache rows 0 .. a; the rest after them.
+        be.kv_store(&gk, n, 3, a, heads, d, &gkc, 0, cap, half);
+        be.kv_store(&gk, n, 3 + a, valid - a, heads, d, &gkc, a, cap, half);
+        be.kv_store(&gv, n, 3, a, heads, d, &gvc, 0, cap, half);
+        be.kv_store(&gv, n, 3 + a, valid - a, heads, d, &gvc, a, cap, half);
+        be.attention_kv(&gq, &gkc, &gvc, heads, sq, valid, cap, d, half, &go);
+        let (cq, ck, cv, ckc, cvc, co) = (
+            cpu.upload(&q),
+            cpu.upload(&k),
+            cpu.upload(&v),
+            cpu.alloc_kv(heads * cap * d, half),
+            cpu.alloc_kv(heads * cap * d, half),
+            cpu.alloc(sq * heads * d),
+        );
+        cpu.kv_store(&ck, n, 3, a, heads, d, &ckc, 0, cap, half);
+        cpu.kv_store(&ck, n, 3 + a, valid - a, heads, d, &ckc, a, cap, half);
+        cpu.kv_store(&cv, n, 3, a, heads, d, &cvc, 0, cap, half);
+        cpu.kv_store(&cv, n, 3 + a, valid - a, heads, d, &cvc, a, cap, half);
+        cpu.attention_kv(&cq, &ckc, &cvc, heads, sq, valid, cap, d, half, &co);
+        let want = cpu.download(&co);
+        p.record(
+            format!(
+                "kv cache h{heads} {sq}x{valid}/{cap} d{d}{}",
+                if half { " f16" } else { "" }
+            ),
+            p.dl(go),
+            want,
+        );
+    }
+
     // VSA: partial tiles in every axis, two head dims, two sparsities.
     for &(grid, heads, d, sparsity) in &[
         ((5, 6, 9), 2, 128, 0.75),
@@ -872,9 +928,15 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
 /// evict), four DMD steps each plus the clean rewrite; the GPU's latents vs
 /// the CPU's, block by block (the cache carries any error forward).
 fn causal<B: Backend>(p: &mut Pair<'_, B>) {
+    causal_with(p, WanConfig::tiny(), false);
+    // head_dim 32: the cache is read in place by the flash kernel (where the
+    // backend can) and stored as 16-bit values.
+    causal_with(p, WanConfig::tiny_vsa(), true);
+}
+
+fn causal_with<B: Backend>(p: &mut Pair<'_, B>, cfg: WanConfig, half_kv: bool) {
     use crate::causal::{CausalConfig, CausalRollout};
     let (be, cpu) = (p.be, &Cpu);
-    let cfg = WanConfig::tiny();
     let src = Synthetic { seed: 3 };
     let embeds = Rng::new(5).normal(cfg.text_len * cfg.text_dim);
     let ccfg = CausalConfig {
@@ -882,7 +944,9 @@ fn causal<B: Backend>(p: &mut Pair<'_, B>) {
         cap_frames: 5,
         sink_frames: 1,
         timesteps: CausalConfig::self_forcing().timesteps,
+        half_kv,
     };
+    let d = cfg.head_dim;
     let gd = WanDit::load(be, cfg.clone(), &src).unwrap();
     let cd = WanDit::load(cpu, cfg, &src).unwrap();
     let (gpr, cpr) = (
@@ -899,7 +963,10 @@ fn causal<B: Backend>(p: &mut Pair<'_, B>) {
         cl.extend(cpu.download(x));
     }
     p.record(
-        "tiny causal rollout, 4 blocks, rolling cache (latent)",
+        format!(
+            "tiny causal rollout d{d}{}, 4 blocks, rolling cache (latent)",
+            if half_kv { " f16 cache" } else { "" }
+        ),
         gl,
         cl,
     );

@@ -46,15 +46,36 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (`docs/runs/2026-11-14-vast-4090-self-forcing-long`). Below ~320×192 the
   model gives noise (out of distribution, not a bug). A 60 s video drifts
   (a subject leaves and returns) but stays one scene.
+- History Forcing's `dmd/model.pt` (same architecture; weights have **no
+  stated licence**: evaluation only) runs with `--cache-frames 21
+  --sink-frames 3`, its trained window. 60 s on an RTX 4090: same speed as
+  Self-Forcing at 21/3 (7.9 fps; 21 frames cost ~30% more than 12), keeps
+  the prompted subject and moves more, but over-saturates and shows light
+  streaks (`docs/runs/2026-11-17-runpod-4090-history-forcing`). MemRoPE (its
+  optional demo cache) is not implemented; the vendored code is CC-BY-NC-SA.
+- K/V cache ops: `kv_store` (one dispatch per run of slots, all heads) and
+  `attention_kv` (flash3 reads the cache in place with a head stride; no
+  prefix packing), `alloc_kv(n, half)` for a 16-bit cache (f16 pairs via core
+  `unpack2x16float`, no `shader-f16`; `CausalConfig::half_kv`). CUDA keeps its
+  bf16 cache and the copy path (trait defaults, `kv_caps`).
 - Browser long videos (`Engine.generateLong` / `stop`; Prompt Studio offers
-  them for manifest variants with `"causal": true`, 480×272 and 640×352,
-  desktop only: the f32 K/V cache is ~2.3 GB at 480×272). Correct in Chrome
-  (SwiftShader parity 99.93%, max 1 level), but headless Chrome on an RTX 4090
-  stalls some blocks for 4-41 s while native wgpu stays at 1.6 s/block
-  (`docs/runs/2026-11-15-vast-4090-chrome-long-video`). wgpu's web backend
-  never frees a dropped buffer: `Owned` / `retire` destroy them after the next
-  submit; `KeepAlive` submits an empty batch every 20 ms during readbacks
-  (halves the stalls). Cause of the rest unknown.
+  them for manifest variants with `"causal": true`). Desktop: 480×272 and
+  640×352, f32 cache unless `?halfkv=1`. Phones (`"mobile": true` variants,
+  public `sf4` = 4-bit Self-Forcing): 320×192 (cache 12) or 480×272 (cache
+  9), 16-bit cache (`setHalfKv`, default on phones), 200 MB of frames. The
+  loop is pipelined (block b queued before block b−1's frames are awaited,
+  `Wgpu::readback_begin` / `Readback::wait`) and the latent never leaves the
+  GPU (`TaeHv::launch_chunk_dev`). SwiftShader parity 99.93%, max 1 level,
+  desktop and phone settings. Headless Chrome on one RTX 4090 host (Japan,
+  615.71.09) stalled some blocks (8–42 s vs 1.6 s); two other 4090s (595.71
+  and 615.71.09) ran flat with and without the buffer pool, so it looked host-
+  specific, cause unknown (`docs/runs/2026-11-18-vast-4090-buffer-pool`).
+  WebGPU buffers are recycled per device (`Recycler`: dropped storage buffers
+  and uniforms go to a free list after the next submit, reused for the same
+  size and usage, zero-filled with `clear_buffer`): 2,772 → 3 allocations per
+  block, 17% faster on one host. Staging buffers are destroyed after the next
+  submit (wgpu's web backend never frees a dropped buffer); `KeepAlive`
+  submits an empty batch every 20 ms during readbacks.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does) **and the clip has ≥ 21 latent frames
   (81 frames)**; `--attention dense` to compare. Shorter clips under VSA
@@ -87,10 +108,17 @@ State and invariants only; the reasoning is in `docs/design.md`.
   arrays indexed in loops. NVIDIA's Vulkan compiler kept those arrays in local
   memory: unrolling made the GEMM 5.75× and flash attention 7.8× faster.
   `FASTWAN_PROFILE=1` gives per-kernel GPU time; check it after kernel work.
-- WebGPU f16 math (`linear3h`, `flash_h`, `FASTWAN_WGPU_F16=1`) is opt-in: correct
-  (PSNR 43.8 dB vs f32 on a real clip) but 8.5% slower on an RTX 4090, where
-  f16 runs at the f32 rate (`docs/runs/2026-11-03-vast-4090-f16`). Unmeasured
-  on AMD / Intel / Apple, where it should pay; measure before defaulting it on.
+- WebGPU f16 math (`FASTWAN_WGPU_F16=1`, `?f16=1`; needs `shader-f16`) is
+  opt-in. Current kernels: `linear4h` / `flash3h` (vec4<f16> tiles, 16-term
+  f16 partial sums flushed into f32): 62/62 checks; RTX 4090 Chrome GEMMs
+  1.11–1.24×, attention 1.62×, native step −7%
+  (`docs/runs/2026-11-17-vast-4090-stalls-f16-phones`). AMD RDNA1 Mac
+  (Chrome → Metal): attention 1.33×, cached attention 1.34×, but GEMMs
+  0.90×, hence `FASTWAN_WGPU_F16=attn` / `?f16=attn` (f16 attention, f32
+  GEMMs). Bench FLOP counts are f64: usize is 32 bits on wasm. The old `linear3h` /
+  `flash_h` were 8.5% slower (`docs/runs/2026-11-03-vast-4090-f16`). Default
+  it on only after a real-clip PSNR check and AMD / Apple numbers (Prompt
+  Studio `?selftest=1` → Benchmark f32 vs f16).
 - `--weights int8` (`fastwan_core::quant::Q8`: symmetric int8, one f32 scale
   per 128 input columns) applies to the block linears only. The CPU backend
   dequantizes and is the reference the kernels are checked against. On an RTX
