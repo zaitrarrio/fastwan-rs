@@ -67,7 +67,12 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (`make_memrope_fixture.py`, `hf_parity` 3e-7). RTX 4090 (595.99), 12-frame
   cache: 63 s at 832×480 in 96 s (10.5 fps, ~3 % over the window cache),
   stable; the same weights on the 12-frame window cache break up mid-clip
-  (`docs/runs/2026-11-17-vast-4090-history-forcing`).
+  (`docs/runs/2026-11-17-vast-4090-history-forcing`). After the merge with
+  main's cache ops the MemRoPE clip is byte-identical to the branch's, CUDA
+  70 / 70, WebGPU 70 / 70 on that 4090
+  (`docs/runs/2026-11-18-vast-4090-merge-check`). VSA check cases take
+  bf16-representable inputs: CUDA's bf16 upload rounding flips top-k picks
+  on near-ties of random scores (0.29 on a draw main's new cases produced).
 - LightX2V: LightTAE (`lighttaew2_1[_v2]`) is TAEHV's network on raw VAE
   latents: `TaeConfig::lighttaew2_1` (chosen by file name) applies `z·std +
   mean` (Wan 2.1 VAE stats; a 1×1 diagonal conv on the device, so
