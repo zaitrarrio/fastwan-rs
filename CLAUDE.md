@@ -88,6 +88,12 @@ State and invariants only; the reasoning is in `docs/design.md`.
 - WebGPU refuses software adapters for bench/generate/serve
   (`FASTWAN_ALLOW_SOFTWARE=1` overrides): a missing driver dependency makes
   wgpu fall back to llvmpipe silently.
+- CUDA kernels load as SASS: NVRTC compiles `kernels.cu` for the device's
+  own SM (`sass_arch`, `compile_cubin`, `nvrtcGetCUBIN`), PTX for
+  `compute_XY` only as a fallback (fastvideo-rs's `nvrtc_sass` rule: NVRTC
+  13.4 PTX did not load on driver R595, CUDA_ERROR_UNSUPPORTED_PTX_VERSION).
+  `cargo test -p fastwan-cuda` compiles cubins for sm_89 / sm_120 with
+  libnvrtc alone.
 - WGSL kernels and their CUDA twins share structure (`fw_<op>` in
   `kernels.cu`). Change both. `fw_` because `norm` collides with a CUDA builtin.
 - Shader change → `python3 web/build.py` (the test page inlines the shaders;
