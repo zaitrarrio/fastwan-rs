@@ -431,6 +431,12 @@ pub trait Backend {
         out: &Self::Buf,
     );
 
+    /// `y[y_off + i] = act(y[y_off + i] + d[d_off + i])` for `i < n`: an
+    /// unmerged LoRA branch's delta added to its linear's output before the
+    /// linear's activation (the FFN's GELU), in place on `y`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_act(&self, y: &Self::Buf, y_off: usize, d: &Self::Buf, d_off: usize, n: usize, act: Act);
+
     /// In place on `x` (`n` elements): `x0 = x − σ_t·v`, then
     /// `x = (1 − σ_n)·x0 + σ_n·noise` when `noise` is given.
     fn dmd_step(

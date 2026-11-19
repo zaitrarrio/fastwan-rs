@@ -267,7 +267,36 @@ enum Cmd {
         /// rotated at their slot (block-relative RoPE).
         #[arg(long, value_enum, default_value_t = CausalMemory::Window)]
         memory: CausalMemory,
+        /// A LoRA adapter on the block linears, kept as an unmerged branch:
+        /// `file.safetensors[:strength]`, repeatable. Wan or Diffusers names
+        /// (LongLive-Plug's `generator_lora_lightx2v.safetensors`, its CFG
+        /// `adapter_model.safetensors:0.5`).
+        #[arg(long = "adapter")]
+        adapters: Vec<String>,
+        /// The sampler: FastWan's DMD ladder, or LongLive-Plug's four Euler
+        /// steps for its Wan2.1-T2V-14B few-step LoRA (shift 5, no CFG).
+        #[arg(long, value_enum, default_value_t = ScheduleKind::Fastwan)]
+        schedule: ScheduleKind,
     },
+}
+
+/// `generate --schedule`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ScheduleKind {
+    /// FastWan 2.1's 3-step DMD (1000 / 757 / 522, fresh noise between).
+    Fastwan,
+    /// LongLive-Plug's few-step LoRA on Wan2.1-T2V-14B: 1000 / 750 / 500 /
+    /// 250 shifted 5 (σ 1 / 0.9375 / 0.833 / 0.625), Euler steps.
+    LonglivePlug,
+}
+
+impl ScheduleKind {
+    fn schedule(self) -> DmdSchedule {
+        match self {
+            ScheduleKind::Fastwan => DmdSchedule::fastwan_1_3b(),
+            ScheduleKind::LonglivePlug => DmdSchedule::longlive_plug_wan(),
+        }
+    }
 }
 
 /// `generate --causal --memory`.
@@ -468,9 +497,9 @@ fn main() -> Result<()> {
             out,
         } => {
             // `native` writes every tensor as f16 (the browser's f16 option).
-            let cfg = WanConfig::fastwan_1_3b();
             let t0 = std::time::Instant::now();
             let src = SafetensorsDir::open(&transformer)?;
+            let cfg = src.wan_config().unwrap_or_else(WanConfig::fastwan_1_3b);
             let miss = missing(&src, &wan_manifest(&cfg));
             if !miss.is_empty() {
                 bail!(
@@ -522,6 +551,8 @@ fn main() -> Result<()> {
             cache_frames,
             sink_frames,
             memory,
+            adapters,
+            schedule,
         } => {
             let g = shape.geometry()?;
             let cfg = WanConfig::fastwan_1_3b();
@@ -549,6 +580,9 @@ fn main() -> Result<()> {
             if causal {
                 if runs > 1 {
                     bail!("--causal does not take --runs");
+                }
+                if !adapters.is_empty() || schedule != ScheduleKind::Fastwan {
+                    bail!("--causal runs its own checkpoint's schedule and takes no --adapter");
                 }
                 let mut ccfg = match memory {
                     CausalMemory::Window => fastwan_model::causal::CausalConfig::self_forcing(),
@@ -582,7 +616,9 @@ fn main() -> Result<()> {
                 runs,
                 attn.get(),
                 attn.weights,
-                upscale.as_deref().map(|p| (p, upscale_x as usize))
+                upscale.as_deref().map(|p| (p, upscale_x as usize)),
+                &adapters,
+                schedule,
             )?)
         }
     }
@@ -704,8 +740,20 @@ fn generate<B: Backend>(
     attention: Option<fastwan_model::Attention>,
     quant: fastwan_core::quant::WeightQuant,
     upscale: Option<(&Path, usize)>,
+    adapters: &[String],
+    schedule: ScheduleKind,
 ) -> Result<()> {
-    let cfg = WanConfig::fastwan_1_3b();
+    let wsrc = SafetensorsDir::open(transformer)?;
+    let cfg = wsrc.wan_config().unwrap_or_else(WanConfig::fastwan_1_3b);
+    if cfg != WanConfig::fastwan_1_3b() {
+        println!(
+            "DiT: {} layers, dim {}, {} heads, FFN {}",
+            cfg.layers,
+            cfg.dim(),
+            cfg.heads,
+            cfg.ffn_dim
+        );
+    }
     let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
     if tcfg.latent_channels != cfg.out_channels {
         bail!(
@@ -717,7 +765,6 @@ fn generate<B: Backend>(
     }
     println!("{}", be.name());
     let t0 = std::time::Instant::now();
-    let wsrc = SafetensorsDir::open(transformer)?;
     let miss = missing(&wsrc, &wan_manifest(&cfg));
     if !miss.is_empty() {
         bail!(
@@ -737,13 +784,35 @@ fn generate<B: Backend>(
             &miss[..miss.len().min(3)]
         );
     }
+    let mut ads = Vec::new();
+    for spec in adapters {
+        let (path, strength) = fastwan_core::lora::parse_spec(spec)?;
+        let a = fastwan_core::lora::Adapter::open(&path, strength)?;
+        println!(
+            "adapter {} (strength {strength}): {} modules",
+            path.display(),
+            a.modules().count()
+        );
+        ads.push(a);
+    }
     let pipe = Pipeline {
-        dit: WanDit::load_with(be, cfg.clone(), &wsrc, quant)?,
+        dit: WanDit::load_with_adapters(be, cfg.clone(), &wsrc, quant, ads)?,
         tae: TaeHv::load(be, tcfg, &tsrc)?,
-        schedule: DmdSchedule::fastwan_1_3b(),
+        schedule: schedule.schedule(),
     };
     be.sync();
-    println!("load {:.1}s", t0.elapsed().as_secs_f64());
+    if pipe.dit.lora_rank() > 0 {
+        println!(
+            "LoRA branches: rank {} summed over the block linears",
+            pipe.dit.lora_rank()
+        );
+    }
+    println!(
+        "load {:.1}s; sampler {:?}: timesteps {:?}",
+        t0.elapsed().as_secs_f64(),
+        schedule,
+        pipe.schedule.timesteps
+    );
     let opt = Options {
         geometry: *g,
         seed,

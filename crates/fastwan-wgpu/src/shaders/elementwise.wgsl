@@ -4,6 +4,7 @@
 //   op 2 tanh_clamp:    x = tanh(x / s) · s
 //   op 3 patchify:      x[tok, f] = y[latent]       (gather)
 //   op 4 unpatchify:    x[latent] = y[tok, f]       (gather)
+//   op 5 add_act:       x[c + i] = act(x[c + i] + y[t + i]), act = gelu_tanh if gate != 0
 struct P { n: u32, op: u32, dim: u32, gate: u32, has_aux: u32, c: u32, t: u32, hh: u32, ww: u32, pp: u32, s0: f32, s1: f32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read_write> x: array<f32>;
@@ -21,6 +22,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
             if (p.has_aux != 0u) { x[i] = (1.0 - p.s1) * x0 + p.s1 * aux[i]; } else { x[i] = x0; }
         }
         case 2u: { x[i] = tanh_safe(x[i] / p.s0) * p.s0; }
+        case 5u: {
+            let s = x[p.c + i] + y[p.t + i];
+            if (p.gate != 0u) {
+                x[p.c + i] = 0.5 * s * (1.0 + tanh_safe(0.7978845608 * (s + 0.044715 * s * s * s)));
+            } else {
+                x[p.c + i] = s;
+            }
+        }
         case 3u: {
             // i = tok·F + f, f = c'·p² + kh·p + kw
             let f = p.c * p.pp * p.pp;

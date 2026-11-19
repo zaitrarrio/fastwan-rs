@@ -120,6 +120,26 @@ Add `--upscale realesr-animevideov3.safetensors` to upscale ×4 after the
 decode (convert the official `.pth` with `python3 -I
 scripts/upscale/convert_esrgan.py`; it is loaded tensors-only, without torch).
 
+### Wan2.1-T2V-14B in four steps (LongLive-Plug)
+
+LongLive-Plug's few-step LoRA turns the 14B base model (50 steps + CFG) into a
+4-forward model. The adapter stays an unmerged branch, and the config comes
+from the checkpoint:
+
+```bash
+huggingface-cli download Wan-AI/Wan2.1-T2V-14B-Diffusers --include "transformer/*" --local-dir wan14b
+huggingface-cli download Efficient-Large-Model/LongLive-Plug-Wan2.1-T2V-14B-few-step generator_lora_lightx2v.safetensors --local-dir plug
+./target/release/fastwan quantize --transformer wan14b/transformer --weights native --out wan14b-f16.safetensors
+./target/release/fastwan generate --transformer wan14b-f16.safetensors --tae fastwan/taew2_1.safetensors \
+    --text-encoder fastwan/text_encoder --tokenizer fastwan/tokenizer/tokenizer.json --prompt "a fox in snow" \
+    --schedule longlive-plug --adapter plug/generator_lora_lightx2v.safetensors --out fox14b.y4m
+```
+
+Its CFG adapter (`…-T2V-14B-cfg`, `adapter_model.safetensors`) stacks on top
+with `--adapter adapter_model.safetensors:0.5`; the strength is the guidance
+knob. On an RTX PRO 6000 Server Edition a 832×480×81 clip takes 24.9 s after
+load (4 × 5.65 s) in 33 GB (`docs/runs/2026-11-19-vast-pro6000-wan14b-plug`).
+
 ## WebGPU test page
 
 `web/fastwan-webgpu-bench.html` runs the backend's WGSL kernels in the

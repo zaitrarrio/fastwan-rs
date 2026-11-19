@@ -1783,6 +1783,12 @@ impl Backend for Wgpu {
         );
     }
 
+    fn add_act(&self, y: &GBuf, y_off: usize, d: &GBuf, d_off: usize, n: usize, act: Act) {
+        let gelu = matches!(act, Act::GeluTanh) as u32;
+        let extra = [0, gelu, 0, y_off as u32, d_off as u32, 0, 0, 0];
+        self.elementwise(5, y, Some(d), None, n, extra, [0.0, 0.0]);
+    }
+
     fn tanh_clamp(&self, x: &GBuf, n: usize, s: f32) {
         self.elementwise(2, x, None, None, n, [0; 8], [s, 0.0]);
     }

@@ -57,6 +57,17 @@ impl WanConfig {
         }
     }
 
+    /// `Wan-AI/Wan2.1-T2V-14B(-Diffusers)`: dim 5120, 40 heads, 40 layers,
+    /// FFN 13824 (LongLive-Plug's 14B backbone).
+    pub fn wan21_14b() -> Self {
+        Self {
+            heads: 40,
+            ffn_dim: 13824,
+            layers: 40,
+            ..Self::fastwan_1_3b()
+        }
+    }
+
     /// A graph small enough to run on the CPU reference in a unit test. Head
     /// dim stays a multiple of 6 so the 3-axis RoPE split is non-trivial.
     pub fn tiny() -> Self {
@@ -90,6 +101,9 @@ impl WanConfig {
         match name {
             "fastwan-1.3b" | "fastwan21-1.3b" | "FastVideo/FastWan2.1-T2V-1.3B-Diffusers" => {
                 Some(Self::fastwan_1_3b())
+            }
+            "wan21-14b" | "wan2.1-14b" | "Wan-AI/Wan2.1-T2V-14B-Diffusers" => {
+                Some(Self::wan21_14b())
             }
             "tiny" => Some(Self::tiny()),
             _ => None,

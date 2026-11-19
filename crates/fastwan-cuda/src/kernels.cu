@@ -233,6 +233,17 @@ extern "C" __global__ void fw_kv_ema(u64 buf_, int heads, int hd, long head_stri
         }
 }
 
+// y[y_off + i] = act(y[y_off + i] + d[d_off + i]) (Backend::add_act: a LoRA
+// branch's delta before its linear's activation).
+extern "C" __global__ void fw_add_act(u64 y_, long y_off, const u64 d_, long d_off, long n, int gelu) {
+    bf16_t* y = (bf16_t*)y_ + y_off;
+    const bf16_t* d = (const bf16_t*)d_ + d_off;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float s = ld(y, i) + ld(d, i);
+    y[i] = bf(gelu ? gelu_tanh(s) : s);
+}
+
 extern "C" __global__ void fw_tanh_clamp(u64 x_, long n, float s) {
     bf16_t* x = (bf16_t*)x_;
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;

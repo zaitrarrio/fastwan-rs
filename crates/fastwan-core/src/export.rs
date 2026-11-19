@@ -23,7 +23,7 @@ use crate::{
     quant::{Q4, Q8, WeightQuant},
     weights::{SafetensorsDir, WeightSource, wan_manifest},
 };
-use safetensors::Dtype;
+pub use safetensors::Dtype;
 use std::collections::HashMap;
 use std::path::Path;
 

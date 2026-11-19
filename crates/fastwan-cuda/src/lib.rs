@@ -107,6 +107,7 @@ struct Kernels {
     gate_residual: CudaFunction,
     dmd_step: CudaFunction,
     tanh_clamp: CudaFunction,
+    add_act: CudaFunction,
     rope_heads: CudaFunction,
     kv_ema: CudaFunction,
     pack_rgba8: CudaFunction,
@@ -360,6 +361,7 @@ impl Cuda {
             gate_residual: get("fw_gate_residual")?,
             dmd_step: get("fw_dmd_step")?,
             tanh_clamp: get("fw_tanh_clamp")?,
+            add_act: get("fw_add_act")?,
             rope_heads: get("fw_rope_heads")?,
             kv_ema: get("fw_kv_ema")?,
             pack_rgba8: get("fw_pack_rgba8")?,
@@ -458,7 +460,7 @@ impl Cuda {
 
     fn kernel_name(&self, f: &CudaFunction) -> &'static str {
         let k = &self.f;
-        let all: [(&CudaFunction, &'static str); 24] = [
+        let all: [(&CudaFunction, &'static str); 25] = [
             (&k.attention_mma_v[0], "attention (mma v1)"),
             (&k.attention_mma_v[1], "attention (mma v2)"),
             (&k.vsa_fine_mma_v[0], "vsa fine (mma v1)"),
@@ -475,6 +477,7 @@ impl Cuda {
             (&k.gate_residual, "gate_residual"),
             (&k.dmd_step, "dmd_step"),
             (&k.tanh_clamp, "tanh_clamp"),
+            (&k.add_act, "add_act"),
             (&k.rope_heads, "rope_heads"),
             (&k.kv_ema, "kv_ema"),
             (&k.patch, "patchify"),
@@ -1361,6 +1364,22 @@ impl Backend for Cuda {
                 Arg::I(frame_rows as i32),
                 Arg::F(alphas[0]),
                 Arg::F(alphas[1]),
+            ],
+        );
+    }
+
+    fn add_act(&self, y: &CuBuf, y_off: usize, d: &CuBuf, d_off: usize, n: usize, act: Act) {
+        self.launch(
+            &self.f.add_act,
+            Self::elems(n),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(y)),
+                Arg::L(y_off as i64),
+                Arg::P(self.ptr(d)),
+                Arg::L(d_off as i64),
+                Arg::L(n as i64),
+                Arg::I(matches!(act, Act::GeluTanh) as i32),
             ],
         );
     }
