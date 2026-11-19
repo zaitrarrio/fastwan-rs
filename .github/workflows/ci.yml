@@ -1,0 +1,131 @@
+# CI for fastwan-rs: the test contract of CLAUDE.md on hardware GitHub has (no GPU).
+#
+#   check   rustfmt, cargo check of every target, and the CUDA builds of the
+#           `fastwan` binary (`cuda` = 12.8 bindings, `cuda-13`): cudarc loads
+#           the driver at run time, so they compile without a toolkit.
+#   test    cargo test --workspace on lavapipe (mesa's CPU Vulkan driver):
+#           the CPU reference, the HF parity fixtures, the tiny pipeline and
+#           the WebGPU conformance suite (`FASTWAN_ALLOW_SOFTWARE=1` accepts
+#           the software adapter), plus `web_page_embeds_current_shaders`.
+#   cuda    cargo test -p fastwan-cuda with libnvrtc from the pip wheel: the
+#           kernels NVRTC-compile for sm_80 / 89 / 100 / 120; fails if the
+#           test skipped rather than passing vacuously.
+#   wasm    cargo check of the browser crate for wasm32-unknown-unknown.
+#   site    web/build.py assembles the Pages tree.
+#
+# No speed numbers come from here: CLAUDE.md's rule is a named card, and
+# lavapipe is only a conformance oracle.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: cargo check (every target, default features)
+        run: cargo check --workspace --all-targets --locked
+      - name: cargo check (the CUDA builds of the fastwan binary)
+        run: |
+          cargo check -p fastwan-cli --features cuda --locked
+          cargo check -p fastwan-cli --features cuda-13 --locked
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - name: lavapipe (mesa's CPU Vulkan driver)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends mesa-vulkan-drivers vulkan-tools
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json vulkaninfo --summary | grep -iE 'deviceName|llvmpipe' || true
+      - name: cargo test --workspace (CPU reference, parity, WebGPU on lavapipe)
+        env:
+          CI: "1"
+          FASTWAN_ALLOW_SOFTWARE: "1"
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+        run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee test.log
+      - name: the WebGPU suite ran on lavapipe, not skipped
+        run: |
+          # lavapipe has no shader-f16, so the f16 conformance case legitimately skips;
+          # any other skip means no usable Vulkan adapter.
+          if grep '^skipping:' test.log | grep -v 'shader-f16'; then
+            echo 'a WebGPU test skipped: no usable Vulkan adapter'; exit 1
+          fi
+          grep -E '^test result' test.log
+
+  cuda:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cuda
+      - name: libnvrtc from the pip wheel (no toolkit, no GPU)
+        run: |
+          python3 -m venv .nvrtc
+          .nvrtc/bin/pip install -q "nvidia-cuda-nvrtc-cu12==12.8.*"
+          echo "LD_LIBRARY_PATH=$(echo "$PWD"/.nvrtc/lib/python3.*/site-packages/nvidia/cuda_nvrtc/lib)" >> "$GITHUB_ENV"
+      - name: cargo test -p fastwan-cuda (kernels NVRTC-compile for sm_80 / 89 / 100 / 120)
+        run: cargo test -p fastwan-cuda --locked -- --nocapture 2>&1 | tee cuda.log
+      - name: the kernels compiled, the test did not skip
+        run: |
+          if grep -q 'skipping: libnvrtc not loadable' cuda.log; then
+            echo 'libnvrtc was not loadable: the compile test skipped'; exit 1
+          fi
+          grep -E 'kernels_compile_for_ampere_ada_and_blackwell .* ok' cuda.log
+
+  wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - name: cargo check (the browser crate)
+        run: cargo check --target wasm32-unknown-unknown -p fastwan-web --locked
+
+  site:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the Pages tree
+        run: |
+          python3 web/build.py
+          test -s web/site/index.html && test -s web/site/demo/index.html
