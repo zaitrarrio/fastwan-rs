@@ -73,6 +73,25 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (`docs/runs/2026-11-18-vast-4090-merge-check`). VSA check cases take
   bf16-representable inputs: CUDA's bf16 upload rounding flips top-k picks
   on near-ties of random scores (0.29 on a draw main's new cases produced).
+- Wan2.1-T2V-14B (`WanConfig::wan21_14b`; `SafetensorsDir::wan_config`
+  infers any Wan DiT's config from its shapes, so `generate` / `quantize`
+  take it unflagged) with LongLive-Plug's few-step LoRA
+  (`generate --schedule longlive-plug --adapter FILE[:STRENGTH]`, Apache-2.0):
+  `DmdSchedule::longlive_plug_wan` is LightX2V's step-distill ladder from the
+  adapter's `inference_config.json` (1000 / 750 / 500 / 250 shifted 5:
+  σ 1 / 0.9375 / 0.833 / 0.625, timesteps σ·1000 fractional, Euler
+  `x − (σ − σ_next)·v`, last step x0, no CFG; `DmdSchedule::renoise` false).
+  Adapters (`fastwan_core::lora`: Wan or Diffusers names, PEFT / ComfyUI
+  prefixes, per-module `.alpha`) stay **unmerged** branches on the block
+  linears, never merged into the bf16 / f16 device weights: W x, then x·Aᵀ
+  and ·Bᵀ in 2048-row chunks, `Backend::add_act` adding the delta before
+  the FFN's GELU; fused QKV / KV get a block-diagonal B, stacked adapters
+  concatenate ranks (the CFG LoRA at 0.5 stacks on the few-step one, as
+  LongLive-Plug combines them for Wan). The checker holds the branches to
+  the merged f32 weights on the CPU (1.4e-7). RTX PRO 6000 Server Edition
+  (580.178.04): 832×480×81 in 24.9 s after load (4 × 5.65 s, the branch
+  0.48 s of each), 33 GB; the same 4 steps without the adapter make a grey
+  blur (`docs/runs/2026-11-19-vast-pro6000-wan14b-plug`).
 - LightX2V: LightTAE (`lighttaew2_1[_v2]`) is TAEHV's network on raw VAE
   latents: `TaeConfig::lighttaew2_1` (chosen by file name) applies `z·std +
   mean` (Wan 2.1 VAE stats; a 1×1 diagonal conv on the device, so

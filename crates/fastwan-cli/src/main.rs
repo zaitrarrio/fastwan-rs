@@ -802,7 +802,10 @@ fn generate<B: Backend>(
     };
     be.sync();
     if pipe.dit.lora_rank() > 0 {
-        println!("LoRA branches: total rank {}", pipe.dit.lora_rank());
+        println!(
+            "LoRA branches: rank {} summed over the block linears",
+            pipe.dit.lora_rank()
+        );
     }
     println!(
         "load {:.1}s; sampler {:?}: timesteps {:?}",
