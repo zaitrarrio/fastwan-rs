@@ -65,7 +65,9 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Measured locally on a loaded 4-core box: 29 min wall, the WebGPU
+    # conformance suite (1110 s) and the model tests (590 s) on lavapipe.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
