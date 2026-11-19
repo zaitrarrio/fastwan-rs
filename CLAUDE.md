@@ -46,13 +46,41 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (`docs/runs/2026-11-14-vast-4090-self-forcing-long`). Below ~320×192 the
   model gives noise (out of distribution, not a bug). A 60 s video drifts
   (a subject leaves and returns) but stays one scene.
-- History Forcing's `dmd/model.pt` (same architecture; weights have **no
-  stated licence**: evaluation only) runs with `--cache-frames 21
-  --sink-frames 3`, its trained window. 60 s on an RTX 4090: same speed as
-  Self-Forcing at 21/3 (7.9 fps; 21 frames cost ~30% more than 12), keeps
-  the prompted subject and moves more, but over-saturates and shows light
-  streaks (`docs/runs/2026-11-17-runpod-4090-history-forcing`). MemRoPE (its
-  optional demo cache) is not implemented; the vendored code is CC-BY-NC-SA.
+- History Forcing's `dmd/model.pt` (same architecture; `xzxxntxdy/History-
+  Forcing`, EMA, through `convert_self_forcing.py`; weights have **no stated
+  licence**: evaluation only, not hosted) runs two ways. Window cache at its
+  trained window, `--cache-frames 21 --sink-frames 3`: 60 s on an RTX 4090
+  at Self-Forcing's speed at 21/3 (7.9 fps; 21 frames cost ~30% more than
+  12), keeps the prompted subject and moves more, but over-saturates and
+  shows light streaks (`docs/runs/2026-11-17-runpod-4090-history-forcing`).
+  MemRoPE (`generate --causal --memory memrope`, `CausalConfig::
+  history_forcing`, its demo config): the cache is `[sink 3 | long EMA |
+  short EMA | recent 4 | block 3]` in slot order; keys are stored
+  **unrotated** and `rope_heads` rotates the valid prefix at slot positions
+  0.. every forward into the scratch (queries at the block's slots;
+  `attention_kv` reads it, and V in place, where the backend is strided); a
+  new block that does not fit averages the evicted recent frames over all
+  their tokens (`kv_ema`) into the memory frames (α 0.01 / 0.1; the first
+  eviction sets both) and the kept recent frames move up through the
+  scratch (no self-copies on WebGPU). MemRoPE caches are f32 (`half_kv` is
+  ignored). Checked against a transcription of MemRoPE's attention
+  (`make_memrope_fixture.py`, `hf_parity` 3e-7). RTX 4090 (595.99), 12-frame
+  cache: 63 s at 832×480 in 96 s (10.5 fps, ~3 % over the window cache),
+  stable; the same weights on the 12-frame window cache break up mid-clip
+  (`docs/runs/2026-11-17-vast-4090-history-forcing`). After the merge with
+  main's cache ops the MemRoPE clip is byte-identical to the branch's, CUDA
+  70 / 70, WebGPU 70 / 70 on that 4090
+  (`docs/runs/2026-11-18-vast-4090-merge-check`). VSA check cases take
+  bf16-representable inputs: CUDA's bf16 upload rounding flips top-k picks
+  on near-ties of random scores (0.29 on a draw main's new cases produced).
+- LightX2V: LightTAE (`lighttaew2_1[_v2]`) is TAEHV's network on raw VAE
+  latents: `TaeConfig::lighttaew2_1` (chosen by file name) applies `z·std +
+  mean` (Wan 2.1 VAE stats; a 1×1 diagonal conv on the device, so
+  `launch_chunk_dev` gets it too) before TAEHV's clamp; it cannot be folded
+  into the first conv (the clamp comes first). `convert_lightx2v_fp8.py`
+  decodes `lightx2v/Self-Forcing-FP8` (E4M3 × per-row scale) to bf16
+  exactly. LightTAE vs TAEHV on the same latents: 35.4 dB, same cost; the
+  FP8 weights make another sample of the scene (21 dB vs bf16), like int4.
 - K/V cache ops: `kv_store` (one dispatch per run of slots, all heads) and
   `attention_kv` (flash3 reads the cache in place with a head stride; no
   prefix packing), `alloc_kv(n, half)` for a 16-bit cache (f16 pairs via core

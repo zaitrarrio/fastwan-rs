@@ -443,6 +443,48 @@ pub trait Backend {
         n: usize,
     );
 
+    /// RoPE over head-major rows (MemRoPE's cached keys, rotated at their
+    /// slot position on every forward): for each head `h < heads` and row
+    /// `r < rows`, `dst[dst_off + h·dst_stride + r·head_dim ..]` is
+    /// `src[src_off + h·src_stride + r·head_dim ..]` rotated by row `r` of
+    /// `cos`/`sin` (`[rows, head_dim / 2]`, interleaved pairs, as
+    /// [`Backend::head_split`]). `src` and `dst` must be distinct buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_heads(
+        &self,
+        src: &Self::Buf,
+        src_off: usize,
+        src_stride: usize,
+        dst: &Self::Buf,
+        dst_off: usize,
+        dst_stride: usize,
+        heads: usize,
+        rows: usize,
+        head_dim: usize,
+        rope: (&Self::Buf, &Self::Buf),
+    );
+
+    /// MemRoPE's EMA memory, in place on one head-major cache buffer
+    /// (`[heads, ·, head_dim]`, heads `head_stride` elements apart): per head
+    /// and channel, `m` = the mean of rows `[src_row, src_row + src_rows)`;
+    /// then for `i` in 0..2 every row of `[dst_row + i·frame_rows,
+    /// dst_row + (i + 1)·frame_rows)` becomes `alphas[i]·m + (1 − alphas[i])·x`
+    /// (`alphas = [1, 1]` initialises both memory frames to the mean). The
+    /// source and destination rows must not overlap.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_ema(
+        &self,
+        buf: &Self::Buf,
+        heads: usize,
+        head_stride: usize,
+        head_dim: usize,
+        src_row: usize,
+        src_rows: usize,
+        dst_row: usize,
+        frame_rows: usize,
+        alphas: [f32; 2],
+    );
+
     // ---- decoder ---------------------------------------------------------
     /// `out = epilogue(conv(cat([a, b]), W) + bias)`; `W` is `[cout, cin·k²]`.
     #[allow(clippy::too_many_arguments)]
