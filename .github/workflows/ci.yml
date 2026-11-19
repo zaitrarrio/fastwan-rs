@@ -54,6 +54,15 @@ jobs:
           cargo check -p fastwan-cli --features cuda --locked
           cargo check -p fastwan-cli --features cuda-13 --locked
 
+      - name: the cuda-13 binary has the CUDA backend compiled in
+        # A build with only `cuda-13` once compiled the backend out (the cfg
+        # gates keyed on the `cuda` feature name): on this GPU-less runner the
+        # error must be the driver's absence, never "built without CUDA".
+        run: |
+          cargo build -p fastwan-cli --features cuda-13 --locked
+          out="$(./target/debug/fastwan check --backend cuda 2>&1 || true)"; echo "$out" | tail -3
+          if echo "$out" | grep -q 'built without CUDA'; then exit 1; fi
+
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
