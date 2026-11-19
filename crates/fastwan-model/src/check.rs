@@ -223,6 +223,22 @@ pub fn ops_deferred<B: Backend>(be: &B, tol: f32) -> Deferred<B> {
     }
 }
 
+/// Random inputs rounded to bf16 (nearest even on the top 16 bits; finite
+/// inputs). The VSA cases need it on both sides: CUDA rounds uploads to bf16,
+/// and with random q / k the pooled tile scores sit so close together that
+/// the rounding alone flips top-k picks (the CPU oracle on bf16-rounded inputs
+/// moves 0.41 / 0.21 from its f32 self on the model grids), which the backend
+/// would be charged for. The small d128 case failed the same way on an RTX
+/// PRO 6000 (rel 0.28) while every other check passed.
+fn bf16_round(x: Vec<f32>) -> Vec<f32> {
+    x.into_iter()
+        .map(|v| {
+            let b = v.to_bits();
+            f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        })
+        .collect()
+}
+
 /// VSA at the token grids the browser runs (480×272×81 and 832×480×81 after
 /// the 2×2 patch), d = 128 like the model, few heads to keep the CPU
 /// reference cheap. The small cases in `ops` never exceed 256 key tiles.
@@ -232,25 +248,11 @@ fn vsa_real<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         let (d, sparsity) = (128, 0.8);
         let spec = fastwan_core::vsa::VsaSpec::new(grid, heads, d, sparsity);
         let s = spec.plan.seq;
-        // bf16-representable inputs: CUDA rounds uploads to bf16, and with
-        // random q / k the pooled tile scores sit so close together that the
-        // rounding alone flips top-k picks (the CPU oracle on bf16-rounded
-        // inputs moves 0.41 / 0.21 from its f32 self), which the backend
-        // would be charged for. Both sides get the same rounded values.
-        let bf = |x: Vec<f32>| -> Vec<f32> {
-            // Round to nearest even on the top 16 bits (finite inputs).
-            x.into_iter()
-                .map(|v| {
-                    let b = v.to_bits();
-                    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
-                })
-                .collect()
-        };
         let (q, k, v, g) = (
-            bf(rng.normal(heads * s * d)),
-            bf(rng.normal(heads * s * d)),
-            bf(rng.normal(heads * s * d)),
-            bf(rng.normal(heads * s * d)),
+            bf16_round(rng.normal(heads * s * d)),
+            bf16_round(rng.normal(heads * s * d)),
+            bf16_round(rng.normal(heads * s * d)),
+            bf16_round(rng.normal(heads * s * d)),
         );
         let (gq, gk, gv, gg, go) = (
             be.upload(&q),
@@ -616,10 +618,10 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         let spec = fastwan_core::vsa::VsaSpec::new(grid, heads, d, sparsity);
         let s = spec.plan.seq;
         let (q, k, v, g) = (
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
+            bf16_round(rng.normal(heads * s * d)),
+            bf16_round(rng.normal(heads * s * d)),
+            bf16_round(rng.normal(heads * s * d)),
+            bf16_round(rng.normal(heads * s * d)),
         );
         let (gq, gk, gv, gg, go) = (
             be.upload(&q),
