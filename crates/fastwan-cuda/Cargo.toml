@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cublas", "cublaslt", "nvrtc", "dynamic-loading", "cuda-12080", "f16"] }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cublas", "cublaslt", "nvrtc", "dynamic-loading", "f16"] }
 fastwan-core = { version = "0.1.0", path = "../fastwan-core" }
 half = "2.7.1"
+
+[features]
+# The CUDA generation cudarc binds against; the libraries are loaded at run
+# time, so this only has to match what the host image ships (12.8 for the
+# nvidia/cuda:12.8 runtime, 13 for fastvideo-studio's image).
+cuda-12 = ["cudarc/cuda-12080"]
+cuda-13 = ["cudarc/cuda-13000"]

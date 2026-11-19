@@ -19,7 +19,10 @@ tiny_http = "0.12.0"
 
 [features]
 default = []
-cuda = ["dep:fastwan-cuda"]
+# `cuda` binds cudarc to CUDA 12.8, `cuda-13` to CUDA 13 (fastvideo-studio's
+# image); the libraries are loaded at run time either way.
+cuda = ["dep:fastwan-cuda", "fastwan-cuda/cuda-12"]
+cuda-13 = ["dep:fastwan-cuda", "fastwan-cuda/cuda-13"]
 
 [[bin]]
 name = "fastwan"
