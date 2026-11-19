@@ -8,7 +8,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 fastwan-core = { version = "0.1.0", path = "../fastwan-core" }
 fastwan-cpu = { version = "0.1.0", path = "../fastwan-cpu" }
-fastwan-cuda = { version = "0.1.0", path = "../fastwan-cuda", optional = true }
+fastwan-cuda = { version = "0.1.0", path = "../fastwan-cuda", optional = true, default-features = false }
 fastwan-model = { version = "0.1.0", path = "../fastwan-model" }
 fastwan-text = { version = "0.1.0", path = "../fastwan-text" }
 fastwan-wgpu = { version = "0.1.0", path = "../fastwan-wgpu" }
@@ -19,7 +19,10 @@ tiny_http = "0.12.0"
 
 [features]
 default = []
-cuda = ["dep:fastwan-cuda"]
+# `cuda` binds cudarc to CUDA 12.8, `cuda-13` to CUDA 13 (fastvideo-studio's
+# image); the libraries are loaded at run time either way.
+cuda = ["dep:fastwan-cuda", "fastwan-cuda/cuda-12"]
+cuda-13 = ["dep:fastwan-cuda", "fastwan-cuda/cuda-13"]
 
 [[bin]]
 name = "fastwan"

@@ -330,12 +330,12 @@ macro_rules! with_backend {
                 $body
             }
             BackendKind::Cuda => {
-                #[cfg(feature = "cuda")]
+                #[cfg(any(feature = "cuda", feature = "cuda-13"))]
                 {
                     let $be = fastwan_cuda::Cuda::new(0).map_err(|e| anyhow::anyhow!("{e}"))?;
                     $body
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(any(feature = "cuda", feature = "cuda-13")))]
                 {
                     bail!("built without CUDA: cargo build --release --features cuda")
                 }
@@ -356,7 +356,7 @@ fn resolve(kind: BackendKind) -> BackendKind {
     if kind != BackendKind::Auto {
         return kind;
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cuda-13"))]
     if fastwan_cuda::Cuda::new(0).is_ok() {
         return BackendKind::Cuda;
     }
