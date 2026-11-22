@@ -184,7 +184,9 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     model(&mut p);
     upscaler(&mut p);
     causal(&mut p);
+    causal_memrope(&mut p);
     pack(&mut p, &mut rng);
+    unpack(&mut p, &mut rng);
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
     model_vsa(
@@ -215,6 +217,7 @@ pub fn ops_deferred<B: Backend>(be: &B, tol: f32) -> Deferred<B> {
     ops(&mut p, &mut rng);
     vsa_real(&mut p, &mut rng);
     pack(&mut p, &mut rng);
+    unpack(&mut p, &mut rng);
     Deferred {
         done: p.out,
         pending: p.pending,
@@ -224,17 +227,34 @@ pub fn ops_deferred<B: Backend>(be: &B, tol: f32) -> Deferred<B> {
 /// VSA at the token grids the browser runs (480×272×81 and 832×480×81 after
 /// the 2×2 patch), d = 128 like the model, few heads to keep the CPU
 /// reference cheap. The small cases in `ops` never exceed 256 key tiles.
+/// `x` rounded to bf16 (nearest even on the top 16 bits, finite inputs):
+/// the values CUDA's uploads hold, so a VSA case's top-k sees the same
+/// scores on both sides.
+fn bf(x: Vec<f32>) -> Vec<f32> {
+    x.into_iter()
+        .map(|v| {
+            let b = v.to_bits();
+            f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        })
+        .collect()
+}
+
 fn vsa_real<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
     let (be, cpu) = (p.be, &Cpu);
     for &(grid, heads) in &[((21, 17, 30), 2), ((21, 30, 52), 1)] {
         let (d, sparsity) = (128, 0.8);
         let spec = fastwan_core::vsa::VsaSpec::new(grid, heads, d, sparsity);
         let s = spec.plan.seq;
+        // bf16-representable inputs: CUDA rounds uploads to bf16, and with
+        // random q / k the pooled tile scores sit so close together that the
+        // rounding alone flips top-k picks (the CPU oracle on bf16-rounded
+        // inputs moves 0.41 / 0.21 from its f32 self), which the backend
+        // would be charged for. Both sides get the same rounded values.
         let (q, k, v, g) = (
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
+            bf(rng.normal(heads * s * d)),
+            bf(rng.normal(heads * s * d)),
+            bf(rng.normal(heads * s * d)),
+            bf(rng.normal(heads * s * d)),
         );
         let (gq, gk, gv, gg, go) = (
             be.upload(&q),
@@ -535,7 +555,66 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         p.record(format!("attention h{heads} {sq}x{sk} d{d}"), g, c);
     }
 
-    // VSA: partial tiles in every axis, two head dims, two sparsities.
+    // K/V cache: stores in two runs (one landing mid-cache), attention over
+    // the valid prefix of a larger cache read in place, f32 and 16-bit.
+    for &(heads, sq, valid, cap, d, half) in &[
+        (3, 70, 130, 200, 128, false),
+        (3, 70, 130, 200, 128, true),
+        (2, 33, 64, 96, 64, true),
+        (12, 100, 300, 300, 128, true),
+    ] {
+        let (strided, can_half) = be.kv_caps(d);
+        let half = half && can_half;
+        let cap = if strided { cap } else { valid };
+        let n = valid + 7; // source rows; the store takes rows 3 .. 3 + valid
+        let (q, k, v) = (
+            rng.normal(heads * sq * d),
+            rng.normal(heads * n * d),
+            rng.normal(heads * n * d),
+        );
+        let a = valid / 3;
+        let (gq, gk, gv, gkc, gvc, go) = (
+            be.upload(&q),
+            be.upload(&k),
+            be.upload(&v),
+            be.alloc_kv(heads * cap * d, half),
+            be.alloc_kv(heads * cap * d, half),
+            be.alloc(sq * heads * d),
+        );
+        // rows 3 .. 3 + a to cache rows 0 .. a; the rest after them.
+        be.kv_store(&gk, n, 3, a, heads, d, &gkc, 0, cap, half);
+        be.kv_store(&gk, n, 3 + a, valid - a, heads, d, &gkc, a, cap, half);
+        be.kv_store(&gv, n, 3, a, heads, d, &gvc, 0, cap, half);
+        be.kv_store(&gv, n, 3 + a, valid - a, heads, d, &gvc, a, cap, half);
+        be.attention_kv(&gq, &gkc, &gvc, heads, sq, valid, cap, d, half, &go);
+        let (cq, ck, cv, ckc, cvc, co) = (
+            cpu.upload(&q),
+            cpu.upload(&k),
+            cpu.upload(&v),
+            cpu.alloc_kv(heads * cap * d, half),
+            cpu.alloc_kv(heads * cap * d, half),
+            cpu.alloc(sq * heads * d),
+        );
+        cpu.kv_store(&ck, n, 3, a, heads, d, &ckc, 0, cap, half);
+        cpu.kv_store(&ck, n, 3 + a, valid - a, heads, d, &ckc, a, cap, half);
+        cpu.kv_store(&cv, n, 3, a, heads, d, &cvc, 0, cap, half);
+        cpu.kv_store(&cv, n, 3 + a, valid - a, heads, d, &cvc, a, cap, half);
+        cpu.attention_kv(&cq, &ckc, &cvc, heads, sq, valid, cap, d, half, &co);
+        let want = cpu.download(&co);
+        p.record(
+            format!(
+                "kv cache h{heads} {sq}x{valid}/{cap} d{d}{}",
+                if half { " f16" } else { "" }
+            ),
+            p.dl(go),
+            want,
+        );
+    }
+
+    // VSA: partial tiles in every axis, two head dims, two sparsities. The
+    // inputs are bf16-representable like the model-grid cases': bf16 upload
+    // rounding alone moved (5, 6, 9) by 0.29 from its f32 oracle once the
+    // RNG draw changed (a top-k near-tie), which CUDA was charged for.
     for &(grid, heads, d, sparsity) in &[
         ((5, 6, 9), 2, 128, 0.75),
         ((4, 8, 8), 3, 16, 0.5),
@@ -544,10 +623,10 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         let spec = fastwan_core::vsa::VsaSpec::new(grid, heads, d, sparsity);
         let s = spec.plan.seq;
         let (q, k, v, g) = (
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
-            rng.normal(heads * s * d),
+            bf(rng.normal(heads * s * d)),
+            bf(rng.normal(heads * s * d)),
+            bf(rng.normal(heads * s * d)),
+            bf(rng.normal(heads * s * d)),
         );
         let (gq, gk, gv, gg, go) = (
             be.upload(&q),
@@ -606,6 +685,104 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         cpu.tanh_clamp(&cx, n, 3.0);
         let (g, c) = (p.dl(gx), cpu.download(&cx));
         p.record("dmd_step + tanh_clamp", g, c);
+    }
+
+    // MemRoPE cache ops: rope_heads between strided head layouts, kv_ema
+    // (initialising and blending) on a [heads, rows, d] cache.
+    {
+        let (heads, rows, d, stride) = (3, 37, 24, 50 * 24);
+        let src = rng.normal(heads * stride);
+        let half = d / 2;
+        let ang: Vec<f32> = (0..rows * half)
+            .map(|i| (i as f32 * 0.37).sin() * 3.0)
+            .collect();
+        let (cs, sn): (Vec<f32>, Vec<f32>) = ang.iter().map(|a| (a.cos(), a.sin())).unzip();
+        let n_out = heads * rows * d + 5;
+        let gs = be.upload(&src);
+        let go = be.alloc(n_out);
+        let (gc, gn) = (be.upload_table(&cs), be.upload_table(&sn));
+        be.rope_heads(
+            &gs,
+            2 * d,
+            stride,
+            &go,
+            5,
+            rows * d,
+            heads,
+            rows,
+            d,
+            (&gc, &gn),
+        );
+        let cs_ = cpu.upload(&src);
+        let co = cpu.alloc(n_out);
+        let (cc, cn) = (cpu.upload_table(&cs), cpu.upload_table(&sn));
+        cpu.rope_heads(
+            &cs_,
+            2 * d,
+            stride,
+            &co,
+            5,
+            rows * d,
+            heads,
+            rows,
+            d,
+            (&cc, &cn),
+        );
+        let (g, c) = (p.dl(go), cpu.download(&co));
+        p.record("rope_heads 3x37x24 (strided)", g, c);
+
+        let frame = 6;
+        let buf = rng.normal(heads * stride);
+        let gb = be.upload(&buf);
+        let cb = cpu.upload(&buf);
+        // First eviction: both memory frames become the mean of 3 frames;
+        // then a blend with the long / short rates.
+        be.kv_ema(
+            &gb,
+            heads,
+            stride,
+            d,
+            5 * frame,
+            3 * frame,
+            frame,
+            frame,
+            [1.0, 1.0],
+        );
+        cpu.kv_ema(
+            &cb,
+            heads,
+            stride,
+            d,
+            5 * frame,
+            3 * frame,
+            frame,
+            frame,
+            [1.0, 1.0],
+        );
+        be.kv_ema(
+            &gb,
+            heads,
+            stride,
+            d,
+            3 * frame + 1,
+            2 * frame + 3,
+            frame,
+            frame,
+            [0.01, 0.1],
+        );
+        cpu.kv_ema(
+            &cb,
+            heads,
+            stride,
+            d,
+            3 * frame + 1,
+            2 * frame + 3,
+            frame,
+            frame,
+            [0.01, 0.1],
+        );
+        let (g, c) = (p.dl(gb), cpu.download(&cb));
+        p.record("kv_ema init + blend 3x50x24", g, c);
     }
 
     // conv2d: 3×3 with concat + upsample + epilogues, 1×1.
@@ -803,6 +980,35 @@ fn model<B: Backend>(p: &mut Pair<'_, B>) {
     p.record("tiny TAEHV decode (frames)", gf, cf);
 }
 
+/// `unpack_rgba8` (8-bit RGBA words → planar RGB in [0, 1], the upscaler's
+/// input): exact up to the backend's activation precision.
+fn unpack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
+    let (be, cpu) = (p.be, &Cpu);
+    let (frames, plane) = (3, 7 * 11);
+    let words: Vec<u32> = rng
+        .uniform(frames * plane * 3, 1.0)
+        .chunks_exact(3)
+        .map(|c| {
+            let q = |v: f32| ((v + 1.0) * 127.5) as u32;
+            q(c[0]) | q(c[1]) << 8 | q(c[2]) << 16 | 0xff00_0000
+        })
+        .collect();
+    let (gs, cs) = (be.upload_words(&words), cpu.upload_words(&words));
+    let (go, co) = (be.alloc(frames * 3 * plane), cpu.alloc(frames * 3 * plane));
+    be.unpack_rgba8(&gs, frames, plane, &go);
+    cpu.unpack_rgba8(&cs, frames, plane, &co);
+    p.record("unpack_rgba8 3 frames", p.dl(go), cpu.download(&co));
+    // A frame range of packed words copied out (the upscaler's batches).
+    let (gw, cw) = (be.alloc_words(2 * plane), cpu.alloc_words(2 * plane));
+    be.copy(&gs, plane, &gw, 0, 2 * plane);
+    cpu.copy(&cs, plane, &cw, 0, 2 * plane);
+    p.record_rgba8(
+        "copy of packed words (frames 1..3)",
+        p.dl(gw),
+        cpu.download(&cw),
+    );
+}
+
 /// `pack_rgba8` (decoder / upscaler output → 8-bit RGBA), with and without
 /// the residual, values straddling [0, 1]; compared as 8-bit levels.
 fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
@@ -816,6 +1022,7 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
                 h: 5,
                 w: 7,
                 p: 2,
+                down: 1,
             },
             false,
         ),
@@ -826,6 +1033,18 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
                 h: 6,
                 w: 9,
                 p: 4,
+                down: 1,
+            },
+            true,
+        ),
+        (
+            PackShape {
+                frames: 2,
+                skip: 1,
+                h: 5,
+                w: 6,
+                p: 4,
+                down: 2,
             },
             true,
         ),
@@ -858,8 +1077,8 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
         cpu.pack_rgba8(&cs, with_base.then_some(&cb), &s, &co);
         p.record_rgba8(
             format!(
-                "pack_rgba8 p{} skip {} base {with_base} (≤1 level)",
-                s.p, s.skip
+                "pack_rgba8 p{} down {} skip {} base {with_base} (≤1 level)",
+                s.p, s.down, s.skip
             ),
             p.dl(go),
             cpu.download(&co),
@@ -872,9 +1091,15 @@ fn pack<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
 /// evict), four DMD steps each plus the clean rewrite; the GPU's latents vs
 /// the CPU's, block by block (the cache carries any error forward).
 fn causal<B: Backend>(p: &mut Pair<'_, B>) {
+    causal_with(p, WanConfig::tiny(), false);
+    // head_dim 32: the cache is read in place by the flash kernel (where the
+    // backend can) and stored as 16-bit values.
+    causal_with(p, WanConfig::tiny_vsa(), true);
+}
+
+fn causal_with<B: Backend>(p: &mut Pair<'_, B>, cfg: WanConfig, half_kv: bool) {
     use crate::causal::{CausalConfig, CausalRollout};
     let (be, cpu) = (p.be, &Cpu);
-    let cfg = WanConfig::tiny();
     let src = Synthetic { seed: 3 };
     let embeds = Rng::new(5).normal(cfg.text_len * cfg.text_dim);
     let ccfg = CausalConfig {
@@ -882,7 +1107,10 @@ fn causal<B: Backend>(p: &mut Pair<'_, B>) {
         cap_frames: 5,
         sink_frames: 1,
         timesteps: CausalConfig::self_forcing().timesteps,
+        half_kv,
+        memory: crate::causal::Memory::Window,
     };
+    let d = cfg.head_dim;
     let gd = WanDit::load(be, cfg.clone(), &src).unwrap();
     let cd = WanDit::load(cpu, cfg, &src).unwrap();
     let (gpr, cpr) = (
@@ -899,7 +1127,60 @@ fn causal<B: Backend>(p: &mut Pair<'_, B>) {
         cl.extend(cpu.download(x));
     }
     p.record(
-        "tiny causal rollout, 4 blocks, rolling cache (latent)",
+        format!(
+            "tiny causal rollout d{d}{}, 4 blocks, rolling cache (latent)",
+            if half_kv { " f16 cache" } else { "" }
+        ),
+        gl,
+        cl,
+    );
+}
+
+/// The MemRoPE rollout (History Forcing's memory) on the tiny model: six
+/// 2-frame blocks through a 7-frame cache (1 sink, 2 EMA, 2 recent, the
+/// block): the fourth block evicts one frame and initialises the memory,
+/// the fifth and sixth evict two and blend it. GPU latents vs the CPU's.
+fn causal_memrope<B: Backend>(p: &mut Pair<'_, B>) {
+    causal_memrope_with(p, WanConfig::tiny(), false);
+    // head_dim 32: attention reads the strided cache in place where the
+    // backend can; a 16-bit cache request is ignored with MemRoPE.
+    causal_memrope_with(p, WanConfig::tiny_vsa(), true);
+}
+
+fn causal_memrope_with<B: Backend>(p: &mut Pair<'_, B>, cfg: WanConfig, half_kv: bool) {
+    use crate::causal::{CausalConfig, CausalRollout, Memory};
+    let (be, cpu) = (p.be, &Cpu);
+    let d = cfg.head_dim;
+    let src = Synthetic { seed: 3 };
+    let embeds = Rng::new(5).normal(cfg.text_len * cfg.text_dim);
+    let ccfg = CausalConfig {
+        block_frames: 2,
+        cap_frames: 7,
+        sink_frames: 1,
+        timesteps: CausalConfig::self_forcing().timesteps,
+        half_kv,
+        memory: Memory::MemRope {
+            alpha_long: 0.01,
+            alpha_short: 0.1,
+        },
+    };
+    let gd = WanDit::load(be, cfg.clone(), &src).unwrap();
+    let cd = WanDit::load(cpu, cfg, &src).unwrap();
+    let (gpr, cpr) = (
+        gd.prepare_prompt(be, &embeds),
+        cd.prepare_prompt(cpu, &embeds),
+    );
+    let mut g = CausalRollout::new(be, &gd, ccfg.clone(), (4, 6), 7, 21).unwrap();
+    let mut c = CausalRollout::new(cpu, &cd, ccfg, (4, 6), 7, 21).unwrap();
+    let (mut gl, mut cl) = (Vec::new(), Vec::new());
+    for _ in 0..6 {
+        let x = g.next_block(be, &gpr).unwrap();
+        gl.extend(be.download(x));
+        let x = c.next_block(cpu, &cpr).unwrap();
+        cl.extend(cpu.download(x));
+    }
+    p.record(
+        format!("tiny MemRoPE rollout d{d}, 6 blocks, EMA memory (latent)"),
         gl,
         cl,
     );
@@ -927,6 +1208,17 @@ fn upscaler<B: Backend>(p: &mut Pair<'_, B>) {
     // `conv2d … ep=3` case at f32 precision).
     p.record_rgba8(
         "tiny upscaler, packed RGBA (≤1 level)",
+        be.download(&gc.out),
+        cpu.download(&cc.out),
+    );
+    // Output scale below the network's: the box filter in pack_rgba8.
+    let (mut g, mut c) = (g, c);
+    g.set_output_scale(1).expect("÷2");
+    c.set_output_scale(1).expect("÷2");
+    let gc = g.launch(be, &rgb, frames, h, w);
+    let cc = c.launch(cpu, &rgb, frames, h, w);
+    p.record_rgba8(
+        "tiny upscaler box-filtered to ×1, packed RGBA (≤1 level)",
         be.download(&gc.out),
         cpu.download(&cc.out),
     );

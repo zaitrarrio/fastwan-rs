@@ -60,7 +60,7 @@ task build            # WebGPU + CPU; task build:cuda on NVIDIA
 task clip             # UMT5 embed, then out/<prompt>-832x480x81-s7.mp4
 ```
 
-`task clip PROMPT="a crowded night market in the rain" SEED=3 BACKEND=wgpu` reuses `./gallery` when that prompt was encoded before. `task embed:gallery` encodes `web/gallery-prompts.txt`. `task serve` is the local studio.
+`task clip PROMPT="a crowded night market in the rain" SEED=3 BACKEND=wgpu` reuses `./gallery` when that prompt was encoded before. `task embed:gallery` encodes `web/gallery-prompts.txt`. `task serve` is the local studio. `task clip:causal MEMORY=memrope` is History Forcing; `UPSCALE=` and `UPSCALE_X=2` pass the upscaler through.
 
 ### Prompt-to-clip demo
 

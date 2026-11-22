@@ -27,6 +27,7 @@ const LINEAR2: &str = include_str!("shaders/linear2.wgsl");
 const LINEAR3: &str = include_str!("shaders/linear3.wgsl");
 const LINEAR3H: &str = include_str!("shaders/linear3h.wgsl");
 const LINEAR4: &str = include_str!("shaders/linear4.wgsl");
+const LINEAR4H: &str = include_str!("shaders/linear4h.wgsl");
 const FLASH_H: &str = include_str!("shaders/flash_h.wgsl");
 /// Token-sized GEMMs only take the f16 path: the 512-row text projections
 /// carry encoder activations that can exceed f16's ±65504.
@@ -36,9 +37,13 @@ const ATTN: &str = include_str!("shaders/attention.wgsl");
 const NORM: &str = include_str!("shaders/norm.wgsl");
 const HEADS: &str = include_str!("shaders/head_split.wgsl");
 const ELEM: &str = include_str!("shaders/elementwise.wgsl");
+const MEMORY: &str = include_str!("shaders/memory.wgsl");
 const PACK: &str = include_str!("shaders/pack.wgsl");
+const UNPACK: &str = include_str!("shaders/unpack.wgsl");
+const KV: &str = include_str!("shaders/kv.wgsl");
 const FLASH: &str = include_str!("shaders/flash.wgsl");
 const FLASH3: &str = include_str!("shaders/flash3.wgsl");
+const FLASH3H: &str = include_str!("shaders/flash3h.wgsl");
 /// Shared memory flash3 declares (vec4 panels, S tile, partials, row state).
 const FLASH3_SHARED: u32 = 512 * 16 + 4160 * 4 + 2 * 256 * 4 + 5 * 64 * 4;
 const VSA_POOL: &str = include_str!("shaders/vsa_pool.wgsl");
@@ -57,22 +62,24 @@ pub struct GBuf {
     len: usize,
 }
 
-/// A device buffer that is freed when the last [`GBuf`] handle goes. Native
-/// wgpu frees on drop. wgpu's WebGPU backend does not: a dropped buffer lives
-/// until the JS garbage collector finds its handle, which a wasm program that
-/// makes little JS garbage rarely triggers. A long video drops thousands of
-/// buffers and dispatch uniforms per block, and Chrome slowed from 1.7 s to
-/// 10-16 s per block as they piled up. So in the browser a dropped buffer is
-/// queued and `destroy()`ed right after the next submission of the pending
-/// encoder (every command that could use it is then submitted, and WebGPU
-/// lets submitted work finish before freeing).
-pub(crate) struct Owned(Option<wgpu::Buffer>);
-
-impl Owned {
-    fn new(b: wgpu::Buffer) -> Self {
-        Self(Some(b))
-    }
-}
+/// A device buffer that goes back to its device's [`Recycler`] when the last
+/// [`GBuf`] handle goes.
+///
+/// Why not create and free per use: a long video creates and drops thousands
+/// of activation buffers and dispatch uniforms per block (several GB at
+/// 480×272). wgpu's WebGPU backend never frees a dropped buffer (the JS
+/// garbage collector does, rarely), and even `destroy()` only releases the
+/// memory once the GPU has finished every submission that used it. With the
+/// next block queued before the previous one's frames are read back, Chrome
+/// then holds about two blocks of activations at once, and on an RTX 4090
+/// blocks ran ~20× slower in bursts (35.5 s vs 1.6 s) while native wgpu stayed
+/// flat (docs/runs/2026-11-17-vast-4090-stalls-f16-phones). So dropped
+/// buffers are recycled instead: retired on drop, moved to a free list right
+/// after the next submission (every command that could use them is then
+/// submitted, and later commands and queue writes are ordered after it), and
+/// handed out again for the same size and usage, cleared, so a buffer is
+/// zero-filled as from `create_buffer`.
+pub(crate) struct Owned(Option<wgpu::Buffer>, Arc<Recycler>);
 
 impl std::ops::Deref for Owned {
     type Target = wgpu::Buffer;
@@ -84,33 +91,106 @@ impl std::ops::Deref for Owned {
 impl Drop for Owned {
     fn drop(&mut self) {
         if let Some(b) = self.0.take() {
-            retire(b);
+            self.1.retire(b);
         }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-thread_local! {
-    static RETIRED: std::cell::RefCell<Vec<wgpu::Buffer>> = const { std::cell::RefCell::new(Vec::new()) };
+/// Buffer accounting for diagnosing allocation churn: buffers created, bytes
+/// created, buffers reused from the free list, bytes held (live + free list).
+static MEM_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEM_CREATED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEM_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEM_HELD_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn tracked(b: wgpu::Buffer) -> wgpu::Buffer {
+    use std::sync::atomic::Ordering::Relaxed;
+    MEM_CREATED.fetch_add(1, Relaxed);
+    MEM_CREATED_BYTES.fetch_add(b.size(), Relaxed);
+    MEM_HELD_BYTES.fetch_add(b.size() as i64, Relaxed);
+    b
 }
 
-/// Free `b` once it can no longer be in an unsubmitted command (see [`Owned`]).
-fn retire(b: wgpu::Buffer) {
-    #[cfg(target_arch = "wasm32")]
-    RETIRED.with(|r| r.borrow_mut().push(b));
-    #[cfg(not(target_arch = "wasm32"))]
-    drop(b);
+/// Allocation counters since start: buffers created, bytes created, buffers
+/// reused, bytes held (in use or on a free list).
+#[derive(Debug, Clone, Copy)]
+pub struct MemStats {
+    pub created: u64,
+    pub created_bytes: u64,
+    pub reused: u64,
+    pub held_bytes: i64,
 }
 
-/// Destroy the retired buffers; call only right after the pending encoder was
-/// submitted (nothing unsubmitted can refer to them then).
-fn destroy_retired() {
-    #[cfg(target_arch = "wasm32")]
-    RETIRED.with(|r| {
-        for b in r.borrow_mut().drain(..) {
-            b.destroy();
+pub fn mem_stats() -> MemStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    MemStats {
+        created: MEM_CREATED.load(Relaxed),
+        created_bytes: MEM_CREATED_BYTES.load(Relaxed),
+        reused: MEM_REUSED.load(Relaxed),
+        held_bytes: MEM_HELD_BYTES.load(Relaxed),
+    }
+}
+
+const STORAGE_RW: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::COPY_SRC)
+    .union(wgpu::BufferUsages::COPY_DST);
+const UNIFORM_W: wgpu::BufferUsages =
+    wgpu::BufferUsages::UNIFORM.union(wgpu::BufferUsages::COPY_DST);
+
+/// Per-device buffer recycling (see [`Owned`]).
+#[derive(Default)]
+pub(crate) struct Recycler {
+    retired: Mutex<Vec<wgpu::Buffer>>,
+    free: Mutex<HashMap<(u64, u32), Vec<wgpu::Buffer>>>,
+}
+
+impl Recycler {
+    /// `b` is no longer referenced by anything not yet recorded.
+    fn retire(&self, b: wgpu::Buffer) {
+        self.retired.lock().unwrap().push(b);
+    }
+
+    /// Call only right after the pending encoder was submitted: nothing
+    /// unsubmitted can refer to a retired buffer then. Activation and uniform
+    /// buffers go to the free list, the rest (readback staging) are freed.
+    fn recycle(&self) {
+        let retired = std::mem::take(&mut *self.retired.lock().unwrap());
+        if retired.is_empty() {
+            return;
         }
-    });
+        let mut free = self.free.lock().unwrap();
+        for b in retired {
+            let u = b.usage();
+            if u == STORAGE_RW || u == UNIFORM_W {
+                free.entry((b.size(), u.bits())).or_default().push(b);
+            } else {
+                MEM_HELD_BYTES.fetch_sub(b.size() as i64, std::sync::atomic::Ordering::Relaxed);
+                b.destroy();
+            }
+        }
+    }
+
+    fn take(&self, size: u64, usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+        let b = self
+            .free
+            .lock()
+            .unwrap()
+            .get_mut(&(size, usage.bits()))?
+            .pop()?;
+        MEM_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(b)
+    }
+
+    /// Free every buffer on the free list (between runs: the next one may use
+    /// other sizes).
+    fn trim(&self) {
+        for (_, v) in self.free.lock().unwrap().drain() {
+            for b in v {
+                MEM_HELD_BYTES.fetch_sub(b.size() as i64, std::sync::atomic::Ordering::Relaxed);
+                b.destroy();
+            }
+        }
+    }
 }
 
 /// VSA state for one token grid.
@@ -128,6 +208,15 @@ pub struct GVsa {
     scale: f32,
 }
 
+impl GVsa {
+    /// The intermediates of the last `vsa_attention` with this state:
+    /// `(pooled, coarse, sel)`, as `fastwan_core::vsa::coarse_reference`
+    /// lays them out (`sel` holds u32 words). For the browser self-test.
+    pub fn stages(&self) -> (&GBuf, &GBuf, &GBuf) {
+        (&self.pooled, &self.coarse, &self.sel)
+    }
+}
+
 /// GPU timestamps around every dispatch, summed per kernel.
 struct Prof {
     qs: wgpu::QuerySet,
@@ -141,8 +230,11 @@ struct Prof {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WgpuOptions {
     /// Use the f16 math kernels where the adapter has `shader-f16`
-    /// (`FASTWAN_WGPU_F16=1`).
+    /// (`FASTWAN_WGPU_F16=1`, or `=attn` for attention only).
     pub f16: bool,
+    /// With `f16`: f16 attention only, f32 GEMMs. On an AMD RDNA1 Mac
+    /// (Chrome → Metal) f16 attention is 1.33× faster but the f16 GEMM 0.90×.
+    pub f16_attn_only: bool,
     /// GEMM kernel (`FASTWAN_WGPU_LINEAR`, see `Backend::linear`); `None` =
     /// the default.
     pub linear: Option<u32>,
@@ -160,7 +252,8 @@ impl WgpuOptions {
     pub fn from_env() -> Self {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
         Self {
-            f16: std::env::var("FASTWAN_WGPU_F16").is_ok_and(|v| v == "1"),
+            f16: std::env::var("FASTWAN_WGPU_F16").is_ok_and(|v| v == "1" || v == "attn"),
+            f16_attn_only: std::env::var("FASTWAN_WGPU_F16").is_ok_and(|v| v == "attn"),
             linear: num("FASTWAN_WGPU_LINEAR"),
             flash: num("FASTWAN_WGPU_FLASH"),
             submit_every: None,
@@ -193,6 +286,8 @@ struct Pending {
 }
 
 pub struct Wgpu {
+    /// Free lists of dropped buffers, reused instead of reallocated.
+    recycler: Arc<Recycler>,
     /// For canvas surfaces (browser only).
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     instance: wgpu::Instance,
@@ -213,6 +308,8 @@ pub struct Wgpu {
     batch: usize,
     /// f16 math kernels (adapter has `shader-f16` and f16 mode is on).
     f16: bool,
+    /// f16 GEMMs too (f16 mode is not attention-only).
+    f16_linear: bool,
     pipelines: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
     /// Pipeline name by address, for the profiler.
     names: Mutex<HashMap<usize, String>>,
@@ -311,13 +408,17 @@ impl Wgpu {
             _ => 1,
         };
         let linear_variant = opts.linear.unwrap_or(4);
+        let recycler = Arc::new(Recycler::default());
         let dummy = GBuf {
-            buf: Arc::new(Owned::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("dummy"),
-                size: 16,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            }))),
+            buf: Arc::new(Owned(
+                Some(tracked(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dummy"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                }))),
+                recycler.clone(),
+            )),
             len: 4,
         };
         let prof = profile.then(|| {
@@ -340,12 +441,14 @@ impl Wgpu {
             adapter,
             device,
             queue,
+            recycler,
             attn_bk,
             flash_ok,
             flash_variant,
             linear_variant,
             batch: opts.submit_every.unwrap_or(BATCH).max(1),
             f16,
+            f16_linear: f16 && !opts.f16_attn_only,
             pipelines: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             tag: Mutex::new(None),
@@ -394,6 +497,15 @@ impl Wgpu {
             return p.clone();
         }
         // `enable f16;` must open the module, before the shared helpers.
+        // Kernel A/B without a rebuild (native only):
+        // FASTWAN_WGPU_SHADER_<key>=file.wgsl replaces the kernel's source.
+        #[cfg(not(target_arch = "wasm32"))]
+        let body = match std::env::var(format!("FASTWAN_WGPU_SHADER_{key}")) {
+            Ok(path) => std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("FASTWAN_WGPU_SHADER_{key}={path}: {e}")),
+            Err(_) => src(),
+        };
+        #[cfg(target_arch = "wasm32")]
         let body = src();
         let code = if body.contains("vec4<f16>") {
             format!("enable f16;\n{COMMON}\n{body}")
@@ -533,13 +645,23 @@ impl Wgpu {
         while words.len() % 4 != 0 {
             words.push(0);
         }
-        let ubuf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck_cast(&words),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        let bytes = bytemuck_cast(&words);
+        let ubuf = match self.recycler.take(bytes.len() as u64, UNIFORM_W) {
+            // Ordered before the pending encoder, which is the first to use it
+            // again (it was retired only after the last one was submitted).
+            Some(b) => {
+                self.queue.write_buffer(&b, 0, bytes);
+                b
+            }
+            None => tracked(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytes,
+                        usage: UNIFORM_W,
+                    }),
+            ),
+        };
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
             resource: ubuf.as_entire_binding(),
@@ -577,14 +699,14 @@ impl Wgpu {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, groups.2);
         }
-        retire(ubuf);
+        self.recycler.retire(ubuf);
         pend.n += 1;
         if pend.n >= self.batch {
             let enc = pend.enc.take().unwrap();
             pend.n = 0;
             drop(pend);
             self.queue.submit([enc.finish()]);
-            destroy_retired();
+            self.recycler.recycle();
         }
     }
 
@@ -622,7 +744,7 @@ impl Wgpu {
         if let Some(enc) = enc {
             self.queue.submit([enc.finish()]);
         }
-        destroy_retired();
+        self.recycler.recycle();
         #[cfg(not(target_arch = "wasm32"))]
         if let (Some(read), Some(prof)) = (readback, &self.prof) {
             let slice = read.slice(..);
@@ -725,18 +847,31 @@ fn bytemuck_cast(w: &[u32]) -> &[u8] {
 }
 
 impl Wgpu {
+    fn owned(&self, b: wgpu::Buffer) -> Arc<Owned> {
+        Arc::new(Owned(Some(tracked(b)), self.recycler.clone()))
+    }
+
+    /// Free the buffers kept for reuse (call between runs: the next one may
+    /// use other sizes).
+    pub fn trim_pool(&self) {
+        // Submitting moves everything dropped so far onto the free list.
+        self.flush();
+        self.recycler.trim();
+    }
+
     fn upload_u32(&self, data: &[u32]) -> GBuf {
         let data = if data.is_empty() { &[0u32][..] } else { data };
         GBuf {
-            buf: Arc::new(Owned::new(self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(data),
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::COPY_DST,
-                },
-            ))),
+            buf: self.owned(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(data),
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_SRC
+                            | wgpu::BufferUsages::COPY_DST,
+                    }),
+            ),
             len: data.len(),
         }
     }
@@ -757,7 +892,9 @@ impl Wgpu {
         scale: f32,
         vsa: Option<(&GVsa, &GBuf)>,
     ) {
-        let pipe = if self.flash_variant == 3 && d <= 128 {
+        let pipe = if self.flash_variant == 3 && d <= 128 && self.f16 {
+            self.pipeline("flash3h", || FLASH3H.to_string())
+        } else if self.flash_variant == 3 && d <= 128 {
             self.pipeline("flash3", || FLASH3.to_string())
         } else if self.f16 {
             self.pipeline("flash_h", || FLASH_H.to_string())
@@ -789,6 +926,50 @@ impl Wgpu {
     }
 }
 
+impl Wgpu {
+    /// flash3.wgsl reading a K/V cache: keys and values of head h start at
+    /// row h · kstride (not h · sk), and with `half` they are f16 pairs in
+    /// u32 (unpacked with core `unpack2x16float`; no `shader-f16` needed).
+    fn flash3_kv_src(half: bool, f16: bool) -> String {
+        let mut s = (if f16 { FLASH3H } else { FLASH3 }).replace(
+            "struct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32 }",
+            "struct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32, kstride: u32, _a: u32, _b: u32, _c: u32 }",
+        );
+        let k_load = "    return k[(h * p.sk + tok) * p.d + col];";
+        let v_load = "                    let b = (h * p.sk + ktok) * d + 4u * cq;\n                    vv = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]);";
+        assert!(s.contains("struct P { heads: u32, sq: u32, sk: u32, d: u32, scale_log2: f32, mode: u32, nb: u32, topk: u32, kstride"));
+        assert!(
+            s.contains(k_load) && s.contains(v_load),
+            "flash3.wgsl changed: update flash3_kv_src"
+        );
+        if half {
+            s = s
+                .replace("var<storage, read> k: array<f32>;", "var<storage, read> k: array<u32>;")
+                .replace("var<storage, read> v: array<f32>;", "var<storage, read> v: array<u32>;")
+                .replace(
+                    k_load,
+                    "    let e = (h * p.kstride + tok) * p.d + col;\n    let w = unpack2x16float(k[e / 2u]);\n    return select(w.x, w.y, (e & 1u) != 0u);",
+                )
+                .replace(
+                    v_load,
+                    "                    let b = (h * p.kstride + ktok) * d + 4u * cq;\n                    let w0 = unpack2x16float(v[b / 2u]);\n                    let w1 = unpack2x16float(v[b / 2u + 1u]);\n                    vv = vec4<f32>(w0.x, w0.y, w1.x, w1.y);",
+                );
+        } else {
+            s = s
+                .replace(k_load, "    return k[(h * p.kstride + tok) * p.d + col];")
+                .replace(
+                    v_load,
+                    "                    let b = (h * p.kstride + ktok) * d + 4u * cq;\n                    vv = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]);",
+                );
+        }
+        s
+    }
+
+    fn kv_flash_ok(&self, d: usize) -> bool {
+        self.flash_ok && self.flash_variant == 3 && d % 16 == 0 && d <= 128
+    }
+}
+
 impl Backend for Wgpu {
     type Buf = GBuf;
     type Vsa = GVsa;
@@ -805,22 +986,37 @@ impl Backend for Wgpu {
             } else {
                 format!(" {}", self.info.driver_info)
             },
-            if self.f16 { " +f16" } else { "" }
+            if !self.f16 {
+                ""
+            } else if self.f16_linear {
+                " +f16"
+            } else {
+                " attn+f16"
+            }
         )
     }
 
     fn alloc(&self, len: usize) -> GBuf {
+        let size = (len.max(1) * 4) as u64;
+        let b = match self.recycler.take(size, STORAGE_RW) {
+            // Zero it as `create_buffer` would, in command order: after every
+            // submitted use, before anything recorded from now on.
+            Some(b) => {
+                let mut pend = self.pending.lock().unwrap();
+                pend.enc
+                    .get_or_insert_with(|| self.device.create_command_encoder(&Default::default()))
+                    .clear_buffer(&b, 0, None);
+                b
+            }
+            None => tracked(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size,
+                usage: STORAGE_RW,
+                mapped_at_creation: false,
+            })),
+        };
         GBuf {
-            buf: Arc::new(Owned::new(self.device.create_buffer(
-                &wgpu::BufferDescriptor {
-                    label: None,
-                    size: (len.max(1) * 4) as u64,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                },
-            ))),
+            buf: Arc::new(Owned(Some(b), self.recycler.clone())),
             len,
         }
     }
@@ -834,15 +1030,16 @@ impl Backend for Wgpu {
             bytemuck::cast_slice(data)
         };
         GBuf {
-            buf: Arc::new(Owned::new(self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytes,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::COPY_DST,
-                },
-            ))),
+            buf: self.owned(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytes,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_SRC
+                            | wgpu::BufferUsages::COPY_DST,
+                    }),
+            ),
             len: data.len(),
         }
     }
@@ -904,13 +1101,13 @@ impl Backend for Wgpu {
                 })
                 .collect();
             let buf = GBuf {
-                buf: Arc::new(Owned::new(self.device.create_buffer_init(
+                buf: self.owned(self.device.create_buffer_init(
                     &wgpu::util::BufferInitDescriptor {
                         label: None,
                         contents: bytemuck::cast_slice(&packed),
                         usage: wgpu::BufferUsages::STORAGE,
                     },
-                ))),
+                )),
                 len: packed.len(),
             };
             GWeight {
@@ -1023,12 +1220,14 @@ impl Backend for Wgpu {
             1 => (LINEAR, 64, "linear"),
             _ => (LINEAR3, 64, "linear3"),
         };
-        let half = self.f16 && f16 && variant == 3 && rows >= F16_MIN_ROWS;
+        let half = self.f16_linear && f16 && (variant == 3 || variant == 4) && rows >= F16_MIN_ROWS;
         let pipe = if let Some((kind, ..)) = &w.quant {
             match kind {
                 Quant::Q8 => self.pipeline(&format!("{name}_q8"), || Self::q8_src(src)),
                 Quant::Q4 => self.pipeline(&format!("{name}_q4"), || Self::q4_src(src)),
             }
+        } else if half && variant == 4 {
+            self.pipeline("linear4h", || LINEAR4H.to_string())
         } else if half {
             self.pipeline("linear3h", || LINEAR3H.to_string())
         } else {
@@ -1124,6 +1323,107 @@ impl Backend for Wgpu {
             &p,
             &[src, rms_w.unwrap_or(&self.dummy), c, s, out],
             Self::grid(rows),
+        );
+    }
+
+    fn kv_caps(&self, d: usize) -> (bool, bool) {
+        let ok = self.kv_flash_ok(d);
+        (ok, ok)
+    }
+
+    fn alloc_kv(&self, n: usize, half: bool) -> GBuf {
+        if half {
+            assert!(n % 2 == 0, "a 16-bit K/V cache holds pairs");
+            self.alloc(n / 2)
+        } else {
+            self.alloc(n)
+        }
+    }
+
+    fn kv_store(
+        &self,
+        src: &GBuf,
+        n: usize,
+        from: usize,
+        len: usize,
+        heads: usize,
+        d: usize,
+        dst: &GBuf,
+        dst_row: usize,
+        stride: usize,
+        half: bool,
+    ) {
+        if len == 0 {
+            return;
+        }
+        assert!(!half || d % 2 == 0, "16-bit K/V rows hold pairs");
+        let pipe = self.pipeline("kv_store", || KV.to_string());
+        let items = heads * len * if half { d / 2 } else { d };
+        self.dispatch(
+            &pipe,
+            &[
+                n as u32,
+                from as u32,
+                len as u32,
+                heads as u32,
+                d as u32,
+                dst_row as u32,
+                stride as u32,
+                half as u32,
+            ],
+            &[src, dst],
+            Self::grid(items.div_ceil(256)),
+        );
+    }
+
+    fn attention_kv(
+        &self,
+        q: &GBuf,
+        k: &GBuf,
+        v: &GBuf,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+        stride: usize,
+        d: usize,
+        half: bool,
+        out: &GBuf,
+    ) {
+        if !self.kv_flash_ok(d) {
+            assert!(
+                stride == sk && !half,
+                "attention_kv needs flash3 here (kv_caps)"
+            );
+            return self.attention(q, k, v, heads, sq, sk, d, out);
+        }
+        let f16 = self.f16;
+        let key = format!(
+            "flash3{}_kv{}",
+            if f16 { "h" } else { "" },
+            if half { "h" } else { "" }
+        );
+        let pipe = self.pipeline(&key, || Self::flash3_kv_src(half, f16));
+        let scale = 1.0 / (d as f32).sqrt();
+        let p = [
+            heads as u32,
+            sq as u32,
+            sk as u32,
+            d as u32,
+            (scale * std::f32::consts::LOG2_E).to_bits(),
+            0,
+            0,
+            0,
+            stride as u32,
+            0,
+            0,
+            0,
+        ];
+        let d0 = &self.dummy;
+        self.dispatch(
+            &pipe,
+            &p,
+            &[q, k, v, out, d0, d0, d0, d0],
+            (sq.div_ceil(64) as u32, heads as u32, 1),
         );
     }
 
@@ -1296,6 +1596,90 @@ impl Backend for Wgpu {
         );
     }
 
+    fn rope_heads(
+        &self,
+        src: &GBuf,
+        src_off: usize,
+        src_stride: usize,
+        dst: &GBuf,
+        dst_off: usize,
+        dst_stride: usize,
+        heads: usize,
+        rows: usize,
+        hd: usize,
+        rope: (&GBuf, &GBuf),
+    ) {
+        let pipe = self.pipeline("memory", || MEMORY.to_string());
+        let p = [
+            0,
+            heads as u32,
+            rows as u32,
+            hd as u32,
+            src_off as u32,
+            src_stride as u32,
+            dst_off as u32,
+            dst_stride as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let n = heads * rows * hd / 2;
+        self.dispatch(
+            &pipe,
+            &p,
+            &[src, rope.0, rope.1, dst],
+            Self::grid(n.div_ceil(256)),
+        );
+    }
+
+    fn kv_ema(
+        &self,
+        buf: &GBuf,
+        heads: usize,
+        head_stride: usize,
+        hd: usize,
+        src_row: usize,
+        src_rows: usize,
+        dst_row: usize,
+        frame_rows: usize,
+        alphas: [f32; 2],
+    ) {
+        assert!(
+            src_row + src_rows <= dst_row || dst_row + 2 * frame_rows <= src_row,
+            "kv_ema: source and memory rows overlap"
+        );
+        let pipe = self.pipeline("memory", || MEMORY.to_string());
+        let p = [
+            1,
+            heads as u32,
+            0,
+            hd as u32,
+            0,
+            0,
+            0,
+            head_stride as u32,
+            src_row as u32,
+            src_rows as u32,
+            dst_row as u32,
+            frame_rows as u32,
+            alphas[0].to_bits(),
+            alphas[1].to_bits(),
+            0,
+            0,
+        ];
+        self.dispatch(
+            &pipe,
+            &p,
+            &[&self.dummy, &self.dummy, &self.dummy, buf],
+            Self::grid(heads * hd.div_ceil(32)),
+        );
+    }
+
     fn conv2d(
         &self,
         a: &GBuf,
@@ -1373,11 +1757,28 @@ impl Backend for Wgpu {
             s.w as u32,
             s.p as u32,
             base.is_some() as u32,
+            s.down as u32,
+            0,
         ];
         self.dispatch(
             &pipe,
             &p,
             &[out, src, base.unwrap_or(&self.dummy)],
+            Self::grid(n.div_ceil(256)),
+        );
+    }
+
+    fn unpack_rgba8(&self, src: &GBuf, frames: usize, plane: usize, out: &GBuf) {
+        let n = frames * 3 * plane;
+        assert!(
+            src.len >= frames * plane && out.len >= n,
+            "unpack_rgba8: sizes"
+        );
+        let pipe = self.pipeline("unpack", || UNPACK.to_string());
+        self.dispatch(
+            &pipe,
+            &[n as u32, plane as u32, 0, 0],
+            &[out, src],
             Self::grid(n.div_ceil(256)),
         );
     }
@@ -1398,12 +1799,12 @@ impl Wgpu {
     #[cfg(not(target_arch = "wasm32"))]
     fn read_with<T>(&self, buf: &GBuf, f: impl FnOnce(&[u8]) -> T) -> T {
         let size = (buf.len.max(1) * 4) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let staging = tracked(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        }));
         {
             let mut pend = self.pending.lock().unwrap();
             let enc = pend
@@ -1428,7 +1829,7 @@ impl Wgpu {
         let out = f(&data);
         drop(data);
         staging.unmap();
-        retire(staging);
+        self.recycler.retire(staging);
         out
     }
 
@@ -1451,16 +1852,25 @@ impl Wgpu {
     /// [`Self::download_async`] that reports a failed map or a recorded
     /// WebGPU error instead of panicking.
     pub async fn try_download_async(&self, buf: &GBuf) -> Result<Vec<f32>, String> {
+        self.readback_begin(buf)?.wait(self).await
+    }
+
+    /// Start reading `buf` back: the copy into a staging buffer is submitted
+    /// now and mapped asynchronously, so work queued after this call does not
+    /// delay it. Await [`Readback::wait`] later; the long-video loop queues
+    /// the next block in between, so the GPU is never idle while the page
+    /// waits for frames.
+    pub fn readback_begin(&self, buf: &GBuf) -> Result<Readback, String> {
         if let Some(f) = self.fault() {
             return Err(f);
         }
         let size = (buf.len.max(1) * 4) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let staging = tracked(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        }));
         {
             let mut pend = self.pending.lock().unwrap();
             let enc = pend
@@ -1473,45 +1883,22 @@ impl Wgpu {
         staging
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |r| tx.send(r));
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        #[cfg(target_arch = "wasm32")]
-        let _tick = self
-            .keepalive
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .then(|| KeepAlive::start(self.queue.clone()))
-            .flatten();
-        if let Err(e) = rx.await {
-            return Err(self
-                .fault()
-                .unwrap_or_else(|| format!("GPU readback failed: {e}")));
-        }
-        if let Some(f) = self.fault() {
-            return Err(f);
-        }
-        let data = staging
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|e| format!("GPU readback failed: {e:?}"))?;
-        let out = bytemuck::cast_slice::<u8, f32>(&data)[..buf.len].to_vec();
-        drop(data);
-        staging.unmap();
-        retire(staging);
-        Ok(out)
+        Ok(Readback {
+            staging,
+            rx,
+            len: buf.len,
+        })
     }
 
     /// Non-blocking readback for the browser (and usable natively).
     pub async fn download_async(&self, buf: &GBuf) -> Vec<f32> {
         let size = (buf.len.max(1) * 4) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let staging = tracked(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        }));
         {
             let mut pend = self.pending.lock().unwrap();
             let enc = pend
@@ -1534,12 +1921,54 @@ impl Wgpu {
         let out = bytemuck::cast_slice::<u8, f32>(&data)[..buf.len].to_vec();
         drop(data);
         staging.unmap();
-        retire(staging);
+        self.recycler.retire(staging);
         out
     }
 }
 
 /// A minimal one-shot channel future (no executor dependency).
+/// A readback started by [`Wgpu::readback_begin`].
+pub struct Readback {
+    staging: wgpu::Buffer,
+    rx: OneRx<Result<(), wgpu::BufferAsyncError>>,
+    len: usize,
+}
+
+impl Readback {
+    /// The buffer's contents once the GPU has written them.
+    pub async fn wait(self, be: &Wgpu) -> Result<Vec<f32>, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = be.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        #[cfg(target_arch = "wasm32")]
+        let _tick = be
+            .keepalive
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| KeepAlive::start(be.queue.clone()))
+            .flatten();
+        if let Err(e) = self.rx.await {
+            return Err(be
+                .fault()
+                .unwrap_or_else(|| format!("GPU readback failed: {e}")));
+        }
+        if let Some(f) = be.fault() {
+            return Err(f);
+        }
+        let data = self
+            .staging
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| format!("GPU readback failed: {e:?}"))?;
+        let out = bytemuck::cast_slice::<u8, f32>(&data)[..self.len].to_vec();
+        drop(data);
+        self.staging.unmap();
+        be.recycler.retire(self.staging);
+        Ok(out)
+    }
+}
+
 /// While a browser readback is pending, submit an empty batch every 20 ms.
 /// Chrome delivered `mapAsync` callbacks for long videos up to ~40 s late
 /// (blocks of 1.5 s took 16-41 s in runs, natively flat): an empty submit makes

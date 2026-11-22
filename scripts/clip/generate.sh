@@ -157,8 +157,14 @@ fi
 if [[ -n "${UPSCALE:-}" ]]; then
   args+=(--upscale "$UPSCALE")
 fi
+if [[ -n "${UPSCALE_X:-}" ]]; then
+  args+=(--upscale-x "$UPSCALE_X")
+fi
 if [[ "${CAUSAL:-0}" == "1" ]]; then
   args+=(--causal --cache-frames "${CACHE_FRAMES:-12}" --sink-frames "${SINK_FRAMES:-3}")
+fi
+if [[ -n "${MEMORY:-}" ]]; then
+  args+=(--memory "$MEMORY")
 fi
 
 "$bin" "${args[@]}" "$@"

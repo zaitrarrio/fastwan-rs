@@ -1,4 +1,4 @@
-//! ×4 video upscaler: Real-ESRGAN's compact network (SRVGGNetCompact,
+//! ×4 (or ×2) video upscaler: Real-ESRGAN's compact network (SRVGGNetCompact,
 //! checkpoint `realesr-animevideov3`, BSD-3), per frame.
 //!
 //! conv3×3 3→F, PReLU → `convs` × (conv3×3 F→F, PReLU) → conv3×3 F→3·s²
@@ -11,6 +11,12 @@
 //! the browser). Chosen over the alternatives in
 //! `docs/runs/2026-11-12-upscalers`: fastest and steadiest learned option,
 //! 2.5 MB of weights.
+//!
+//! ×2 runs the same ×4 network and box-filters each 2×2 block in
+//! `pack_rgba8` (`down = 2`): no fast ×2 model was better than bicubic
+//! (`RealESRGAN_x2plus` was 10× slower and barely distinguishable), and the
+//! network is the cost either way, so ×2 costs about what ×4 does but writes a
+//! quarter of the pixels.
 
 use fastwan_core::{
     Result,
@@ -75,6 +81,8 @@ struct Layer<B: Backend> {
 pub struct Upscaler<B: Backend> {
     pub cfg: UpConfig,
     layers: Vec<Layer<B>>,
+    /// Box-filter factor after the network (1 or a divisor of `cfg.scale`).
+    down: usize,
 }
 
 /// One batch of upscaled frames on the device, packed RGBA (one word per
@@ -82,7 +90,10 @@ pub struct Upscaler<B: Backend> {
 pub struct UpChunk<B: Backend> {
     pub out: B::Buf,
     /// Held until the caller has downloaded `out`.
-    _keep: [B::Buf; 5],
+    _keep: [B::Buf; 4],
+    /// The uploaded input of [`Upscaler::launch`] (the caller owns it for
+    /// [`Upscaler::launch_words`]).
+    base: Option<B::Buf>,
     pub frames: usize,
     pub h: usize,
     pub w: usize,
@@ -106,7 +117,28 @@ impl<B: Backend> Upscaler<B> {
                 },
             });
         }
-        Ok(Self { cfg, layers })
+        Ok(Self {
+            cfg,
+            layers,
+            down: 1,
+        })
+    }
+
+    /// The output scale: the network's (`cfg.scale`), or a divisor of it
+    /// reached by box-filtering the network's output (×2 from the ×4 model).
+    pub fn set_output_scale(&mut self, s: usize) -> Result<()> {
+        if s == 0 || self.cfg.scale % s != 0 {
+            return Err(fastwan_core::Error::Msg(format!(
+                "upscale ×{s}: must divide the network's ×{}",
+                self.cfg.scale
+            )));
+        }
+        self.down = self.cfg.scale / s;
+        Ok(())
+    }
+
+    pub fn output_scale(&self) -> usize {
+        self.cfg.scale / self.down
     }
 
     /// Frames per batch so the widest activation (`feat` channels) stays
@@ -117,19 +149,35 @@ impl<B: Backend> Upscaler<B> {
     }
 
     /// Queue the network on `frames` interleaved 8-bit RGB frames
-    /// (`[frames, h, w, 3]`). Download `out` and finish with [`rgb8`].
+    /// (`[frames, h, w, 3]`), uploaded as packed words.
     pub fn launch(&self, be: &B, rgb: &[u8], frames: usize, h: usize, w: usize) -> UpChunk<B> {
         assert_eq!(rgb.len(), frames * h * w * 3);
+        let words: Vec<u32> = rgb
+            .chunks_exact(3)
+            .map(|p| p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16 | 0xff00_0000)
+            .collect();
+        let base = be.upload_words(&words);
+        let mut c = self.launch_words(be, &base, frames, h, w);
+        c.base = Some(base);
+        c
+    }
+
+    /// Queue the network on `frames` packed 8-bit RGBA frames already on the
+    /// device (`[frames, h, w]` words: [`Backend::upload_words`], or a
+    /// decoder's [`Backend::pack_rgba8`] output), with no host pass. Keep
+    /// `words` alive until `out` is downloaded. Read `out` with
+    /// [`UpChunk::rgba8`].
+    pub fn launch_words(
+        &self,
+        be: &B,
+        words: &B::Buf,
+        frames: usize,
+        h: usize,
+        w: usize,
+    ) -> UpChunk<B> {
         let plane = h * w;
-        let mut x = vec![0f32; frames * 3 * plane];
-        for f in 0..frames {
-            for p in 0..plane {
-                for c in 0..3 {
-                    x[(f * 3 + c) * plane + p] = rgb[(f * plane + p) * 3 + c] as f32 / 255.0;
-                }
-            }
-        }
-        let input = be.upload(&x);
+        let input = be.alloc(frames * 3 * plane);
+        be.unpack_rgba8(words, frames, plane, &input);
         // Ping-pong between two feature buffers; the last conv writes `out`.
         let feat = [
             be.alloc(frames * self.cfg.feat * plane),
@@ -163,22 +211,19 @@ impl<B: Backend> Upscaler<B> {
             h,
             w,
             p: self.cfg.scale,
+            down: self.down,
         };
         let packed = be.alloc_words(shape.pixels());
         // The residual is the input itself, as exact 8-bit words.
-        let words: Vec<u32> = rgb
-            .chunks_exact(3)
-            .map(|p| p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16)
-            .collect();
-        let base = be.upload_words(&words);
-        be.pack_rgba8(&out, Some(&base), &shape, &packed);
+        be.pack_rgba8(&out, Some(words), &shape, &packed);
         UpChunk {
             out: packed,
-            _keep: [input, f0, f1, out, base],
+            _keep: [input, f0, f1, out],
+            base: None,
             frames,
             h,
             w,
-            scale: self.cfg.scale,
+            scale: self.output_scale(),
         }
     }
 }

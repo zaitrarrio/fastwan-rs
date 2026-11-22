@@ -401,6 +401,65 @@ impl Backend for Cpu {
         }
     }
 
+    fn kv_caps(&self, _head_dim: usize) -> (bool, bool) {
+        (true, true)
+    }
+
+    fn kv_store(
+        &self,
+        src: &CpuBuf,
+        n: usize,
+        from: usize,
+        len: usize,
+        heads: usize,
+        d: usize,
+        dst: &CpuBuf,
+        dst_row: usize,
+        stride: usize,
+        half: bool,
+    ) {
+        let src = src.r();
+        let mut dst = dst.w();
+        for h in 0..heads {
+            let s = &src[(h * n + from) * d..][..len * d];
+            let o = &mut dst[(h * stride + dst_row) * d..][..len * d];
+            if half {
+                // The 16-bit cache keeps f16 values: round through f16.
+                for (o, &x) in o.iter_mut().zip(s) {
+                    *o = half::f16::from_f32(x).to_f32();
+                }
+            } else {
+                o.copy_from_slice(s);
+            }
+        }
+    }
+
+    fn attention_kv(
+        &self,
+        q: &CpuBuf,
+        k: &CpuBuf,
+        v: &CpuBuf,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+        stride: usize,
+        d: usize,
+        _half: bool,
+        out: &CpuBuf,
+    ) {
+        // Gather the valid rows of each head and reuse the reference attention.
+        let pack = |b: &CpuBuf| {
+            let b = b.r();
+            let mut v = Vec::with_capacity(heads * sk * d);
+            for h in 0..heads {
+                v.extend_from_slice(&b[h * stride * d..][..sk * d]);
+            }
+            CpuBuf(Arc::new(RwLock::new(v)))
+        };
+        let (pk, pv) = (pack(k), pack(v));
+        self.attention(q, &pk, &pv, heads, sq, sk, d, out);
+    }
+
     fn attention(
         &self,
         q: &CpuBuf,
@@ -539,6 +598,73 @@ impl Backend for Cpu {
         }
     }
 
+    fn rope_heads(
+        &self,
+        src: &CpuBuf,
+        src_off: usize,
+        src_stride: usize,
+        dst: &CpuBuf,
+        dst_off: usize,
+        dst_stride: usize,
+        heads: usize,
+        rows: usize,
+        hd: usize,
+        rope: (&CpuBuf, &CpuBuf),
+    ) {
+        let (src, c, s) = (src.r(), rope.0.r(), rope.1.r());
+        let mut dst = dst.w();
+        let half = hd / 2;
+        for h in 0..heads {
+            for r in 0..rows {
+                let x = &src[src_off + h * src_stride + r * hd..][..hd];
+                let y = &mut dst[dst_off + h * dst_stride + r * hd..][..hd];
+                for i in 0..half {
+                    let (cv, sv) = (c[r * half + i], s[r * half + i]);
+                    let (x1, x2) = (x[2 * i], x[2 * i + 1]);
+                    y[2 * i] = x1 * cv - x2 * sv;
+                    y[2 * i + 1] = x1 * sv + x2 * cv;
+                }
+            }
+        }
+    }
+
+    fn kv_ema(
+        &self,
+        buf: &CpuBuf,
+        heads: usize,
+        head_stride: usize,
+        hd: usize,
+        src_row: usize,
+        src_rows: usize,
+        dst_row: usize,
+        frame_rows: usize,
+        alphas: [f32; 2],
+    ) {
+        assert!(
+            src_row + src_rows <= dst_row || dst_row + 2 * frame_rows <= src_row,
+            "kv_ema: source and memory rows overlap"
+        );
+        let mut b = buf.w();
+        for h in 0..heads {
+            let base = h * head_stride;
+            let mut m = vec![0f64; hd];
+            for r in 0..src_rows {
+                for (j, mj) in m.iter_mut().enumerate() {
+                    *mj += b[base + (src_row + r) * hd + j] as f64;
+                }
+            }
+            let m: Vec<f32> = m.iter().map(|&v| (v / src_rows as f64) as f32).collect();
+            for (i, &a) in alphas.iter().enumerate() {
+                for r in 0..frame_rows {
+                    let row = &mut b[base + (dst_row + i * frame_rows + r) * hd..][..hd];
+                    for (x, &mj) in row.iter_mut().zip(&m) {
+                        *x = a * mj + (1.0 - a) * *x;
+                    }
+                }
+            }
+        }
+    }
+
     fn conv2d(
         &self,
         a: &CpuBuf,
@@ -609,8 +735,8 @@ impl Backend for Cpu {
     }
 
     fn pack_rgba8(&self, src: &CpuBuf, base: Option<&CpuBuf>, s: &PackShape, out: &CpuBuf) {
-        let (h, w, p) = (s.h, s.w, s.p);
-        let (oh, ow) = (h * p, w * p);
+        let (h, w, p, d) = (s.h, s.w, s.p, s.down);
+        let (oh, ow) = s.out_hw();
         let src = src.r();
         let base = base.map(|b| b.r());
         let mut o = out.w();
@@ -618,20 +744,43 @@ impl Backend for Cpu {
             .par_chunks_mut(ow)
             .enumerate()
             .for_each(|(row, line)| {
-                let (f, y) = (row / oh + s.skip, row % oh);
-                let (sy, iy) = (y / p, y % p);
-                for (x, px) in line.iter_mut().enumerate() {
-                    let (sx, ix) = (x / p, x % p);
-                    let v = |c: usize| {
-                        let k = c * p * p + iy * p + ix;
+                let (f, oy) = (row / oh + s.skip, row % oh);
+                for (ox, px) in line.iter_mut().enumerate() {
+                    // One shuffled-image sample, residual added and clamped.
+                    let v = |c: usize, y: usize, x: usize| {
+                        let (sy, sx) = (y / p, x / p);
+                        let k = c * p * p + (y % p) * p + x % p;
                         let mut v = src[((f * 3 * p * p + k) * h + sy) * w + sx];
                         if let Some(b) = &base {
                             let word = b[(f * h + sy) * w + sx].to_bits();
                             v += ((word >> (8 * c)) & 0xff) as f32 / 255.0;
                         }
-                        v
+                        v.clamp(0.0, 1.0)
                     };
-                    *px = f32::from_bits(pack_pixel(v(0), v(1), v(2)));
+                    let avg = |c: usize| {
+                        let mut a = 0.0;
+                        for dy in 0..d {
+                            for dx in 0..d {
+                                a += v(c, oy * d + dy, ox * d + dx);
+                            }
+                        }
+                        a / (d * d) as f32
+                    };
+                    *px = f32::from_bits(pack_pixel(avg(0), avg(1), avg(2)));
+                }
+            });
+    }
+
+    fn unpack_rgba8(&self, src: &CpuBuf, frames: usize, plane: usize, out: &CpuBuf) {
+        let src = src.r();
+        let mut o = out.w();
+        o[..frames * 3 * plane]
+            .par_chunks_mut(plane)
+            .enumerate()
+            .for_each(|(fc, line)| {
+                let (f, c) = (fc / 3, fc % 3);
+                for (p, v) in line.iter_mut().enumerate() {
+                    *v = ((src[f * plane + p].to_bits() >> (8 * c)) & 0xff) as f32 / 255.0;
                 }
             });
     }

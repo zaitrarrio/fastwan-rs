@@ -55,6 +55,9 @@ fi
 if [[ -n "${ALLOW_ORIGIN:-}" ]]; then
   args+=(--allow-origin "$ALLOW_ORIGIN")
 fi
+if [[ -n "${UPSCALER:-}" ]]; then
+  args+=(--upscaler "$UPSCALER")
+fi
 
 echo "studio: http://${ADDR:-127.0.0.1:7860}/"
 exec "$bin" "${args[@]}" "$@"

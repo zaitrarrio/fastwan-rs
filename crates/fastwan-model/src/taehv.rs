@@ -43,6 +43,8 @@ pub struct TaeHv<B: Backend> {
     first: ConvW<B>,
     stages: Vec<Stage<B>>,
     last: ConvW<B>,
+    /// LightTAE's latent denormalisation (`TaeConfig::denormalize`).
+    denorm: Option<ConvW<B>>,
 }
 
 /// Carried between chunks: one saved input frame per MemBlock, and how many
@@ -83,6 +85,7 @@ impl<B: Backend> Chunk<B> {
             h: self.h,
             w: self.w,
             p: self.p,
+            down: 1,
         };
         let out = be.alloc_words(s.pixels());
         be.pack_rgba8(&self.rgb, None, &s, &out);
@@ -165,7 +168,25 @@ impl<B: Backend> TaeHv<B> {
                 )?,
             });
         }
+        let denorm = if cfg.denormalize {
+            if cfg.latent_channels != 16 {
+                return Err(fastwan_core::Error::Geometry(
+                    "LightTAE denormalises Wan 2.1 latents (16 channels)".into(),
+                ));
+            }
+            let mut wd = vec![0f32; 16 * 16];
+            for c in 0..16 {
+                wd[c * 16 + c] = fastwan_core::config::WAN21_LATENT_STD[c];
+            }
+            Some(ConvW {
+                w: be.weight(&wd, 16, 16),
+                b: Some(be.upload(&fastwan_core::config::WAN21_LATENT_MEAN)),
+            })
+        } else {
+            None
+        };
         Ok(Self {
+            denorm,
             first: conv_w(be, src, "decoder.1", nf[0], cfg.latent_channels, 3, true)?,
             last: conv_w(be, src, "decoder.22", cfg.out_channels(), nf[3], 3, true)?,
             stages,
@@ -227,12 +248,76 @@ impl<B: Backend> TaeHv<B> {
         h: usize,
         w: usize,
     ) -> Chunk<B> {
+        assert_eq!(z.len(), frames * self.cfg.latent_channels * h * w);
+        self.launch_x0(be, st, be.upload(z), frames, h, w)
+    }
+
+    /// [`TaeHv::launch_chunk`] from a latent already on the device, laid out
+    /// `[C, frames, h, w]` (a causal block): reordered to frame-major on the
+    /// device, so the latent never makes a round trip through the host.
+    pub fn launch_chunk_dev(
+        &self,
+        be: &B,
+        st: &mut DecodeState<B>,
+        latent: &B::Buf,
+        frames: usize,
+        h: usize,
+        w: usize,
+    ) -> Chunk<B> {
+        let c = self.cfg.latent_channels;
+        let plane = h * w;
+        let x0 = be.alloc(frames * c * plane);
+        for f in 0..frames {
+            for ch in 0..c {
+                be.copy(
+                    latent,
+                    (ch * frames + f) * plane,
+                    &x0,
+                    (f * c + ch) * plane,
+                    plane,
+                );
+            }
+        }
+        self.launch_x0(be, st, x0, frames, h, w)
+    }
+
+    /// The decoder on a frame-major latent `x0` (`[frames, C, h, w]`).
+    fn launch_x0(
+        &self,
+        be: &B,
+        st: &mut DecodeState<B>,
+        x0: B::Buf,
+        frames: usize,
+        h: usize,
+        w: usize,
+    ) -> Chunk<B> {
         let cfg = &self.cfg;
         let nf = cfg.widths;
-        assert_eq!(z.len(), frames * cfg.latent_channels * h * w);
+        // LightTAE: `z·std + mean` per channel (Wan 2.1 VAE statistics) as
+        // a 1×1 diagonal conv on the device, before TAEHV's clamp, so the
+        // host and the device-latent paths (`launch_chunk_dev`) agree.
+        let x0 = match &self.denorm {
+            Some(dw) => {
+                let n = frames * cfg.latent_channels * h * w;
+                let y = be.alloc(n);
+                let c = cfg.latent_channels;
+                let s = ConvShape {
+                    frames,
+                    cin_a: c,
+                    cin_b: 0,
+                    cout: c,
+                    h,
+                    w,
+                    upsample: false,
+                    k: 1,
+                };
+                be.conv2d(&x0, None, &s, &dw.w, dw.b.as_ref(), ConvEpilogue::None, &y);
+                y
+            }
+            None => x0,
+        };
         let (mut f, mut h, mut w) = (frames, h, w);
-        let x0 = be.upload(z);
-        be.tanh_clamp(&x0, z.len(), 3.0);
+        be.tanh_clamp(&x0, frames * cfg.latent_channels * h * w, 3.0);
         let shape = |f, cin_a, cin_b, cout, h, w, upsample, k| ConvShape {
             frames: f,
             cin_a,

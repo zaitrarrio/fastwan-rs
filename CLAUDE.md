@@ -46,15 +46,64 @@ State and invariants only; the reasoning is in `docs/design.md`.
   (`docs/runs/2026-11-14-vast-4090-self-forcing-long`). Below ~320×192 the
   model gives noise (out of distribution, not a bug). A 60 s video drifts
   (a subject leaves and returns) but stays one scene.
+- History Forcing's `dmd/model.pt` (same architecture; `xzxxntxdy/History-
+  Forcing`, EMA, through `convert_self_forcing.py`; weights have **no stated
+  licence**: evaluation only, not hosted) runs two ways. Window cache at its
+  trained window, `--cache-frames 21 --sink-frames 3`: 60 s on an RTX 4090
+  at Self-Forcing's speed at 21/3 (7.9 fps; 21 frames cost ~30% more than
+  12), keeps the prompted subject and moves more, but over-saturates and
+  shows light streaks (`docs/runs/2026-11-17-runpod-4090-history-forcing`).
+  MemRoPE (`generate --causal --memory memrope`, `CausalConfig::
+  history_forcing`, its demo config): the cache is `[sink 3 | long EMA |
+  short EMA | recent 4 | block 3]` in slot order; keys are stored
+  **unrotated** and `rope_heads` rotates the valid prefix at slot positions
+  0.. every forward into the scratch (queries at the block's slots;
+  `attention_kv` reads it, and V in place, where the backend is strided); a
+  new block that does not fit averages the evicted recent frames over all
+  their tokens (`kv_ema`) into the memory frames (α 0.01 / 0.1; the first
+  eviction sets both) and the kept recent frames move up through the
+  scratch (no self-copies on WebGPU). MemRoPE caches are f32 (`half_kv` is
+  ignored). Checked against a transcription of MemRoPE's attention
+  (`make_memrope_fixture.py`, `hf_parity` 3e-7). RTX 4090 (595.99), 12-frame
+  cache: 63 s at 832×480 in 96 s (10.5 fps, ~3 % over the window cache),
+  stable; the same weights on the 12-frame window cache break up mid-clip
+  (`docs/runs/2026-11-17-vast-4090-history-forcing`). After the merge with
+  main's cache ops the MemRoPE clip is byte-identical to the branch's, CUDA
+  70 / 70, WebGPU 70 / 70 on that 4090
+  (`docs/runs/2026-11-18-vast-4090-merge-check`). VSA check cases take
+  bf16-representable inputs: CUDA's bf16 upload rounding flips top-k picks
+  on near-ties of random scores (0.29 on a draw main's new cases produced).
+- LightX2V: LightTAE (`lighttaew2_1[_v2]`) is TAEHV's network on raw VAE
+  latents: `TaeConfig::lighttaew2_1` (chosen by file name) applies `z·std +
+  mean` (Wan 2.1 VAE stats; a 1×1 diagonal conv on the device, so
+  `launch_chunk_dev` gets it too) before TAEHV's clamp; it cannot be folded
+  into the first conv (the clamp comes first). `convert_lightx2v_fp8.py`
+  decodes `lightx2v/Self-Forcing-FP8` (E4M3 × per-row scale) to bf16
+  exactly. LightTAE vs TAEHV on the same latents: 35.4 dB, same cost; the
+  FP8 weights make another sample of the scene (21 dB vs bf16), like int4.
+- K/V cache ops: `kv_store` (one dispatch per run of slots, all heads) and
+  `attention_kv` (flash3 reads the cache in place with a head stride; no
+  prefix packing), `alloc_kv(n, half)` for a 16-bit cache (f16 pairs via core
+  `unpack2x16float`, no `shader-f16`; `CausalConfig::half_kv`). CUDA keeps its
+  bf16 cache and the copy path (trait defaults, `kv_caps`).
 - Browser long videos (`Engine.generateLong` / `stop`; Prompt Studio offers
-  them for manifest variants with `"causal": true`, 480×272 and 640×352,
-  desktop only: the f32 K/V cache is ~2.3 GB at 480×272). Correct in Chrome
-  (SwiftShader parity 99.93%, max 1 level), but headless Chrome on an RTX 4090
-  stalls some blocks for 4-41 s while native wgpu stays at 1.6 s/block
-  (`docs/runs/2026-11-15-vast-4090-chrome-long-video`). wgpu's web backend
-  never frees a dropped buffer: `Owned` / `retire` destroy them after the next
-  submit; `KeepAlive` submits an empty batch every 20 ms during readbacks
-  (halves the stalls). Cause of the rest unknown.
+  them for manifest variants with `"causal": true`). Desktop: 480×272 and
+  640×352, f32 cache unless `?halfkv=1`. Phones (`"mobile": true` variants,
+  public `sf4` = 4-bit Self-Forcing): 320×192 (cache 12) or 480×272 (cache
+  9), 16-bit cache (`setHalfKv`, default on phones), 200 MB of frames. The
+  loop is pipelined (block b queued before block b−1's frames are awaited,
+  `Wgpu::readback_begin` / `Readback::wait`) and the latent never leaves the
+  GPU (`TaeHv::launch_chunk_dev`). SwiftShader parity 99.93%, max 1 level,
+  desktop and phone settings. Headless Chrome on one RTX 4090 host (Japan,
+  615.71.09) stalled some blocks (8–42 s vs 1.6 s); two other 4090s (595.71
+  and 615.71.09) ran flat with and without the buffer pool, so it looked host-
+  specific, cause unknown (`docs/runs/2026-11-18-vast-4090-buffer-pool`).
+  WebGPU buffers are recycled per device (`Recycler`: dropped storage buffers
+  and uniforms go to a free list after the next submit, reused for the same
+  size and usage, zero-filled with `clear_buffer`): 2,772 → 3 allocations per
+  block, 17% faster on one host. Staging buffers are destroyed after the next
+  submit (wgpu's web backend never frees a dropped buffer); `KeepAlive`
+  submits an empty batch every 20 ms during readbacks.
 - Attention: VSA (sparsity 0.8) is the default whenever every block has
   `to_gate_compress` (FastWan does) **and the clip has ≥ 21 latent frames
   (81 frames)**; `--attention dense` to compare. Shorter clips under VSA
@@ -87,10 +136,17 @@ State and invariants only; the reasoning is in `docs/design.md`.
   arrays indexed in loops. NVIDIA's Vulkan compiler kept those arrays in local
   memory: unrolling made the GEMM 5.75× and flash attention 7.8× faster.
   `FASTWAN_PROFILE=1` gives per-kernel GPU time; check it after kernel work.
-- WebGPU f16 math (`linear3h`, `flash_h`, `FASTWAN_WGPU_F16=1`) is opt-in: correct
-  (PSNR 43.8 dB vs f32 on a real clip) but 8.5% slower on an RTX 4090, where
-  f16 runs at the f32 rate (`docs/runs/2026-11-03-vast-4090-f16`). Unmeasured
-  on AMD / Intel / Apple, where it should pay; measure before defaulting it on.
+- WebGPU f16 math (`FASTWAN_WGPU_F16=1`, `?f16=1`; needs `shader-f16`) is
+  opt-in. Current kernels: `linear4h` / `flash3h` (vec4<f16> tiles, 16-term
+  f16 partial sums flushed into f32): 62/62 checks; RTX 4090 Chrome GEMMs
+  1.11–1.24×, attention 1.62×, native step −7%
+  (`docs/runs/2026-11-17-vast-4090-stalls-f16-phones`). AMD RDNA1 Mac
+  (Chrome → Metal): attention 1.33×, cached attention 1.34×, but GEMMs
+  0.90×, hence `FASTWAN_WGPU_F16=attn` / `?f16=attn` (f16 attention, f32
+  GEMMs). Bench FLOP counts are f64: usize is 32 bits on wasm. The old `linear3h` /
+  `flash_h` were 8.5% slower (`docs/runs/2026-11-03-vast-4090-f16`). Default
+  it on only after a real-clip PSNR check and AMD / Apple numbers (Prompt
+  Studio `?selftest=1` → Benchmark f32 vs f16).
 - `--weights int8` (`fastwan_core::quant::Q8`: symmetric int8, one f32 scale
   per 128 input columns) applies to the block linears only. The CPU backend
   dequantizes and is the reference the kernels are checked against. On an RTX
@@ -111,6 +167,20 @@ State and invariants only; the reasoning is in `docs/design.md`.
   carried a `var` declared in a loop body across iterations, which broke
   multi-chunk flash attention while naga/wgpu passed. Run the bench page in
   Chrome as well as `cargo test` after shader changes.
+- WGSL: no workgroup atomics. `vsa_coarse`'s top-k counted with
+  `atomic<u32>` (store / add / load across barriers) and picked the wrong
+  tiles for 74% of queries on an AMD RDNA1 Mac (Chrome → Metal) while Apple,
+  NVIDIA and SwiftShader were exact: every 5 s clip was noise there. It is now
+  a radix select (4-bit passes, byte counters packed per thread, two-level
+  sums), with the picks written by all threads after a prefix scan and one
+  exp per tile, and the query mean in workgroup memory. RTX 4090 (Vulkan),
+  832×480, 12 heads: 3.25 ms/call vs 5.96 (atomic) and 9.38 (radix without
+  the shared query mean); a 30-layer VSA step 7.54 → 7.39 s, coarse 3.5 →
+  1.2% (`docs/runs/2026-11-17-vast-4090-vsa-coarse`). lavapipe ranked these
+  wrongly: time kernels on a real GPU (`examples/vsa_bench.rs`,
+  `FASTWAN_WGPU_SHADER_<kernel>=file.wgsl` swaps one without a rebuild). The browser self-test
+  (`?selftest=1`: `check::ops_deferred` + VSA stage by stage against
+  `vsa::coarse_reference`) finds such per-GPU failures; ask for its output.
 - WGSL auto layouts drop unused bindings, so every declared binding must be
   statically used (see the guard lines at the end of `conv.wgsl` and
   `elementwise.wgsl`).
@@ -148,11 +218,23 @@ State and invariants only; the reasoning is in `docs/design.md`.
   size whose largest buffer exceeds the binding cap before denoising, and the
   page fails the call on a wasm `RuntimeError`. Tiny-model parity vs the CPU (SwiftShader Chrome): f4/f16
   clips and the upscaler 99.9% byte-exact, max 1 level.
-- Upscaler (`upscale.rs`, Real-ESRGAN `realesr-animevideov3`, BSD-3): convs on
-  the backend with `ConvEpilogue::Prelu`, pixel-shuffle + nearest skip in
-  `pack_rgba8` (below). Real weights match a numpy SRVGGNetCompact 100%
-  (`scripts/upscale/parity.py`). `generate --upscale`, Prompt Studio checkbox.
-  4090 CUDA: 81 frames 480×272 → 1920×1088 in 0.87 s, of which 285 ms is GPU.
+- Upscaler (`upscale.rs`, Real-ESRGAN `realesr-animevideov3`, BSD-3, ×4):
+  convs on the backend with `ConvEpilogue::Prelu`, pixel-shuffle + nearest
+  skip in `pack_rgba8` (below). ×2 is the same network then a 2×2 box filter
+  in `pack_rgba8` (`PackShape::down`; `Upscaler::set_output_scale`): no fast
+  ×2 model beat bicubic. `unpack_rgba8` feeds packed frames (a decoder's
+  output, or uploaded RGBA) to `Upscaler::launch_words` on the device. Real
+  weights match a numpy SRVGGNetCompact 100% (`scripts/upscale/parity.py`).
+  CLI `generate --upscale <file> --upscale-x 2|4`, clips and `--causal` (per
+  block); `serve --upscaler <file>`, `upscale: 2|4` per request. RTX 4090
+  CUDA: 81 frames 832×480 ×4 in 2.99 s, ×2 1.39 s; long 832×480 ×2 8.2 fps
+  (10.8 without). Browser: upscaled as it plays into a window of at most
+  768 MB (96 MB on phones, ×2 only) from the playhead forward, any size and
+  long videos; playback waits for each upscaled frame; frames per call adapt
+  (one at first: a long submission trips the GPU watchdog). Chrome on a
+  4090: 16-26 ms/frame (480×272), 43-53 ms (832×480), ~14.5 fps playback,
+  long-video generation unchanged (`docs/runs/2026-11-18-vast-4090-upscale-everywhere`).
+  CUDA `copy` takes f32-flagged (packed word) buffers too.
 - `pack_rgba8` (+ `alloc_words` / `upload_words` / `download_rgba8`): TAEHV's
   and the upscaler's last step on the device, frames out as packed RGBA. A
   packed word is not a valid f32 in general: WGSL writes it through a u32
@@ -168,7 +250,8 @@ State and invariants only; the reasoning is in `docs/design.md`.
   first 1080p frame 0.5 s after the decode, all 81 in 1.4–1.7 s (was 2.4–2.6
   s with readback; `docs/runs/2026-11-13-vast-4090-browser-upscale-gpu`). In
   a browser dropping a buffer destroys it: drop the upscaler's intermediates
-  only after a fence. Upscale is offered for 480×272 only. Playwright's headless
+  only after a fence. Headless screenshots do not capture that WebGPU
+  canvas: check what is shown by reading the frame back. Playwright's headless
   *shell* has no `navigator.gpu`: use the full Chromium build. Vast hosts
   differ in whether they expose Vulkan; `fastwan check --backend wgpu` must
   name NVIDIA, not llvmpipe. `fastwan serve` marks its page
@@ -176,11 +259,14 @@ State and invariants only; the reasoning is in `docs/design.md`.
 - Phones (`MOBILE` in `web/demo.html`: iPhone / iPad / Android UA): the tab's
   memory limit covers GPU memory and iOS resets the tab when it is crossed
   (reported: reset during step 1 at the defaults, ~2 GB: 0.9 GB weights + 1 GB
-  activations + decode). There: 4-bit only, 480×272 only, ≤ 33 frames, no
-  upscale; the engine (`createEngine(…, mobile)`) runs the FFN in 1024-token
+  activations + decode). There: 4-bit only, 480×272 only, ≤ 33 frames, upscale
+  ×2 only; the engine (`createEngine(…, mobile)`) runs the FFN in 1024-token
   chunks, decodes one latent frame at a time and submits every 8 dispatches.
   Not yet measured on a real phone. A `fastwan.run` breadcrumb in
   localStorage names the stage if the tab dies; the next visit shows it.
+- Headless Chrome on SwiftShader needs `--use-vulkan=swiftshader
+  --use-webgpu-adapter=swiftshader --use-angle=swiftshader`: with only the
+  adapter flag, drawing on a WebGPU canvas loses the device ("Destroyed").
 - Tests: `cargo test --workspace` (needs a Vulkan driver for the WebGPU suite:
   `mesa-vulkan-drivers`); NVRTC kernel compile needs libnvrtc on
   `LD_LIBRARY_PATH` (`pip install nvidia-cuda-nvrtc-cu12`).

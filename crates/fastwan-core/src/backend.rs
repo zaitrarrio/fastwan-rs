@@ -43,7 +43,10 @@ pub enum ConvEpilogue<'a, T> {
 
 /// [`Backend::pack_rgba8`]: `src` is `[skip + frames, 3·p², h, w]` (a
 /// pixel-shuffled RGB map, as TAEHV and the upscaler end); the output is
-/// `frames` images of `h·p × w·p` packed pixels.
+/// `frames` images of `h·p/down × w·p/down` packed pixels. `down` (1, or a
+/// divisor of `p`) averages each `down × down` block of the shuffled image
+/// after the residual and clamp, before rounding: the ×2 upscale is the ×4
+/// network followed by a 2×2 box filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackShape {
     /// Frames written (the first `skip` source frames are dropped).
@@ -52,11 +55,23 @@ pub struct PackShape {
     pub h: usize,
     pub w: usize,
     pub p: usize,
+    pub down: usize,
 }
 
 impl PackShape {
+    /// Output image height and width.
+    pub fn out_hw(&self) -> (usize, usize) {
+        assert!(
+            self.down >= 1 && self.p % self.down == 0,
+            "pack down {} must divide p {}",
+            self.down,
+            self.p
+        );
+        (self.h * self.p / self.down, self.w * self.p / self.down)
+    }
     pub fn pixels(&self) -> usize {
-        self.frames * self.h * self.p * self.w * self.p
+        let (oh, ow) = self.out_hw();
+        self.frames * oh * ow
     }
 }
 
@@ -297,6 +312,73 @@ pub trait Backend {
         out: &Self::Buf,
     );
 
+    /// K/V cache support at this head dim: `(strided, half)`. `strided`: the
+    /// backend's [`Backend::attention_kv`] reads a cache in place (rows of each
+    /// head `stride` apart, only the first `sk` valid), so a filling cache
+    /// needs no packing. `half`: [`Backend::alloc_kv`] can store 16-bit
+    /// values (half the memory). The defaults are neither.
+    fn kv_caps(&self, _head_dim: usize) -> (bool, bool) {
+        (false, false)
+    }
+    /// A K/V cache buffer of `n` values, 16-bit when `half` and the backend
+    /// says so in [`Backend::kv_caps`]; otherwise f32 like [`Backend::alloc`].
+    fn alloc_kv(&self, n: usize, half: bool) -> Self::Buf {
+        let _ = half;
+        self.alloc(n)
+    }
+    /// Rows `from .. from + len` of every head of `src` (`[heads, n, d]`)
+    /// into the cache `dst` at row `dst_row` of each head, heads `stride`
+    /// rows apart, in `dst`'s storage (`half` as passed to `alloc_kv`). One
+    /// call per run of consecutive slots, all heads at once.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_store(
+        &self,
+        src: &Self::Buf,
+        n: usize,
+        from: usize,
+        len: usize,
+        heads: usize,
+        d: usize,
+        dst: &Self::Buf,
+        dst_row: usize,
+        stride: usize,
+        half: bool,
+    ) {
+        let _ = half;
+        for h in 0..heads {
+            self.copy(
+                src,
+                (h * n + from) * d,
+                dst,
+                (h * stride + dst_row) * d,
+                len * d,
+            );
+        }
+    }
+    /// [`Backend::attention`] over a cache: `k`/`v` are `[heads, stride, d]`
+    /// of which the first `sk` rows per head are valid. Only called when
+    /// [`Backend::kv_caps`] says strided (or when `stride == sk`).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_kv(
+        &self,
+        q: &Self::Buf,
+        k: &Self::Buf,
+        v: &Self::Buf,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+        stride: usize,
+        head_dim: usize,
+        half: bool,
+        out: &Self::Buf,
+    ) {
+        assert!(
+            stride == sk && !half,
+            "attention_kv: this backend reads only full f32 caches (kv_caps)"
+        );
+        self.attention(q, k, v, heads, sq, sk, head_dim, out);
+    }
+
     /// Whether [`Backend::vsa_attention`] can run at this head dim on this
     /// device (WebGPU needs its flash kernel: head_dim % 16 == 0, ≤ 128, and
     /// enough workgroup memory).
@@ -361,6 +443,48 @@ pub trait Backend {
         n: usize,
     );
 
+    /// RoPE over head-major rows (MemRoPE's cached keys, rotated at their
+    /// slot position on every forward): for each head `h < heads` and row
+    /// `r < rows`, `dst[dst_off + h·dst_stride + r·head_dim ..]` is
+    /// `src[src_off + h·src_stride + r·head_dim ..]` rotated by row `r` of
+    /// `cos`/`sin` (`[rows, head_dim / 2]`, interleaved pairs, as
+    /// [`Backend::head_split`]). `src` and `dst` must be distinct buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_heads(
+        &self,
+        src: &Self::Buf,
+        src_off: usize,
+        src_stride: usize,
+        dst: &Self::Buf,
+        dst_off: usize,
+        dst_stride: usize,
+        heads: usize,
+        rows: usize,
+        head_dim: usize,
+        rope: (&Self::Buf, &Self::Buf),
+    );
+
+    /// MemRoPE's EMA memory, in place on one head-major cache buffer
+    /// (`[heads, ·, head_dim]`, heads `head_stride` elements apart): per head
+    /// and channel, `m` = the mean of rows `[src_row, src_row + src_rows)`;
+    /// then for `i` in 0..2 every row of `[dst_row + i·frame_rows,
+    /// dst_row + (i + 1)·frame_rows)` becomes `alphas[i]·m + (1 − alphas[i])·x`
+    /// (`alphas = [1, 1]` initialises both memory frames to the mean). The
+    /// source and destination rows must not overlap.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_ema(
+        &self,
+        buf: &Self::Buf,
+        heads: usize,
+        head_stride: usize,
+        head_dim: usize,
+        src_row: usize,
+        src_rows: usize,
+        dst_row: usize,
+        frame_rows: usize,
+        alphas: [f32; 2],
+    );
+
     // ---- decoder ---------------------------------------------------------
     /// `out = epilogue(conv(cat([a, b]), W) + bias)`; `W` is `[cout, cin·k²]`.
     #[allow(clippy::too_many_arguments)]
@@ -401,4 +525,9 @@ pub trait Backend {
     /// `byte / 255` exactly (bf16 activations would lose a level near 1).
     /// Frames leave the device at 4 bytes per pixel, ready to show.
     fn pack_rgba8(&self, src: &Self::Buf, base: Option<&Self::Buf>, s: &PackShape, out: &Self::Buf);
+    /// The inverse layout step: 8-bit RGBA words `[frames, plane]` (from
+    /// [`Backend::upload_words`] or [`Backend::pack_rgba8`]) to planar RGB
+    /// `[frames, 3, plane]` as `byte / 255`, the upscaler's input. Decoded
+    /// frames go straight into the upscaler without a host pass.
+    fn unpack_rgba8(&self, src: &Self::Buf, frames: usize, plane: usize, out: &Self::Buf);
 }

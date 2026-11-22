@@ -9,7 +9,8 @@
 # Pass knobs as variables:
 #   task clip PROMPT="a crowded night market in the rain" SEED=3 BACKEND=wgpu
 #   task clip:preview
-#   task generate EMBEDS=gallery/01-a-fox.safetensors
+#   task clip:causal MEMORY=memrope TRANSFORMER=path/to/self-forcing.safetensors
+#   task generate EMBEDS=gallery/01-a-fox.safetensors UPSCALE=realesr.safetensors UPSCALE_X=2
 # Cargo filters and build flags use -- : `task test -- hf_parity`, `task build -- -j 8`.
 
 version: "3"
@@ -51,6 +52,9 @@ vars:
   CAUSAL: "0"
   CACHE_FRAMES: "12"
   SINK_FRAMES: "3"
+  MEMORY: ""
+  UPSCALE_X: ""
+  UPSCALER: ""
   QUANT: int4-hqq-g64
   QUANT_OUT: ""
   ADDR: "127.0.0.1:7860"
@@ -98,6 +102,9 @@ env:
   CAUSAL: "{{.CAUSAL}}"
   CACHE_FRAMES: "{{.CACHE_FRAMES}}"
   SINK_FRAMES: "{{.SINK_FRAMES}}"
+  MEMORY: "{{.MEMORY}}"
+  UPSCALE_X: "{{.UPSCALE_X}}"
+  UPSCALER: "{{.UPSCALER}}"
   QUANT: "{{.QUANT}}"
   QUANT_OUT: "{{.QUANT_OUT}}"
   ADDR: "{{.ADDR}}"
@@ -241,7 +248,7 @@ tasks:
       - bash scripts/clip/generate.sh
 
   clip:causal:
-    desc: Causal rollout; TRANSFORMER must be a Self-Forcing checkpoint
+    desc: Causal rollout. MEMORY=window or memrope; TRANSFORMER is the checkpoint
     deps: [build]
     vars:
       CAUSAL: "1"

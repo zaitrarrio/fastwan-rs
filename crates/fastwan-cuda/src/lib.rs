@@ -107,7 +107,10 @@ struct Kernels {
     gate_residual: CudaFunction,
     dmd_step: CudaFunction,
     tanh_clamp: CudaFunction,
+    rope_heads: CudaFunction,
+    kv_ema: CudaFunction,
     pack_rgba8: CudaFunction,
+    unpack_rgba8: CudaFunction,
     patch: CudaFunction,
     conv2d: CudaFunction,
     conv2d_mma: CudaFunction,
@@ -280,7 +283,10 @@ impl Cuda {
             gate_residual: get("fw_gate_residual")?,
             dmd_step: get("fw_dmd_step")?,
             tanh_clamp: get("fw_tanh_clamp")?,
+            rope_heads: get("fw_rope_heads")?,
+            kv_ema: get("fw_kv_ema")?,
             pack_rgba8: get("fw_pack_rgba8")?,
+            unpack_rgba8: get("fw_unpack_rgba8")?,
             patch: get("fw_patch")?,
             conv2d: get("fw_conv2d")?,
             conv2d_mma: get("fw_conv2d_mma")?,
@@ -375,7 +381,7 @@ impl Cuda {
 
     fn kernel_name(&self, f: &CudaFunction) -> &'static str {
         let k = &self.f;
-        let all: [(&CudaFunction, &'static str); 22] = [
+        let all: [(&CudaFunction, &'static str); 24] = [
             (&k.attention_mma_v[0], "attention (mma v1)"),
             (&k.attention_mma_v[1], "attention (mma v2)"),
             (&k.vsa_fine_mma_v[0], "vsa fine (mma v1)"),
@@ -392,6 +398,8 @@ impl Cuda {
             (&k.gate_residual, "gate_residual"),
             (&k.dmd_step, "dmd_step"),
             (&k.tanh_clamp, "tanh_clamp"),
+            (&k.rope_heads, "rope_heads"),
+            (&k.kv_ema, "kv_ema"),
             (&k.patch, "patchify"),
             (&k.conv2d, "conv2d (scalar)"),
             (&k.conv2d_mma, "conv2d (mma)"),
@@ -555,15 +563,21 @@ impl Backend for Cuda {
         if len == 0 {
             return;
         }
-        assert!(!src.f32 && !dst.f32 && so + len <= src.len && d + len <= dst.len);
+        // bf16 activations (2 bytes) or f32-flagged buffers such as packed
+        // RGBA words (4 bytes); both sides must be the same kind.
+        assert!(
+            src.f32 == dst.f32 && so + len <= src.len && d + len <= dst.len,
+            "copy: mixed bf16 / f32 buffers or out of range"
+        );
+        let e = if src.f32 { 4 } else { 2 };
         // SAFETY: both ranges are inside their allocations (asserted above).
         self.timed(
             || "copy (dtod)".into(),
             || unsafe {
                 cudarc::driver::result::memcpy_dtod_async(
-                    self.ptr(dst) + (d * 2) as u64,
-                    self.ptr(src) + (so * 2) as u64,
-                    len * 2,
+                    self.ptr(dst) + (d * e) as u64,
+                    self.ptr(src) + (so * e) as u64,
+                    len * e,
                     self.stream.cu_stream(),
                 )
                 .expect("dtod");
@@ -1178,6 +1192,98 @@ impl Backend for Cuda {
                 Arg::I(s.w as i32),
                 Arg::I(s.p as i32),
                 Arg::I(base.is_some() as i32),
+                Arg::I(s.down as i32),
+            ],
+        );
+    }
+
+    fn unpack_rgba8(&self, src: &CuBuf, frames: usize, plane: usize, out: &CuBuf) {
+        let n = frames * 3 * plane;
+        assert!(
+            src.f32 && src.len >= frames * plane && !out.f32 && out.len >= n,
+            "unpack_rgba8: src from alloc_words / upload_words, out an activation"
+        );
+        self.launch(
+            &self.f.unpack_rgba8,
+            Self::elems(n),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(src)),
+                Arg::P(self.ptr(out)),
+                Arg::L(n as i64),
+                Arg::L(plane as i64),
+            ],
+        );
+    }
+
+    fn rope_heads(
+        &self,
+        src: &CuBuf,
+        src_off: usize,
+        src_stride: usize,
+        dst: &CuBuf,
+        dst_off: usize,
+        dst_stride: usize,
+        heads: usize,
+        rows: usize,
+        hd: usize,
+        rope: (&CuBuf, &CuBuf),
+    ) {
+        assert!(
+            rope.0.f32 && rope.1.f32,
+            "RoPE tables must come from upload_table"
+        );
+        self.launch(
+            &self.f.rope_heads,
+            Self::elems(heads * rows * hd / 2),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(src)),
+                Arg::P(self.ptr(dst)),
+                Arg::P(self.ptr(rope.0)),
+                Arg::P(self.ptr(rope.1)),
+                Arg::I(heads as i32),
+                Arg::I(rows as i32),
+                Arg::I(hd as i32),
+                Arg::L(src_off as i64),
+                Arg::L(src_stride as i64),
+                Arg::L(dst_off as i64),
+                Arg::L(dst_stride as i64),
+            ],
+        );
+    }
+
+    fn kv_ema(
+        &self,
+        buf: &CuBuf,
+        heads: usize,
+        head_stride: usize,
+        hd: usize,
+        src_row: usize,
+        src_rows: usize,
+        dst_row: usize,
+        frame_rows: usize,
+        alphas: [f32; 2],
+    ) {
+        assert!(
+            src_row + src_rows <= dst_row || dst_row + 2 * frame_rows <= src_row,
+            "kv_ema: source and memory rows overlap"
+        );
+        self.launch(
+            &self.f.kv_ema,
+            ((heads * hd.div_ceil(32)) as u32, 1, 1),
+            (256, 1, 1),
+            &[
+                Arg::P(self.ptr(buf)),
+                Arg::I(heads as i32),
+                Arg::I(hd as i32),
+                Arg::L(head_stride as i64),
+                Arg::I(src_row as i32),
+                Arg::I(src_rows as i32),
+                Arg::I(dst_row as i32),
+                Arg::I(frame_rows as i32),
+                Arg::F(alphas[0]),
+                Arg::F(alphas[1]),
             ],
         );
     }

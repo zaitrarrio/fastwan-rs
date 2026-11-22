@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 mod gallery;
 mod serve;
+mod upscale;
 
 #[derive(Parser)]
 #[command(
@@ -167,6 +168,10 @@ enum Cmd {
         /// https://fastwan.pages.dev for the hosted demo page.
         #[arg(long)]
         allow_origin: Option<String>,
+        /// Offer ×2 / ×4 upscaling with this Real-ESRGAN compact model
+        /// (`realesr-animevideov3.safetensors`).
+        #[arg(long)]
+        upscaler: Option<PathBuf>,
     },
     /// Write a quantized copy of the DiT: block linears as int8 / 4-bit codes,
     /// everything else f16 (the browser download format; see
@@ -236,10 +241,15 @@ enum Cmd {
         ffn_chunk: Option<usize>,
         #[arg(long, default_value_t = 2)]
         tae_chunk: usize,
-        /// Upscale ×4 after decoding with Real-ESRGAN's compact video model
+        /// Upscale after decoding with Real-ESRGAN's compact video model
         /// (`realesr-animevideov3.safetensors`; scripts/upscale/convert_esrgan.py).
+        /// Long videos (--causal) upscale each block as it is decoded.
         #[arg(long)]
         upscale: Option<PathBuf>,
+        /// Upscale factor: 4, or 2 (the ×4 network, then a 2×2 box filter on
+        /// the GPU; about the same cost, a quarter of the pixels).
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(2..=4))]
+        upscale_x: u8,
         /// Causal rollout (a Self-Forcing checkpoint: scripts/convert_self_forcing.py):
         /// 3-latent-frame blocks over a rolling K/V cache, any --frames, streamed
         /// to --out as each block decodes.
@@ -251,7 +261,22 @@ enum Cmd {
         /// Causal: first latent frames kept in the cache for the whole video.
         #[arg(long, default_value_t = 3)]
         sink_frames: usize,
+        /// Causal: what the full cache keeps. `memrope` is History Forcing's
+        /// memory (its checkpoint: scripts/convert_self_forcing.py on
+        /// dmd/model.pt): 2 EMA frames after the sink, unrotated keys
+        /// rotated at their slot (block-relative RoPE).
+        #[arg(long, value_enum, default_value_t = CausalMemory::Window)]
+        memory: CausalMemory,
     },
+}
+
+/// `generate --causal --memory`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum CausalMemory {
+    /// Sink + rolling window (Self-Forcing, LongLive).
+    Window,
+    /// MemRoPE: sink + long / short EMA memory frames + recent window.
+    Memrope,
 }
 
 /// Run `f` with the selected backend.
@@ -364,6 +389,7 @@ fn main() -> Result<()> {
             max_frames,
             tae_chunk,
             allow_origin,
+            upscaler,
         } => {
             let weights = if synthetic {
                 serve::Weights::Synthetic { gallery }
@@ -390,6 +416,7 @@ fn main() -> Result<()> {
                 allow_origin,
                 attention: attn.get(),
                 quant: attn.weights,
+                upscaler,
             };
             serve::serve(settings, move |s, shared, rx| {
                 with_backend!(backend, |be| serve::engine(be, s, shared, rx))
@@ -490,9 +517,11 @@ fn main() -> Result<()> {
             ffn_chunk,
             tae_chunk,
             upscale,
+            upscale_x,
             causal,
             cache_frames,
             sink_frames,
+            memory,
         } => {
             let g = shape.geometry()?;
             let cfg = WanConfig::fastwan_1_3b();
@@ -518,10 +547,13 @@ fn main() -> Result<()> {
                 (None, None) => bail!("give --prompt or --embeds"),
             };
             if causal {
-                if upscale.is_some() || runs > 1 {
-                    bail!("--causal does not take --upscale or --runs yet");
+                if runs > 1 {
+                    bail!("--causal does not take --runs");
                 }
-                let mut ccfg = fastwan_model::causal::CausalConfig::self_forcing();
+                let mut ccfg = match memory {
+                    CausalMemory::Window => fastwan_model::causal::CausalConfig::self_forcing(),
+                    CausalMemory::Memrope => fastwan_model::causal::CausalConfig::history_forcing(),
+                };
                 ccfg.cache_frames(cache_frames, sink_frames);
                 return with_backend!(backend, |be| generate_causal(
                     &be,
@@ -534,6 +566,7 @@ fn main() -> Result<()> {
                     ffn_chunk,
                     ccfg,
                     attn.weights,
+                    upscale.as_deref().map(|p| (p, upscale_x as usize)),
                 ));
             }
             with_backend!(backend, |be| generate(
@@ -549,7 +582,7 @@ fn main() -> Result<()> {
                 runs,
                 attn.get(),
                 attn.weights,
-                upscale.as_deref()
+                upscale.as_deref().map(|p| (p, upscale_x as usize))
             )?)
         }
     }
@@ -670,7 +703,7 @@ fn generate<B: Backend>(
     runs: usize,
     attention: Option<fastwan_model::Attention>,
     quant: fastwan_core::quant::WeightQuant,
-    upscale: Option<&Path>,
+    upscale: Option<(&Path, usize)>,
 ) -> Result<()> {
     let cfg = WanConfig::fastwan_1_3b();
     let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
@@ -740,47 +773,18 @@ fn generate<B: Backend>(
         print!("all runs: {r}");
     }
     let mut video = last.expect("at least one run");
-    if let Some(path) = upscale {
-        use fastwan_model::upscale::{UpConfig, Upscaler, up_manifest};
-        let ucfg = UpConfig::anime_video_v3();
-        let usrc = SafetensorsDir::open(path)?;
-        let miss = missing(&usrc, &up_manifest(&ucfg));
-        if !miss.is_empty() {
-            bail!(
-                "{} is not realesr-animevideov3 (missing {:?})",
-                path.display(),
-                &miss[..miss.len().min(3)]
-            );
-        }
-        let up = Upscaler::load(be, ucfg, &usrc)?;
-        let (h, w, s) = (video.height, video.width, ucfg.scale);
-        // Batches of a few frames: activations are 64 channels at full size.
-        let batch = up.batch(h, w, 1 << 30).min(8);
+    if let Some((path, x)) = upscale {
+        let up = upscale::load(be, path, x)?;
+        let (h, w) = (video.height, video.width);
         be.profile_reset();
         let t0 = std::time::Instant::now();
-        let mut rgb = Vec::with_capacity(video.rgb.len() * s * s);
-        // Pipelined like the decode: batch i+1 is queued before batch i is
-        // read back and converted, so host work overlaps the GPU.
-        let starts: Vec<usize> = (0..video.frames).step_by(batch).collect();
-        let launch = |f0: usize| {
-            let n = batch.min(video.frames - f0);
-            up.launch(
-                be,
-                &video.rgb[f0 * h * w * 3..(f0 + n) * h * w * 3],
-                n,
-                h,
-                w,
-            )
-        };
-        let mut cur = launch(starts[0]);
-        for i in 0..starts.len() {
-            let next = starts.get(i + 1).map(|&f0| launch(f0));
-            let rgba = be.download_rgba8(&cur.out);
-            rgb.extend(fastwan_core::backend::rgba_to_rgb(&rgba));
-            if let Some(n) = next {
-                cur = n;
-            }
-        }
+        let words: Vec<u32> = video
+            .rgb
+            .chunks_exact(3)
+            .map(|p| p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16)
+            .collect();
+        let rgb = upscale::frames(be, &up, &be.upload_words(&words), video.frames, h, w);
+        let s = up.output_scale();
         println!(
             "upscale x{s} {:.2}s ({}x{} -> {}x{})",
             t0.elapsed().as_secs_f64(),
@@ -825,10 +829,11 @@ fn generate_causal<B: Backend>(
     ffn_chunk: Option<usize>,
     ccfg: fastwan_model::causal::CausalConfig,
     quant: fastwan_core::quant::WeightQuant,
+    upscale: Option<(&Path, usize)>,
 ) -> Result<()> {
-    use fastwan_model::causal::{CausalRollout, frame_major};
+    use fastwan_model::causal::CausalRollout;
     let cfg = WanConfig::fastwan_1_3b();
-    let tcfg = TaeConfig::taew2_1();
+    let tcfg = TaeConfig::from_file_name(&tae.to_string_lossy()).unwrap_or_else(TaeConfig::taew2_1);
     println!("{}", be.name());
     let t0 = std::time::Instant::now();
     let wsrc = SafetensorsDir::open(transformer)?;
@@ -844,14 +849,15 @@ fn generate_causal<B: Backend>(
     let tsrc = SafetensorsDir::open(tae)?;
     let dit = WanDit::load_with(be, cfg.clone(), &wsrc, quant)?;
     let taehv = TaeHv::load(be, tcfg, &tsrc)?;
+    let up = upscale.map(|(p, x)| upscale::load(be, p, x)).transpose()?;
     be.sync();
     println!("load {:.1}s", t0.elapsed().as_secs_f64());
     let (lt, lh, lw) = g.latent();
     let bf = ccfg.block_frames;
     let blocks = lt.div_ceil(bf);
     println!(
-        "causal: {blocks} blocks of {bf} latent frames, cache {} (sink {}), timesteps {:?}",
-        ccfg.cap_frames, ccfg.sink_frames, ccfg.timesteps
+        "causal: {blocks} blocks of {bf} latent frames, cache {} (sink {}, {:?}), timesteps {:?}",
+        ccfg.cap_frames, ccfg.sink_frames, ccfg.memory, ccfg.timesteps
     );
     let t0 = std::time::Instant::now();
     let prompt = dit.prepare_prompt(be, e);
@@ -865,19 +871,38 @@ fn generate_causal<B: Backend>(
     )?;
     let mut st = taehv.state();
     let mut y4m: Option<Y4m> = None;
-    let c = cfg.out_channels;
     let mut frames = 0;
     let mut first_frame = None;
     for b in 0..blocks {
         let tb = std::time::Instant::now();
-        let latent = be.download(roll.next_block(be, &prompt)?);
+        // The latent stays on the device: the decoder reads the block as is.
+        let x = roll.next_block(be, &prompt)?;
+        let chunk = taehv.launch_chunk_dev(be, &mut st, x, bf, lh, lw);
         let den = tb.elapsed().as_secs_f64();
-        let z = frame_major(&latent, c, bf, lh * lw);
-        let chunk = taehv.launch_chunk(be, &mut st, &z, bf, lh, lw);
         let packed = chunk.pack(be);
-        let raw = be.download_rgba8(&packed);
         let (n, h, w) = chunk.dims();
-        let rgb = fastwan_core::backend::rgba_to_rgb(&raw[..n * h * w * 4]);
+        let tu = std::time::Instant::now();
+        // The decoded block goes into the upscaler on the device; only the
+        // upscaled frames come back.
+        let (rgb, h, w) = match &up {
+            Some(up) => {
+                let s = up.output_scale();
+                (upscale::frames(be, up, &packed, n, h, w), h * s, w * s)
+            }
+            None => {
+                let raw = be.download_rgba8(&packed);
+                (
+                    fastwan_core::backend::rgba_to_rgb(&raw[..n * h * w * 4]),
+                    h,
+                    w,
+                )
+            }
+        };
+        let up_s = if up.is_some() {
+            tu.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
         let y = match y4m.as_mut() {
             Some(y) => y,
             None => y4m.insert(Y4m::create(out, w, h, 16)?),
@@ -886,8 +911,13 @@ fn generate_causal<B: Backend>(
         frames += n;
         first_frame.get_or_insert(t0.elapsed().as_secs_f64());
         println!(
-            "block {b}: denoise {den:.2}s  decode {:.2}s  {n} frames ({frames} total, {:.1} fps so far)",
-            tb.elapsed().as_secs_f64() - den,
+            "block {b}: denoise {den:.2}s  decode {:.2}s{}  {n} frames ({frames} total, {:.1} fps so far)",
+            tb.elapsed().as_secs_f64() - den - up_s,
+            if up.is_some() {
+                format!("  upscale {up_s:.2}s")
+            } else {
+                String::new()
+            },
             frames as f64 / t0.elapsed().as_secs_f64()
         );
     }

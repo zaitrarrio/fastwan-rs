@@ -1,4 +1,6 @@
-"""Self-Forcing DMD checkpoint (.pt) -> Diffusers-named safetensors, no torch.
+"""Self-Forcing-style checkpoint (.pt) -> Diffusers-named safetensors, no torch.
+Also reads History Forcing's dmd/model.pt (tensors saved with attributes),
+which runs with `generate --causal --memory memrope`.
 
     python3 -I scripts/convert_self_forcing.py self_forcing_dmd.pt transformer.safetensors
 
@@ -66,12 +68,36 @@ def rebuild(storage, offset, size, stride, *_):
     return Lazy(storage, offset, size, stride)
 
 
+TENSOR = object()  # stands in for the torch.Tensor class
+
+
+def rebuild_from_type(func, new_type, args, state):
+    # A tensor saved with Python attributes (History Forcing's checkpoints):
+    # the plain tensor, attributes dropped. Only plain Tensor is accepted.
+    if func is not rebuild or new_type is not TENSOR:
+        raise pickle.UnpicklingError("unexpected tensor subclass")
+    return rebuild(*args)
+
+
+def rebuild_parameter(data, requires_grad, hooks, *_):
+    # nn.Parameter: the tensor it wraps.
+    if not isinstance(data, Lazy):
+        raise pickle.UnpicklingError("parameter without a tensor")
+    return data
+
+
 class Unpickler(pickle.Unpickler):
     def find_class(self, mod, name):
         if (mod, name) == ("collections", "OrderedDict"):
             return collections.OrderedDict
         if (mod, name) == ("torch._utils", "_rebuild_tensor_v2"):
             return rebuild
+        if (mod, name) == ("torch._tensor", "_rebuild_from_type_v2"):
+            return rebuild_from_type
+        if (mod, name) == ("torch._utils", "_rebuild_parameter"):
+            return rebuild_parameter
+        if (mod, name) == ("torch", "Tensor"):
+            return TENSOR
         if mod == "torch" and name in DTYPES:
             return name
         raise pickle.UnpicklingError(f"refusing global {mod}.{name}")

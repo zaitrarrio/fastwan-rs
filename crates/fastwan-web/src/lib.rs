@@ -47,9 +47,10 @@ mod web {
         tae: RefCell<Option<TaeHv<Wgpu>>>,
         up: RefCell<Option<Upscaler<Wgpu>>>,
         /// The canvas upscaled frames are drawn on, and the frames kept on
-        /// the GPU: (packed buffer, frames in it), one entry per batch.
+        /// the GPU, one entry per batch: the page keeps a window of them
+        /// around the playhead (`upscaleFrames` / `dropUpscaled`).
         view: RefCell<Option<fastwan_wgpu::CanvasView>>,
-        kept: RefCell<Vec<(fastwan_wgpu::GBuf, usize)>>,
+        kept: RefCell<Vec<Kept>>,
         kept_dims: std::cell::Cell<(u32, u32)>,
         /// Lower-memory settings for phones (see `create_engine`).
         mobile: bool,
@@ -57,6 +58,16 @@ mod web {
         stop: std::cell::Cell<bool>,
         /// Clip attention: `None` = the model's default (VSA from 81 frames).
         attention: std::cell::Cell<Option<fastwan_model::Attention>>,
+        /// Long videos keep the K/V cache as 16-bit values (half its memory);
+        /// on by default on phones.
+        half_kv: std::cell::Cell<bool>,
+    }
+
+    /// A batch of upscaled frames on the GPU: frames `first..first + n`.
+    struct Kept {
+        buf: fastwan_wgpu::GBuf,
+        first: usize,
+        n: usize,
     }
 
     #[wasm_bindgen]
@@ -71,6 +82,7 @@ mod web {
         model: String,
         kernels: Option<String>,
         mobile: Option<bool>,
+        f16: Option<String>,
     ) -> Result<Engine, JsValue> {
         console_error_panic_hook::set_once();
         let (cfg, tcfg) = match model.as_str() {
@@ -93,6 +105,12 @@ mod web {
         if mobile {
             opts.submit_every = Some(8);
         }
+        // f16 math kernels where the adapter has `shader-f16`, fixed for the
+        // device's lifetime: "1" = linear4h + flash3h, "attn" = flash3h only
+        // (f32 GEMMs), anything else = off.
+        let f16 = f16.unwrap_or_default();
+        opts.f16 = f16 == "1" || f16 == "attn";
+        opts.f16_attn_only = f16 == "attn";
         let be = Wgpu::with_options_async(opts).await.map_err(err)?;
         Ok(Engine {
             inner: Rc::new(Inner {
@@ -109,6 +127,7 @@ mod web {
                 mobile,
                 stop: std::cell::Cell::new(false),
                 attention: std::cell::Cell::new(None),
+                half_kv: std::cell::Cell::new(mobile),
             }),
         })
     }
@@ -227,45 +246,93 @@ mod web {
             Ok(())
         }
 
-        /// Upscale `frames` RGB frames and keep the result on the GPU (no
-        /// readback); resolves to the number of frames kept so far, once this
-        /// batch has finished. Show them with `showUpscaled`.
-        #[wasm_bindgen(js_name = upscaleKeep)]
-        pub fn upscale_keep(
+        /// The upscaler's output scale: 4 (the network's), or 2 (the ×4
+        /// network, then a 2×2 box filter on the GPU). Returns the scale.
+        #[wasm_bindgen(js_name = setUpscale)]
+        pub fn set_upscale(&self, x: usize) -> Result<usize, JsValue> {
+            let mut up = self.inner.up.borrow_mut();
+            let up = up
+                .as_mut()
+                .ok_or_else(|| err("the upscaler is not loaded"))?;
+            up.set_output_scale(x).map_err(err)?;
+            Ok(up.output_scale())
+        }
+
+        /// Upscale frames `first..first + frames` given as RGBA bytes
+        /// (`[frames, h, w, 4]`, as decoded) and keep them on the GPU (no
+        /// readback); resolves once the batch is done. Show them with
+        /// `showUpscaled`, free them with `dropUpscaled`.
+        #[wasm_bindgen(js_name = upscaleFrames)]
+        pub fn upscale_frames(
             &self,
-            rgb: Vec<u8>,
+            rgba: Vec<u8>,
+            first: usize,
             frames: usize,
             h: usize,
             w: usize,
         ) -> js_sys::Promise {
             let inner = self.inner.clone();
             wasm_bindgen_futures::future_to_promise(async move {
+                if rgba.len() != frames * h * w * 4 {
+                    return Err(err("rgba is not frames × h × w × 4"));
+                }
+                let words: Vec<u32> = rgba
+                    .chunks_exact(4)
+                    .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+                    .collect();
+                let base = inner.be.upload_words(&words);
                 let chunk = {
                     let up = inner.up.borrow();
                     let up = up
                         .as_ref()
                         .ok_or_else(|| err("the upscaler is not loaded"))?;
-                    if rgb.len() != frames * h * w * 3 {
-                        return Err(err("rgb is not frames × h × w × 3"));
-                    }
-                    up.launch(&inner.be, &rgb, frames, h, w)
+                    up.launch_words(&inner.be, &base, frames, h, w)
                 };
                 let s = chunk.scale as u32;
                 // Wait for the batch: progress for the page, and the
-                // intermediates may only be dropped (destroyed) after it.
+                // intermediates may only be dropped after it.
                 let fence = inner.be.alloc(1);
                 inner.be.try_download_async(&fence).await.map_err(err)?;
+                drop(base);
                 let mut kept = inner.kept.borrow_mut();
-                kept.push((chunk.into_out(), frames));
+                kept.retain(|k| k.first + k.n <= first || k.first >= first + frames);
+                kept.push(Kept {
+                    buf: chunk.into_out(),
+                    first,
+                    n: frames,
+                });
                 inner.kept_dims.set((w as u32 * s, h as u32 * s));
-                Ok(JsValue::from(kept.iter().map(|k| k.1).sum::<usize>() as u32))
+                Ok(JsValue::from(kept.iter().map(|k| k.n).sum::<usize>() as u32))
             })
+        }
+
+        /// Whether frame `i` is upscaled and kept on the GPU.
+        #[wasm_bindgen(js_name = isUpscaled)]
+        pub fn is_upscaled(&self, i: usize) -> bool {
+            self.locate(i).is_some()
+        }
+
+        /// The kept batches as `[first, n, first, n, …]`.
+        #[wasm_bindgen(js_name = upscaledRanges)]
+        pub fn upscaled_ranges(&self) -> Vec<u32> {
+            self.inner
+                .kept
+                .borrow()
+                .iter()
+                .flat_map(|k| [k.first as u32, k.n as u32])
+                .collect()
+        }
+
+        /// Free the kept batch that starts at frame `first`.
+        #[wasm_bindgen(js_name = dropUpscaled)]
+        pub fn drop_upscaled(&self, first: usize) {
+            self.inner.kept.borrow_mut().retain(|k| k.first != first);
         }
 
         /// Upscaled frames kept on the GPU.
         #[wasm_bindgen(js_name = upscaledCount)]
         pub fn upscaled_count(&self) -> usize {
-            self.inner.kept.borrow().iter().map(|k| k.1).sum()
+            self.inner.kept.borrow().iter().map(|k| k.n).sum()
         }
 
         /// Free the kept upscaled frames.
@@ -323,7 +390,7 @@ mod web {
         ) -> js_sys::Promise {
             let inner = self.inner.clone();
             wasm_bindgen_futures::future_to_promise(async move {
-                run(
+                let r = run(
                     &inner,
                     embeds,
                     Geometry {
@@ -334,8 +401,10 @@ mod web {
                     seed as u64,
                     &on_event,
                 )
-                .await
-                .map(|()| JsValue::UNDEFINED)
+                .await;
+                // Free the buffers kept for reuse: the next run may use other sizes.
+                inner.be.trim_pool();
+                r.map(|()| JsValue::UNDEFINED)
             })
         }
 
@@ -343,6 +412,8 @@ mod web {
         /// block by block: events `prepared`, then per block `block`
         /// `{index, total, ms, denoise_ms}` and `frames` (as in `generate`).
         /// `cache_frames` / `sink_frames` are latent frames (12 / 3).
+        /// `memrope` selects History Forcing's MemRoPE memory (a manifest
+        /// variant with `"memory": "memrope"`) instead of the rolling window.
         #[wasm_bindgen(js_name = generateLong)]
         #[allow(clippy::too_many_arguments)]
         pub fn generate_long(
@@ -354,11 +425,12 @@ mod web {
             seed: f64,
             cache_frames: usize,
             sink_frames: usize,
+            memrope: bool,
             on_event: Function,
         ) -> js_sys::Promise {
             let inner = self.inner.clone();
             wasm_bindgen_futures::future_to_promise(async move {
-                run_long(
+                let r = run_long(
                     &inner,
                     embeds,
                     Geometry {
@@ -369,10 +441,13 @@ mod web {
                     seed as u64,
                     cache_frames,
                     sink_frames,
+                    memrope,
                     &on_event,
                 )
-                .await
-                .map(|()| JsValue::UNDEFINED)
+                .await;
+                // Free the buffers kept for reuse: the next run may use other sizes.
+                inner.be.trim_pool();
+                r.map(|()| JsValue::UNDEFINED)
             })
         }
 
@@ -426,7 +501,202 @@ mod web {
                     set(&o, "ok", r.ok);
                     let _ = on_event.call1(&JsValue::NULL, &o);
                 }
+                // VSA stage by stage (the op checks above only see the
+                // result): tile means, coarse output, selected tiles.
+                for &(grid, heads, d) in &[
+                    ((5usize, 6usize, 9usize), 2usize, 128usize),
+                    ((21, 17, 30), 2, 128),
+                ] {
+                    use fastwan_core::Backend as _;
+                    let spec = fastwan_core::vsa::VsaSpec::new(grid, heads, d, 0.8);
+                    let n = heads * spec.plan.seq * d;
+                    let mut rng = fastwan_core::rng::Rng::new(7);
+                    let (q, k, v, g) = (rng.normal(n), rng.normal(n), rng.normal(n), rng.normal(n));
+                    let (gq, gk, gv, gg, go) = (
+                        be.upload(&q),
+                        be.upload(&k),
+                        be.upload(&v),
+                        be.upload(&g),
+                        be.alloc(n),
+                    );
+                    let st = be.vsa_prepare(&spec);
+                    be.vsa_attention(&gq, &gk, &gv, &gg, &st, &go);
+                    let (want_p, want_c, want_s) =
+                        fastwan_core::vsa::coarse_reference(&spec, &q, &k, &v);
+                    let (bp, bc, bs) = st.stages();
+                    let got_p = be.try_download_async(bp).await.map_err(err)?;
+                    let got_c = be.try_download_async(bc).await.map_err(err)?;
+                    let got_s = be.try_download_async(bs).await.map_err(err)?;
+                    let relf = |a: &[f32], b: &[f32]| {
+                        let scale = b.iter().fold(0f32, |m, x| m.max(x.abs())) + 1e-6;
+                        a.iter().zip(b).fold(0f32, |m, (x, y)| {
+                            let e = (x - y).abs();
+                            if e.is_nan() { f32::INFINITY } else { m.max(e) }
+                        }) / scale
+                    };
+                    // Selection: tiles the GPU picked that the host did not, as a set per query tile.
+                    let topk = spec.topk;
+                    let got_s: Vec<u32> = got_s.iter().map(|x| x.to_bits()).collect();
+                    let mut wrong = 0usize;
+                    for (gr, wr) in got_s.chunks(topk).zip(want_s.chunks(topk)) {
+                        wrong += gr.iter().filter(|t| !wr.contains(t)).count();
+                    }
+                    let total_sel = want_s.len();
+                    let tag = format!(
+                        "vsa stages {grid:?} h{heads} d{d} topk {topk}/{}",
+                        spec.plan.num_tiles()
+                    );
+                    let rows = [
+                        (
+                            format!("{tag}: pool (tile means)"),
+                            relf(&got_p, &want_p),
+                            None,
+                        ),
+                        (
+                            format!("{tag}: coarse (tile attention)"),
+                            relf(&got_c, &want_c),
+                            None,
+                        ),
+                        (
+                            format!("{tag}: select ({wrong} of {total_sel} picks differ)"),
+                            wrong as f32 / total_sel as f32,
+                            Some(wrong),
+                        ),
+                    ];
+                    for (name, rel, wrong) in rows {
+                        // A near-tie can flip a pick between float orders: allow 1%.
+                        let ok = match wrong {
+                            Some(w) => w * 100 <= total_sel,
+                            None => rel <= tol,
+                        };
+                        bad += (!ok) as u32;
+                        let o = Object::new();
+                        set(&o, "type", "check");
+                        set(&o, "name", name.as_str());
+                        set(&o, "rel", rel as f64);
+                        set(&o, "ok", ok);
+                        let _ = on_event.call1(&JsValue::NULL, &o);
+                    }
+                    if got_s.iter().take(topk * 4).all(|&x| x == 0) {
+                        let o = Object::new();
+                        set(&o, "type", "check");
+                        set(
+                            &o,
+                            "name",
+                            "note: the first query tiles selected only tile 0 (sel never written?)",
+                        );
+                        set(&o, "rel", 0.0);
+                        set(&o, "ok", false);
+                        let _ = on_event.call1(&JsValue::NULL, &o);
+                    }
+                }
                 Ok(JsValue::from(bad))
+            })
+        }
+
+        /// Long videos: keep the K/V cache as 16-bit values (half the cache
+        /// memory; on by default on phones).
+        #[wasm_bindgen(js_name = setHalfKv)]
+        pub fn set_half_kv(&self, on: bool) {
+            self.inner.half_kv.set(on);
+        }
+
+        /// Whether the f16 math kernels are in use (asked for at
+        /// `createEngine` and supported by the adapter).
+        #[wasm_bindgen(js_name = isF16)]
+        pub fn is_f16(&self) -> bool {
+            self.inner.be.f16()
+        }
+
+        /// Time the model's main kernels on this GPU with synthetic data: the
+        /// FFN GEMMs (f16 weights), dense attention and attention over a
+        /// 16-bit K/V cache, each at a model shape. Events:
+        /// `{type: "bench", name, ms, gflops}`, one per kernel (mean of `reps`
+        /// calls after a warm-up, fenced by a readback).
+        pub fn bench(&self, reps: u32, on_event: Function) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            wasm_bindgen_futures::future_to_promise(async move {
+                use fastwan_core::Backend as _;
+                let be = &inner.be;
+                let reps = reps.max(1);
+                let mut rng = Rng::new(3);
+                let fence = be.alloc(1);
+                let emit = |name: &str, ms: f64, flop: f64| {
+                    let o = Object::new();
+                    set(&o, "type", "bench");
+                    set(&o, "name", name);
+                    set(&o, "ms", ms);
+                    set(&o, "gflops", flop / ms / 1e6);
+                    set(&o, "tflops", flop / ms / 1e9);
+                    let _ = on_event.call1(&JsValue::NULL, &o);
+                };
+                // Rows: 3 latent frames at 480×272 (one long-video block) ≈
+                // 1530 tokens; 4096 keeps every kernel on its large-tile path.
+                let (m, d, f) = (4096usize, 1536usize, 8960usize);
+                let x = be.upload(&rng.normal(m * f));
+                let wu = be.weight(&rng.uniform(f * d, 0.05), f, d);
+                let wd = be.weight(&rng.uniform(d * f, 0.05), d, f);
+                let h = be.alloc(m * f);
+                let y = be.alloc(m * d);
+                let mut results: Vec<(String, f64, f64)> = Vec::new();
+                // In f64: usize is 32 bits on wasm and these products overflow it.
+                let ffn = 2.0 * m as f64 * d as f64 * f as f64;
+                let ms = time_it(be, &fence, reps, &|| {
+                    be.linear(
+                        &x,
+                        0,
+                        m,
+                        &wu,
+                        None,
+                        fastwan_core::backend::Act::GeluTanh,
+                        &h,
+                        0,
+                    )
+                })
+                .await?;
+                results.push(("GEMM 4096×1536→8960 (FFN up, GELU)".into(), ffn, ms));
+                let ms = time_it(be, &fence, reps, &|| {
+                    be.linear(&h, 0, m, &wd, None, fastwan_core::backend::Act::None, &y, 0)
+                })
+                .await?;
+                results.push(("GEMM 4096×8960→1536 (FFN down)".into(), ffn, ms));
+                let (heads, hd, s) = (12usize, 128usize, 4096usize);
+                let q = be.upload(&rng.normal(heads * s * hd));
+                let k = be.upload(&rng.normal(heads * s * hd));
+                let v = be.upload(&rng.normal(heads * s * hd));
+                let o = be.alloc(s * heads * hd);
+                let ms = time_it(be, &fence, reps, &|| {
+                    be.attention(&q, &k, &v, heads, s, s, hd, &o)
+                })
+                .await?;
+                results.push((
+                    "attention 12×4096×4096 d128".into(),
+                    4.0 * heads as f64 * s as f64 * s as f64 * hd as f64,
+                    ms,
+                ));
+                if be.kv_caps(hd).1 {
+                    // One long-video block (1530 queries) over a full 12-frame
+                    // cache at 480×272 (6120 keys), 16-bit.
+                    let (sq, sk) = (1530usize, 6120usize);
+                    let kc = be.alloc_kv(heads * sk * hd, true);
+                    let vc = be.alloc_kv(heads * sk * hd, true);
+                    let src = be.upload(&rng.normal(heads * sk * hd));
+                    be.kv_store(&src, sk, 0, sk, heads, hd, &kc, 0, sk, true);
+                    be.kv_store(&src, sk, 0, sk, heads, hd, &vc, 0, sk, true);
+                    let ms = time_it(be, &fence, reps, &|| {
+                        be.attention_kv(&q, &kc, &vc, heads, sq, sk, sk, hd, true, &o)
+                    })
+                    .await?;
+                    results.push((
+                        "attention over 16-bit cache 1530×6120".into(),
+                        4.0 * heads as f64 * sq as f64 * sk as f64 * hd as f64,
+                        ms,
+                    ));
+                }
+                for (n, fl, ms) in &results {
+                    emit(n, *ms, *fl);
+                }
+                Ok(JsValue::from(results.len() as u32))
             })
         }
 
@@ -467,9 +737,10 @@ mod web {
         seed: u64,
         cache_frames: usize,
         sink_frames: usize,
+        memrope: bool,
         on: &Function,
     ) -> Result<(), JsValue> {
-        use fastwan_model::causal::{CausalConfig, CausalRollout, frame_major};
+        use fastwan_model::causal::{CausalConfig, CausalRollout};
         let emit = |o: Object| {
             let _ = on.call1(&JsValue::NULL, &o);
         };
@@ -482,8 +753,19 @@ mod web {
             .ok_or_else(|| err("the decoder is not loaded"))?;
         g.validate(cfg).map_err(err)?;
         let e = read_embeds(cfg, embeds)?;
-        let mut ccfg = CausalConfig::self_forcing();
+        let mut ccfg = if memrope {
+            CausalConfig::history_forcing()
+        } else {
+            CausalConfig::self_forcing()
+        };
         ccfg.cache_frames(cache_frames, sink_frames);
+        ccfg.half_kv = inner.half_kv.get();
+        // MemRoPE caches stay f32 (KvCache::new ignores half_kv there).
+        let kv_bytes = if ccfg.half_kv && !memrope && be.kv_caps(cfg.head_dim).1 {
+            2
+        } else {
+            4
+        };
         let bf = ccfg.block_frames;
         // One block's activations: plan a clip of one block's length.
         let block = Geometry {
@@ -503,7 +785,7 @@ mod web {
         );
         let (lt, lh, lw) = g.latent();
         let tpf = (lh / cfg.patch) * (lw / cfg.patch);
-        let cache_layer = (cache_frames * tpf * cfg.dim() * 4) as u64;
+        let cache_layer = (cache_frames * tpf * cfg.dim() * kv_bytes) as u64;
         let largest = p.largest_binding.max(cache_layer);
         if largest > be.max_binding() {
             return Err(err(format!(
@@ -527,41 +809,66 @@ mod web {
         be.try_download_async(&fence).await.map_err(err)?;
         emit(Object::new().tap(|o| set(o, "type", "prepared")));
         let blocks = lt.div_ceil(bf);
-        let c = tae.cfg.latent_channels;
         let mut st = tae.state();
+        // Pipelined: block b is queued (denoise, decode from the device
+        // latent, pack, readback copy) before the page waits for block b − 1's
+        // frames, so the GPU always has the next block while the browser
+        // delivers the previous readback. No latent leaves the GPU.
         let mut done = 0usize;
-        for b in 0..blocks {
-            if inner.stop.get() {
-                break;
+        let mut pending: Option<(
+            fastwan_wgpu::Readback,
+            fastwan_model::taehv::Chunk<Wgpu>,
+            usize,
+        )> = None;
+        let mut queued = 0usize;
+        let mut t_last = now_ms();
+        loop {
+            let next = if queued < blocks && !inner.stop.get() {
+                let x = roll.next_block(be, &prompt).map_err(err)?;
+                let ck = tae.launch_chunk_dev(be, &mut st, x, bf, lh, lw);
+                let packed = ck.pack(be);
+                let rb = be
+                    .readback_begin(&packed)
+                    .map_err(|e| err(format!("decode failed: {e} ({})", be.limits_text())))?;
+                queued += 1;
+                Some((rb, ck, queued - 1))
+            } else {
+                None
+            };
+            if let Some((rb, ck, b)) = pending.take() {
+                let raw = rb
+                    .wait(be)
+                    .await
+                    .map_err(|e| err(format!("decode failed: {e} ({})", be.limits_text())))?;
+                let (count, h, w, rgba) = ck.rgba8(&raw);
+                let now = now_ms();
+                let o = Object::new();
+                set(&o, "type", "block");
+                set(&o, "index", b as u32);
+                set(&o, "total", blocks as u32);
+                set(&o, "ms", now - t_last);
+                set(&o, "denoise_ms", now - t_last);
+                let m = fastwan_wgpu::mem_stats();
+                set(&o, "buffers_created", m.created as f64);
+                set(&o, "buffers_reused", m.reused as f64);
+                set(&o, "mb_created", m.created_bytes as f64 / 1e6);
+                set(&o, "mb_held", m.held_bytes as f64 / 1e6);
+                emit(o);
+                t_last = now;
+                let o = Object::new();
+                set(&o, "type", "frames");
+                set(&o, "first", done as u32);
+                set(&o, "count", count as u32);
+                set(&o, "width", w as u32);
+                set(&o, "height", h as u32);
+                set(&o, "rgba", Uint8Array::from(&rgba[..]));
+                emit(o);
+                done += count;
             }
-            let t0 = now_ms();
-            let x = roll.next_block(be, &prompt).map_err(err)?;
-            let latent = be.try_download_async(x).await.map_err(err)?;
-            let denoise_ms = now_ms() - t0;
-            let z = frame_major(&latent, c, bf, lh * lw);
-            let ck = tae.launch_chunk(be, &mut st, &z, bf, lh, lw);
-            let packed = ck.pack(be);
-            let raw = be
-                .try_download_async(&packed)
-                .await
-                .map_err(|e| err(format!("decode failed: {e} ({})", be.limits_text())))?;
-            let (count, h, w, rgba) = ck.rgba8(&raw);
-            let o = Object::new();
-            set(&o, "type", "block");
-            set(&o, "index", b as u32);
-            set(&o, "total", blocks as u32);
-            set(&o, "ms", now_ms() - t0);
-            set(&o, "denoise_ms", denoise_ms);
-            emit(o);
-            let o = Object::new();
-            set(&o, "type", "frames");
-            set(&o, "first", done as u32);
-            set(&o, "count", count as u32);
-            set(&o, "width", w as u32);
-            set(&o, "height", h as u32);
-            set(&o, "rgba", Uint8Array::from(&rgba[..]));
-            emit(o);
-            done += count;
+            match next {
+                Some(n) => pending = Some(n),
+                None => break,
+            }
         }
         Ok(())
     }
@@ -711,15 +1018,31 @@ mod web {
     impl Engine {
         fn locate(&self, i: usize) -> Option<(fastwan_wgpu::GBuf, usize)> {
             let (w, h) = self.inner.kept_dims.get();
-            let mut i = i;
-            for (buf, n) in self.inner.kept.borrow().iter() {
-                if i < *n {
-                    return Some((buf.clone(), i * (w * h) as usize));
-                }
-                i -= n;
-            }
-            None
+            self.inner
+                .kept
+                .borrow()
+                .iter()
+                .find(|k| (k.first..k.first + k.n).contains(&i))
+                .map(|k| (k.buf.clone(), (i - k.first) * (w * h) as usize))
         }
+    }
+
+    /// Mean time of `run` over `reps` calls after one warm-up call, fenced
+    /// by readbacks so queued work is counted.
+    async fn time_it(
+        be: &Wgpu,
+        fence: &fastwan_wgpu::GBuf,
+        reps: u32,
+        run: &dyn Fn(),
+    ) -> Result<f64, JsValue> {
+        run();
+        be.try_download_async(fence).await.map_err(err)?;
+        let t0 = now_ms();
+        for _ in 0..reps {
+            run();
+        }
+        be.try_download_async(fence).await.map_err(err)?;
+        Ok((now_ms() - t0) / reps as f64)
     }
 
     trait Tap: Sized {
