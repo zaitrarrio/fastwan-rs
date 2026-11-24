@@ -35,6 +35,11 @@ pub enum WeightQuant {
     /// elsewhere the same arithmetic in f32 / bf16. Load-time only: not a
     /// stored file format.
     Fp8,
+    /// [`Self::Fp8`] with one activation scale for the whole input of each
+    /// linear ([`fq8_tensor`]) instead of one per token: both scales then
+    /// fold into one factor per output channel, which cuBLASLt applies with
+    /// the bias and GELU inside the GEMM (no separate epilogue pass).
+    Fp8Tensor,
 }
 
 impl WeightQuant {
@@ -73,6 +78,7 @@ impl std::fmt::Display for WeightQuant {
             Self::Native => f.write_str("native"),
             Self::Int8 => f.write_str("int8"),
             Self::Fp8 => f.write_str("fp8"),
+            Self::Fp8Tensor => f.write_str("fp8t"),
             Self::Int4 {
                 group,
                 hqq,
@@ -94,6 +100,7 @@ impl std::str::FromStr for WeightQuant {
             "native" | "bf16" | "f16" => Ok(Self::Native),
             "int8" | "q8" => Ok(Self::Int8),
             "fp8" | "e4m3" => Ok(Self::Fp8),
+            "fp8t" | "fp8-tensor" => Ok(Self::Fp8Tensor),
             _ => {
                 // int4[-hqq][-g<N>][-ffn]
                 let (s, ffn_only) = match s.strip_suffix("-ffn") {
@@ -102,7 +109,7 @@ impl std::str::FromStr for WeightQuant {
                 };
                 let rest = s.strip_prefix("int4").ok_or_else(|| {
                     format!(
-                        "unknown weight format `{s}` (native | int8 | fp8 | int4[-hqq][-gN][-ffn])"
+                        "unknown weight format `{s}` (native | int8 | fp8 | fp8t | int4[-hqq][-gN][-ffn])"
                     )
                 })?;
                 let (hqq, rest) = match rest.strip_prefix("-hqq") {
@@ -262,14 +269,27 @@ pub fn fq8_rows(x: &mut [f32], cols: usize) {
     }
 }
 
+/// [`fq8_rows`] with one scale for the whole slice (every row of one
+/// linear's input): `scale = amax(x) / 448` over all of `x`.
+pub fn fq8_tensor(x: &mut [f32]) {
+    let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let (s, inv) = e4m3_row_scale(amax);
+    for v in x.iter_mut() {
+        *v = e4m3_decode(e4m3_encode(*v * inv)) * s;
+    }
+}
+
 /// A `[rows, cols]` matrix as E4M3 codes with one f32 scale per row (output
-/// channel): `w ≈ e4m3(q) · s`.
+/// channel): `w ≈ e4m3(q) · s`. `per_tensor` says how a linear with it
+/// quantizes its input: per token ([`fq8_rows`], false) or with one scale
+/// for the whole input ([`fq8_tensor`], true).
 #[derive(Debug, Clone)]
 pub struct F8 {
     pub q: Vec<u8>,
     pub scales: Vec<f32>,
     pub rows: usize,
     pub cols: usize,
+    pub per_tensor: bool,
 }
 
 impl F8 {
@@ -290,7 +310,14 @@ impl F8 {
             scales,
             rows,
             cols,
+            per_tensor: false,
         }
+    }
+
+    /// The same weights, with one activation scale per linear input.
+    pub fn per_tensor(mut self) -> Self {
+        self.per_tensor = true;
+        self
     }
 
     pub fn dequantize(&self) -> Vec<f32> {
@@ -569,6 +596,21 @@ mod tests {
         let mut z = vec![0.0; cols];
         fq8_rows(&mut z, cols);
         assert!(z.iter().all(|&v| v == 0.0));
+        // One row: per tensor and per row agree; several: the largest value
+        // anywhere is exact and maps to ±448 · scale.
+        let mut a = w[..cols].to_vec();
+        let mut b = a.clone();
+        fq8_rows(&mut a, cols);
+        fq8_tensor(&mut b);
+        assert_eq!(a, b);
+        let mut t = w.clone();
+        fq8_tensor(&mut t);
+        let (i, amax) =
+            w.iter().enumerate().fold(
+                (0, 0.0f32),
+                |m, (i, v)| if v.abs() > m.1 { (i, v.abs()) } else { m },
+            );
+        assert_eq!(t[i].abs(), amax);
     }
 
     use super::*;

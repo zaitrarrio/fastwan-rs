@@ -28,8 +28,9 @@ pub struct CpuWeight {
     data: Vec<f32>,
     rows: usize,
     cols: usize,
-    /// FP8 W8A8: quantize each input row to E4M3 before the matmul.
-    fq8: bool,
+    /// FP8 W8A8: quantize the input to E4M3 before the matmul, per row
+    /// (`Some(false)`) or per tensor (`Some(true)`).
+    fq8: Option<bool>,
 }
 
 #[derive(Default)]
@@ -230,7 +231,7 @@ impl Backend for Cpu {
             data: data.to_vec(),
             rows,
             cols,
-            fq8: false,
+            fq8: None,
         }
     }
     fn sync(&self) {}
@@ -245,7 +246,7 @@ impl Backend for Cpu {
 
     fn weight_fp8(&self, q: &fastwan_core::quant::F8) -> CpuWeight {
         CpuWeight {
-            fq8: true,
+            fq8: Some(q.per_tensor),
             ..self.weight(&q.dequantize(), q.rows, q.cols)
         }
     }
@@ -268,15 +269,20 @@ impl Backend for Cpu {
         let x = &x[x_row * k..(x_row + rows) * k];
         // FP8 W8A8: the input rows as E4M3 at their own scales.
         let xq;
-        let x = if w.fq8 {
-            xq = {
-                let mut v = x.to_vec();
-                fastwan_core::quant::fq8_rows(&mut v, k);
-                v
-            };
-            &xq[..]
-        } else {
-            x
+        let x = match w.fq8 {
+            Some(per_tensor) => {
+                xq = {
+                    let mut v = x.to_vec();
+                    if per_tensor {
+                        fastwan_core::quant::fq8_tensor(&mut v);
+                    } else {
+                        fastwan_core::quant::fq8_rows(&mut v, k);
+                    }
+                    v
+                };
+                &xq[..]
+            }
+            None => x,
         };
         y[y_row * n..(y_row + rows) * n]
             .par_chunks_mut(n)

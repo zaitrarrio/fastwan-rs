@@ -60,8 +60,9 @@ pub struct CuWeight {
 enum Quant {
     Q8,
     Q4,
-    /// E4M3 codes (one per byte) and one f32 scale per row, used W8A8.
-    F8,
+    /// E4M3 codes (one per byte) and one f32 scale per row, used W8A8;
+    /// the flag: one activation scale per input (true) or per token.
+    F8(bool),
 }
 
 pub struct Cuda {
@@ -127,6 +128,9 @@ struct Kernels {
     fp8_fake_rows: CudaFunction,
     fp8_epilogue: CudaFunction,
     dequant_f8: CudaFunction,
+    fp8_amax: CudaFunction,
+    fp8_quant_tensor: CudaFunction,
+    fp8_fake_tensor: CudaFunction,
 }
 
 #[derive(Debug)]
@@ -373,6 +377,65 @@ impl Lt {
         }
     }
 
+    /// [`Lt::plan_fp8`] with the per-tensor path's fusion: alpha is a device
+    /// vector over the output channels (rows of column-major D), beta zero,
+    /// and `epi` 0 = bias, 1 = GELU(·+bias), 4 = GELU, 5 = none. `None` =
+    /// cuBLASLt has no such kernel here.
+    fn plan_fp8_fused(&self, n: usize, k: usize, rows: usize, epi: u8) -> Option<LtPlan> {
+        let p = self.plan_fp8(n, k, rows)?;
+        let mode =
+            lt_sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_ZERO;
+        let epilogue = match epi {
+            1 => lt_sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU_BIAS,
+            0 => lt_sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
+            4 => lt_sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU,
+            _ => lt_sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+        };
+        let pref = lt_result::create_matmul_pref().ok()?;
+        let ws = LT_WORKSPACE as u64;
+        let dummy: u64 = self.workspace_ptr();
+        // SAFETY: freshly created descriptors; attribute buffers outlive the calls.
+        unsafe {
+            lt_result::set_matmul_desc_attribute(
+                p.desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_POINTER_MODE,
+                (&mode) as *const _ as *const _,
+                std::mem::size_of::<lt_sys::cublasLtPointerMode_t>(),
+            )
+            .ok()?;
+            lt_result::set_matmul_desc_attribute(
+                p.desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+                (&epilogue) as *const _ as *const _,
+                std::mem::size_of::<lt_sys::cublasLtEpilogue_t>(),
+            )
+            .ok()?;
+            if epi <= 1 {
+                lt_result::set_matmul_desc_attribute(
+                    p.desc,
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                    (&dummy) as *const u64 as *const _,
+                    8,
+                )
+                .ok()?;
+            }
+            lt_result::set_matmul_pref_attribute(
+                pref,
+                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&ws) as *const u64 as *const _,
+                8,
+            )
+            .ok()?;
+            let h =
+                lt_result::get_matmul_algo_heuristic(self.handle, p.desc, p.a, p.b, p.c, p.c, pref);
+            let _ = lt_result::destroy_matmul_pref(pref);
+            Some(LtPlan {
+                algo: h.ok()?.algo,
+                ..p
+            })
+        }
+    }
+
     fn workspace_ptr(&self) -> u64 {
         // The workspace lives as long as `self`; no stream ordering is needed
         // for a pointer value.
@@ -437,6 +500,9 @@ impl Cuda {
             fp8_fake_rows: get("fw_fp8_fake_rows")?,
             fp8_epilogue: get("fw_fp8_epilogue")?,
             dequant_f8: get("fw_dequant_f8")?,
+            fp8_amax: get("fw_fp8_amax")?,
+            fp8_quant_tensor: get("fw_fp8_quant_tensor")?,
+            fp8_fake_tensor: get("fw_fp8_fake_tensor")?,
         };
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
@@ -528,7 +594,7 @@ impl Cuda {
 
     fn kernel_name(&self, f: &CudaFunction) -> &'static str {
         let k = &self.f;
-        let all: [(&CudaFunction, &'static str); 29] = [
+        let all: [(&CudaFunction, &'static str); 32] = [
             (&k.attention_mma_v[0], "attention (mma v1)"),
             (&k.attention_mma_v[1], "attention (mma v2)"),
             (&k.vsa_fine_mma_v[0], "vsa fine (mma v1)"),
@@ -547,6 +613,9 @@ impl Cuda {
             (&k.fp8_quant_rows, "fp8 quantize rows"),
             (&k.fp8_fake_rows, "fp8 fake-quant rows (fallback)"),
             (&k.fp8_epilogue, "fp8 scale+bias+act"),
+            (&k.fp8_amax, "fp8 amax (tensor)"),
+            (&k.fp8_quant_tensor, "fp8 quantize (tensor)"),
+            (&k.fp8_fake_tensor, "fp8 fake-quant tensor (fallback)"),
             (&k.dequant_f8, "dequant fp8 (fallback)"),
             (&k.tanh_clamp, "tanh_clamp"),
             (&k.add_act, "add_act"),
@@ -783,7 +852,11 @@ impl Backend for Cuda {
             },
             rows: q.rows,
             cols: q.cols,
-            quant: Some((Quant::F8, Backend::upload_table(self, &q.scales), q.cols)),
+            quant: Some((
+                Quant::F8(q.per_tensor),
+                Backend::upload_table(self, &q.scales),
+                q.cols,
+            )),
         }
     }
 
@@ -842,27 +915,47 @@ impl Backend for Cuda {
     ) {
         let (n, k) = (w.rows, w.cols);
         assert!((x_row + rows) * k <= x.len && (y_row + rows) * n <= y.len);
-        if let Some((Quant::F8, wscale, _)) = &w.quant
-            && self.linear_fp8(x, x_row, rows, w, wscale, bias, act, y, y_row)
+        if let Some((Quant::F8(per_tensor), wscale, _)) = &w.quant
+            && self.linear_fp8(x, x_row, rows, w, wscale, *per_tensor, bias, act, y, y_row)
         {
             return;
         }
         // FP8 without FP8 tensor cores (or no cuBLASLt plan): the same
-        // E4M3-rounded input rows, multiplied in bf16.
-        let xq = matches!(&w.quant, Some((Quant::F8, ..))).then(|| {
-            let out = self.alloc(rows * k);
-            self.launch(
-                &self.f.fp8_fake_rows,
-                (rows as u32, 1, 1),
-                (256, 1, 1),
-                &[
-                    Arg::P(self.ptr(x) + (x_row * k * 2) as u64),
-                    Arg::P(self.ptr(&out)),
-                    Arg::I(k as i32),
-                ],
-            );
-            out
-        });
+        // E4M3-rounded input, multiplied in bf16.
+        let xq = match &w.quant {
+            Some((Quant::F8(false), ..)) => {
+                let out = self.alloc(rows * k);
+                self.launch(
+                    &self.f.fp8_fake_rows,
+                    (rows as u32, 1, 1),
+                    (256, 1, 1),
+                    &[
+                        Arg::P(self.ptr(x) + (x_row * k * 2) as u64),
+                        Arg::P(self.ptr(&out)),
+                        Arg::I(k as i32),
+                    ],
+                );
+                Some(out)
+            }
+            Some((Quant::F8(true), ..)) => {
+                let out = self.alloc(rows * k);
+                let xp = self.ptr(x) + (x_row * k * 2) as u64;
+                let amax = self.fp8_amax(xp, rows * k);
+                self.launch(
+                    &self.f.fp8_fake_tensor,
+                    Self::elems(rows * k),
+                    (256, 1, 1),
+                    &[
+                        Arg::P(xp),
+                        Arg::P(self.ptr(&out)),
+                        Arg::P(self.ptr(&amax)),
+                        Arg::L((rows * k) as i64),
+                    ],
+                );
+                Some(out)
+            }
+            _ => None,
+        };
         let (x, x_row) = match &xq {
             Some(b) => (b, 0),
             None => (x, x_row),
@@ -879,7 +972,7 @@ impl Backend for Cuda {
                     match kind {
                         Quant::Q8 => &self.f.dequant_q8,
                         Quant::Q4 => &self.f.dequant_q4,
-                        Quant::F8 => &self.f.dequant_f8,
+                        Quant::F8(_) => &self.f.dequant_f8,
                     },
                     Self::elems(n * k),
                     (256, 1, 1),
@@ -1526,6 +1619,7 @@ impl Cuda {
         rows: usize,
         w: &CuWeight,
         wscale: &CuBuf,
+        per_tensor: bool,
         bias: Option<&CuBuf>,
         act: Act,
         y: &CuBuf,
@@ -1539,6 +1633,102 @@ impl Cuda {
         if k % 16 != 0 || n % 16 != 0 || rows == 0 {
             return false;
         }
+        let xp_in = self.ptr(x) + (x_row * k * 2) as u64;
+        let xq = self.alloc_words((rows * k).div_ceil(4));
+        let sx = self.alloc_words(rows);
+        let yp = self.ptr(y) + (y_row * n * 2) as u64;
+        if per_tensor {
+            let amax = self.fp8_amax(xp_in, rows * k);
+            let alpha_v = self.alloc_words(n);
+            self.launch(
+                &self.f.fp8_quant_tensor,
+                Self::elems((rows * k).max(n).max(rows)),
+                (256, 1, 1),
+                &[
+                    Arg::P(xp_in),
+                    Arg::P(self.ptr(&xq)),
+                    Arg::P(self.ptr(&amax)),
+                    Arg::L((rows * k) as i64),
+                    Arg::P(self.ptr(wscale)),
+                    Arg::P(self.ptr(&alpha_v)),
+                    Arg::I(n as i32),
+                    Arg::P(self.ptr(&sx)),
+                    Arg::I(rows as i32),
+                ],
+            );
+            // Fused: alpha vector (sw · s per output channel) with the bias /
+            // GELU epilogue, straight into y.
+            let epi = match (bias.is_some(), act) {
+                (true, Act::GeluTanh) => 1u8,
+                (true, Act::None) => 0,
+                (false, Act::GeluTanh) => 4,
+                (false, Act::None) => 5,
+            };
+            let mut plans = lt.plans.lock().unwrap();
+            if let Some(p) = plans
+                .entry((n, k, rows, 8 + epi))
+                .or_insert_with(|| lt.plan_fp8_fused(n, k, rows, epi))
+            {
+                let (wp, xp, ws, av) = (
+                    self.ptr(&w.buf),
+                    self.ptr(&xq),
+                    lt.workspace_ptr(),
+                    self.ptr(&alpha_v),
+                );
+                let beta = 0.0f32;
+                let bp = self.opt(bias);
+                self.timed(
+                    || format!("gemm fp8t+epilogue n={n} k={k}"),
+                    // SAFETY: as in the per-token path; alpha_v holds n f32,
+                    // the bias n bf16.
+                    || unsafe {
+                        if bias.is_some() {
+                            lt_result::set_matmul_desc_attribute(
+                                p.desc,
+                                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                (&bp) as *const u64 as *const _,
+                                8,
+                            )
+                            .expect("lt bias pointer");
+                        }
+                        lt_result::matmul(
+                            lt.handle,
+                            p.desc,
+                            av as *const _,
+                            (&beta) as *const f32 as *const _,
+                            wp as *const _,
+                            p.a,
+                            xp as *const _,
+                            p.b,
+                            yp as *const _,
+                            p.c,
+                            yp as *mut _,
+                            p.c,
+                            &p.algo,
+                            ws as *mut _,
+                            LT_WORKSPACE,
+                            self.stream.cu_stream() as *mut _,
+                        )
+                        .expect("cublasLt fp8 fused matmul");
+                    },
+                );
+                return true;
+            }
+            // No fused plan: the plain FP8 GEMM and the epilogue kernel
+            // below, with sx = s on every row.
+        } else {
+            self.launch(
+                &self.f.fp8_quant_rows,
+                (rows as u32, 1, 1),
+                (256, 1, 1),
+                &[
+                    Arg::P(xp_in),
+                    Arg::P(self.ptr(&xq)),
+                    Arg::P(self.ptr(&sx)),
+                    Arg::I(k as i32),
+                ],
+            );
+        }
         let mut plans = lt.plans.lock().unwrap();
         let Some(p) = plans
             .entry((n, k, rows, 2))
@@ -1546,21 +1736,7 @@ impl Cuda {
         else {
             return false;
         };
-        let xq = self.alloc_words((rows * k).div_ceil(4));
-        let sx = self.alloc_words(rows);
-        self.launch(
-            &self.f.fp8_quant_rows,
-            (rows as u32, 1, 1),
-            (256, 1, 1),
-            &[
-                Arg::P(self.ptr(x) + (x_row * k * 2) as u64),
-                Arg::P(self.ptr(&xq)),
-                Arg::P(self.ptr(&sx)),
-                Arg::I(k as i32),
-            ],
-        );
         let (alpha, beta) = (1.0f32, 0.0f32);
-        let yp = self.ptr(y) + (y_row * n * 2) as u64;
         let (wp, xp, ws) = (self.ptr(&w.buf), self.ptr(&xq), lt.workspace_ptr());
         self.timed(
             || {
@@ -1617,6 +1793,18 @@ impl Cuda {
             e.1 += 1;
         }
         true
+    }
+
+    /// The amax of `total` bf16 values at `xp`, into a fresh zeroed word.
+    fn fp8_amax(&self, xp: u64, total: usize) -> CuBuf {
+        let amax = self.alloc_words(1);
+        self.launch(
+            &self.f.fp8_amax,
+            (total.div_ceil(256).min(4096) as u32, 1, 1),
+            (256, 1, 1),
+            &[Arg::P(xp), Arg::L(total as i64), Arg::P(self.ptr(&amax))],
+        );
+        amax
     }
 
     fn norm_impl(
