@@ -28,6 +28,8 @@ pub struct CpuWeight {
     data: Vec<f32>,
     rows: usize,
     cols: usize,
+    /// FP8 W8A8: quantize each input row to E4M3 before the matmul.
+    fq8: bool,
 }
 
 #[derive(Default)]
@@ -228,6 +230,7 @@ impl Backend for Cpu {
             data: data.to_vec(),
             rows,
             cols,
+            fq8: false,
         }
     }
     fn sync(&self) {}
@@ -238,6 +241,13 @@ impl Backend for Cpu {
 
     fn weight_q4(&self, q: &fastwan_core::quant::Q4) -> CpuWeight {
         self.weight(&q.dequantize(), q.rows, q.cols)
+    }
+
+    fn weight_fp8(&self, q: &fastwan_core::quant::F8) -> CpuWeight {
+        CpuWeight {
+            fq8: true,
+            ..self.weight(&q.dequantize(), q.rows, q.cols)
+        }
     }
 
     fn linear(
@@ -256,6 +266,18 @@ impl Backend for Cpu {
         let b = bias.map(|b| b.r());
         let mut y = y.w();
         let x = &x[x_row * k..(x_row + rows) * k];
+        // FP8 W8A8: the input rows as E4M3 at their own scales.
+        let xq;
+        let x = if w.fq8 {
+            xq = {
+                let mut v = x.to_vec();
+                fastwan_core::quant::fq8_rows(&mut v, k);
+                v
+            };
+            &xq[..]
+        } else {
+            x
+        };
         y[y_row * n..(y_row + rows) * n]
             .par_chunks_mut(n)
             .zip(x.par_chunks(k))

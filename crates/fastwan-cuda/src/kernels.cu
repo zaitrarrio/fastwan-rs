@@ -990,6 +990,84 @@ extern "C" __global__ void fw_dequant_q8(u64 out_, u64 q_, u64 s_, long n, int g
     out[i] = bf((float)q[i] * s[i / group]);
 }
 
+// FP8 W8A8 (fastwan_core::quant::F8 / fq8_rows). E4M3 in software, a port of
+// e4m3_encode / e4m3_decode (round to nearest even, saturating at 448), so the
+// codes match the CPU reference bit for bit and this file still compiles for
+// targets without FP8 instructions.
+__device__ __forceinline__ unsigned char fw_e4m3(float v) {
+    if (isnan(v)) return 0;
+    const unsigned char sign = signbit(v) ? 0x80 : 0;
+    const float a = fabsf(v);
+    int mag;
+    if (a >= 448.0f) mag = 0x7e;
+    else if (a < 0.015625f) mag = (int)rintf(a * 512.0f);
+    else {
+        int e = (int)((__float_as_uint(a) >> 23) & 255u) - 127;
+        int m = (int)rintf(a / ldexpf(1.0f, e - 3)) - 8;
+        if (m == 8) { e += 1; m = 0; }
+        mag = min(((e + 7) << 3) | m, 0x7e);
+    }
+    return sign | (unsigned char)mag;
+}
+__device__ __forceinline__ float fw_e4m3_dec(unsigned char b) {
+    const int e = (b >> 3) & 15;
+    const float m = (float)(b & 7);
+    const float v = e == 0 ? m / 512.0f : (8.0f + m) * ldexpf(1.0f, e - 10);
+    return (b & 128) ? -v : v;
+}
+// The row's amax over 256 threads (shared-memory tree), then (scale, 1/scale)
+// as e4m3_row_scale: amax / 448 and 448 / amax, both 0 for an all-zero row.
+__device__ __forceinline__ float2 fw_fp8_row_scale(const bf16_t* x, int k) {
+    __shared__ float red[256];
+    float m = 0.0f;
+    for (int i = threadIdx.x; i < k; i += 256) m = fmaxf(m, fabsf(ld(x, i)));
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    const float amax = red[0];
+    return amax > 0.0f ? make_float2(amax / 448.0f, 448.0f / amax) : make_float2(0.0f, 0.0f);
+}
+// One block of 256 per row: codes (k bytes per row) and the row's scale, for
+// the FP8 GEMM.
+extern "C" __global__ void fw_fp8_quant_rows(u64 x_, u64 q_, u64 s_, int k) {
+    const bf16_t* x = (const bf16_t*)x_ + (long)blockIdx.x * k;
+    unsigned char* q = (unsigned char*)q_ + (long)blockIdx.x * k;
+    const float2 sc = fw_fp8_row_scale(x, k);
+    if (threadIdx.x == 0) ((float*)s_)[blockIdx.x] = sc.x;
+    for (int i = threadIdx.x; i < k; i += 256) q[i] = fw_e4m3(ld(x, i) * sc.y);
+}
+// The same rows rounded through E4M3 and back to bf16: the fallback for GPUs
+// without FP8 tensor cores (the GEMM then runs in bf16).
+extern "C" __global__ void fw_fp8_fake_rows(u64 x_, u64 out_, int k) {
+    const bf16_t* x = (const bf16_t*)x_ + (long)blockIdx.x * k;
+    bf16_t* out = (bf16_t*)out_ + (long)blockIdx.x * k;
+    const float2 sc = fw_fp8_row_scale(x, k);
+    for (int i = threadIdx.x; i < k; i += 256) out[i] = bf(fw_e4m3_dec(fw_e4m3(ld(x, i) * sc.y)) * sc.x);
+}
+// After the FP8 GEMM wrote Σ codes·codes to y (bf16): y = act(y · sx[row] ·
+// sw[col] + bias[col]).
+extern "C" __global__ void fw_fp8_epilogue(u64 y_, u64 sx_, u64 sw_, u64 b_, long total, int n, int has_bias, int gelu) {
+    bf16_t* y = (bf16_t*)y_;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const long r = i / n;
+    const int c = (int)(i % n);
+    float v = ld(y, i) * ((const float*)sx_)[r] * ((const float*)sw_)[c];
+    if (has_bias) v += ld((const bf16_t*)b_, c);
+    y[i] = bf(gelu ? gelu_tanh(v) : v);
+}
+// E4M3 weight codes with one scale per row to bf16 (the fallback GEMM's weight).
+extern "C" __global__ void fw_dequant_f8(u64 out_, u64 q_, u64 s_, long n, int cols) {
+    bf16_t* out = (bf16_t*)out_;
+    const unsigned char* q = (const unsigned char*)q_;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = bf(fw_e4m3_dec(q[i]) * ((const float*)s_)[i / cols]);
+}
+
 // 4-bit weight-only (fastwan_core::quant::Q4): codes packed 2 per byte (low
 // nibble first), (scale, zero) f32 pairs per `group` columns. Expands to
 // bf16 `(q − zero) · scale` — the twin of the WGSL `_q4` GEMMs' `load_w`.

@@ -190,6 +190,7 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     model_lora(&mut p);
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
+    model_vsa(&mut p, WeightQuant::Fp8);
     model_vsa(
         &mut p,
         WeightQuant::Int4 {
@@ -345,6 +346,20 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             cpu.linear(&cx, 3, m, &cpu.weight_q4(&q), Some(&cb), act, &cy, 2);
             p.record(
                 format!("linear int4/{} {m}x{k}x{n} {act:?}", q.group),
+                p.dl(gy),
+                cpu.download(&cy),
+            );
+            // FP8 W8A8: E4M3 weights per row and the input rows per token; the
+            // CPU applies the same rounding (fq8_rows), so this checks the
+            // kernels' quantize, decode and scaling, and on CUDA sm_89+ the
+            // FP8 tensor-core GEMM.
+            let q = fastwan_core::quant::F8::quantize(&w, n, k);
+            let gy = be.alloc((m + 2) * n);
+            be.linear(&gx, 3, m, &be.weight_fp8(&q), Some(&gb), act, &gy, 2);
+            let cy = cpu.alloc((m + 2) * n);
+            cpu.linear(&cx, 3, m, &cpu.weight_fp8(&q), Some(&cb), act, &cy, 2);
+            p.record(
+                format!("linear fp8 {m}x{k}x{n} {act:?}"),
                 p.dl(gy),
                 cpu.download(&cy),
             );

@@ -56,6 +56,13 @@ pub fn quantize_dit(
         let (rows, cols) = (shape[0], shape[1..].iter().product::<usize>());
         let w = src.get(&name, &shape)?;
         match fmt {
+            WeightQuant::Fp8 => {
+                return Err(Error::Weights(
+                    "fp8 is a load-time option (generate --weights fp8), not a stored format: \
+                     export native and pass --weights fp8 when running"
+                        .into(),
+                ));
+            }
             WeightQuant::Int8 => {
                 let q = Q8::quantize(&w, rows, cols);
                 let ng = cols / q.group;
