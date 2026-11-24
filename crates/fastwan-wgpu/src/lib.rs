@@ -280,9 +280,8 @@ enum Quant {
     /// [`fastwan_core::quant::Q4`]: 8 codes per word.
     Q4,
     /// [`fastwan_core::quant::F8`]: E4M3 codes 4 per word, one scale per
-    /// row; the input goes through `fq8.wgsl` first (W8A8), per row or, with
-    /// the flag, per tensor.
-    F8(bool),
+    /// row; the input rows go through `fq8.wgsl` first (W8A8).
+    F8,
 }
 
 struct Pending {
@@ -1181,7 +1180,7 @@ impl Backend for Wgpu {
             rows: q.rows,
             cols: q.cols,
             f16: false,
-            quant: Some((Quant::F8(q.per_tensor), self.upload(&q.scales), q.cols)),
+            quant: Some((Quant::F8, self.upload(&q.scales), q.cols)),
         }
     }
 
@@ -1229,30 +1228,15 @@ impl Backend for Wgpu {
     ) {
         // FP8 W8A8: the input rows as E4M3 at their own scales, first.
         let xq;
-        let (x, x_row) = if let Some((Quant::F8(per_tensor), ..)) = &w.quant {
+        let (x, x_row) = if matches!(&w.quant, Some((Quant::F8, ..))) {
             xq = self.alloc(rows * w.cols);
             let pipe = self.pipeline("fq8", || FQ8.to_string());
-            let (r, k, xr) = (rows as u32, w.cols as u32, x_row as u32);
-            if *per_tensor {
-                // Row maxima, their max, then every row at that one scale.
-                let rmax = self.alloc(rows);
-                let amax = self.alloc(1);
-                self.dispatch(
-                    &pipe,
-                    &[r, k, xr, 1],
-                    &[&rmax, x, &self.dummy],
-                    Self::grid(rows),
-                );
-                self.dispatch(&pipe, &[r, k, xr, 2], &[&amax, x, &rmax], (1, 1, 1));
-                self.dispatch(&pipe, &[r, k, xr, 3], &[&xq, x, &amax], Self::grid(rows));
-            } else {
-                self.dispatch(
-                    &pipe,
-                    &[r, k, xr, 0],
-                    &[&xq, x, &self.dummy],
-                    Self::grid(rows),
-                );
-            }
+            self.dispatch(
+                &pipe,
+                &[rows as u32, w.cols as u32, x_row as u32, 0],
+                &[&xq, x],
+                Self::grid(rows),
+            );
             (&xq, 0)
         } else {
             (x, x_row)
@@ -1294,7 +1278,7 @@ impl Backend for Wgpu {
             match kind {
                 Quant::Q8 => self.pipeline(&format!("{name}_q8"), || Self::q8_src(src)),
                 Quant::Q4 => self.pipeline(&format!("{name}_q4"), || Self::q4_src(src)),
-                Quant::F8(_) => self.pipeline(&format!("{name}_f8"), || Self::f8_src(src)),
+                Quant::F8 => self.pipeline(&format!("{name}_f8"), || Self::f8_src(src)),
             }
         } else if half && variant == 4 {
             self.pipeline("linear4h", || LINEAR4H.to_string())

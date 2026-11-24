@@ -60,9 +60,7 @@ struct AttnArgs {
     /// DiT block weights on the device: `native` (bf16 / f16), `int8`
     /// (weight-only, per-128-column scales: half the memory), `int4…`, or
     /// `fp8` (E4M3 weights and activations, W8A8: FP8 tensor-core GEMMs on
-    /// CUDA sm_89+; the same arithmetic in bf16 / f32 elsewhere), or `fp8t`
-    /// (fp8 with one activation scale per linear input instead of per token:
-    /// the scales, bias and GELU fuse into the GEMM). Opt-in.
+    /// CUDA sm_89+; the same arithmetic in bf16 / f32 elsewhere). Opt-in.
     #[arg(long, default_value = "native")]
     weights: fastwan_core::quant::WeightQuant,
 }

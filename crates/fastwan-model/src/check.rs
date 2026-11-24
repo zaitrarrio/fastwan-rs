@@ -77,9 +77,6 @@ pub struct Pending<B: Backend> {
     pub buf: B::Buf,
     want: Vec<f32>,
     rgba: bool,
-    /// Multiplies the tolerance for this check (1 for all but the
-    /// FP8-activation model cases; see `model_vsa`).
-    tol_scale: f32,
 }
 
 impl<B: Backend> Pending<B> {
@@ -89,7 +86,7 @@ impl<B: Backend> Pending<B> {
         if self.rgba {
             result_rgba8(self.name.clone(), got, &self.want)
         } else {
-            result(self.name.clone(), got, &self.want, tol * self.tol_scale)
+            result(self.name.clone(), got, &self.want, tol)
         }
     }
 }
@@ -148,7 +145,6 @@ impl<'a, B: Backend> Pair<'a, B> {
                 buf,
                 want,
                 rgba: true,
-                tol_scale: 1.0,
             }),
         }
     }
@@ -158,28 +154,13 @@ impl<'a, B: Backend> Pair<'a, B> {
     }
 
     fn record(&mut self, name: impl Into<String>, got: impl IntoGot<B>, want: Vec<f32>) {
-        self.record_scaled(name, got, want, 1.0);
-    }
-
-    /// [`Self::record`] at `tol_scale` × the tolerance.
-    fn record_scaled(
-        &mut self,
-        name: impl Into<String>,
-        got: impl IntoGot<B>,
-        want: Vec<f32>,
-        tol_scale: f32,
-    ) {
         match got.into_got() {
-            Got::Now(g) => {
-                let r = result(name.into(), &g, &want, self.tol * tol_scale);
-                self.out.push(r);
-            }
+            Got::Now(g) => self.record_now(name, g, want),
             Got::Dev(buf) => self.pending.push(Pending {
                 name: name.into(),
                 buf,
                 want,
                 rgba: false,
-                tol_scale,
             }),
         }
     }
@@ -210,7 +191,6 @@ pub fn run_all<B: Backend>(be: &B, tol: f32) -> Vec<CheckResult> {
     model_vsa(&mut p, WeightQuant::Native);
     model_vsa(&mut p, WeightQuant::Int8);
     model_vsa(&mut p, WeightQuant::Fp8);
-    model_vsa(&mut p, WeightQuant::Fp8Tensor);
     model_vsa(
         &mut p,
         WeightQuant::Int4 {
@@ -380,17 +360,6 @@ fn ops<B: Backend>(p: &mut Pair<'_, B>, rng: &mut Rng) {
             cpu.linear(&cx, 3, m, &cpu.weight_fp8(&q), Some(&cb), act, &cy, 2);
             p.record(
                 format!("linear fp8 {m}x{k}x{n} {act:?}"),
-                p.dl(gy),
-                cpu.download(&cy),
-            );
-            // The same with one activation scale for the whole input.
-            let q = q.per_tensor();
-            let gy = be.alloc((m + 2) * n);
-            be.linear(&gx, 3, m, &be.weight_fp8(&q), Some(&gb), act, &gy, 2);
-            let cy = cpu.alloc((m + 2) * n);
-            cpu.linear(&cx, 3, m, &cpu.weight_fp8(&q), Some(&cb), act, &cy, 2);
-            p.record(
-                format!("linear fp8t {m}x{k}x{n} {act:?}"),
                 p.dl(gy),
                 cpu.download(&cy),
             );
@@ -1505,20 +1474,10 @@ fn model_vsa<B: Backend>(p: &mut Pair<'_, B>, quant: WeightQuant) {
         WeightQuant::Native => String::new(),
         q => format!(", {q}"),
     };
-    // With FP8 activations, upstream f32 rounding differences between the
-    // backend and the CPU move values across E4M3 code boundaries (a whole
-    // code, 1/16 relative, instead of an ulp), and one scale per tensor makes
-    // those steps coarser; the linear cases hold the FP8 kernels themselves
-    // to the plain tolerance. Measured on lavapipe: fp8 1.4e-3, fp8t 2.4e-3.
-    let scale = match quant {
-        WeightQuant::Fp8 | WeightQuant::Fp8Tensor => 4.0,
-        _ => 1.0,
-    };
-    p.record_scaled(
+    p.record(
         format!("tiny DiT, VSA 4 tiles, 3 DMD steps{tag} (latent)"),
         gl,
         cl,
-        scale,
     );
 }
 

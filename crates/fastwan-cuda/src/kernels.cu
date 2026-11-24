@@ -1059,45 +1059,6 @@ extern "C" __global__ void fw_fp8_epilogue(u64 y_, u64 sx_, u64 sw_, u64 b_, lon
     if (has_bias) v += ld((const bf16_t*)b_, c);
     y[i] = bf(gelu ? gelu_tanh(v) : v);
 }
-// Per-tensor FP8 (fastwan_core::quant::fq8_tensor): the amax of a whole
-// input. Non-negative floats order like their bits, so a block reduction and
-// one atomicMax on the bits; `amax_` must start at 0.
-extern "C" __global__ void fw_fp8_amax(u64 x_, long total, u64 amax_) {
-    const bf16_t* x = (const bf16_t*)x_;
-    __shared__ float red[256];
-    float m = 0.0f;
-    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long)gridDim.x * blockDim.x)
-        m = fmaxf(m, fabsf(ld(x, i)));
-    red[threadIdx.x] = m;
-    __syncthreads();
-    for (int o = 128; o > 0; o >>= 1) {
-        if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) atomicMax((unsigned int*)amax_, __float_as_uint(red[0]));
-}
-// Codes for the whole input at one scale, and the per-output-channel factor
-// alpha[c] = sw[c] · s (cuBLASLt applies it, the bias and GELU in the GEMM);
-// also sx[r] = s for every row, for the unfused epilogue fallback.
-extern "C" __global__ void fw_fp8_quant_tensor(u64 x_, u64 q_, u64 amax_, long total, u64 sw_, u64 alpha_, int n, u64 sx_, int rows) {
-    const float amax = __uint_as_float(*(const unsigned int*)amax_);
-    const float s = amax > 0.0f ? amax / 448.0f : 0.0f;
-    const float inv = amax > 0.0f ? 448.0f / amax : 0.0f;
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) ((float*)alpha_)[i] = ((const float*)sw_)[i] * s;
-    if (i < rows) ((float*)sx_)[i] = s;
-    if (i < total) ((unsigned char*)q_)[i] = fw_e4m3(ld((const bf16_t*)x_, i) * inv);
-}
-// The bf16 fallback (no FP8 tensor cores): the input rounded through E4M3 at
-// the one scale.
-extern "C" __global__ void fw_fp8_fake_tensor(u64 x_, u64 out_, u64 amax_, long total) {
-    const float amax = __uint_as_float(*(const unsigned int*)amax_);
-    const float s = amax > 0.0f ? amax / 448.0f : 0.0f;
-    const float inv = amax > 0.0f ? 448.0f / amax : 0.0f;
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total) ((bf16_t*)out_)[i] = bf(fw_e4m3_dec(fw_e4m3(ld((const bf16_t*)x_, i) * inv)) * s);
-}
-
 // E4M3 weight codes with one scale per row to bf16 (the fallback GEMM's weight).
 extern "C" __global__ void fw_dequant_f8(u64 out_, u64 q_, u64 s_, long n, int cols) {
     bf16_t* out = (bf16_t*)out_;

@@ -210,10 +210,8 @@ pub trait Backend {
     /// with `weight(&q.dequantize())`.
     fn weight_q4(&self, q: &crate::quant::Q4) -> Self::Weight;
     /// An FP8 (E4M3) matrix with one scale per row, used W8A8: [`linear`]
-    /// with it first quantizes its input to E4M3, each row at its own scale
-    /// ([`crate::quant::fq8_rows`]) or, with `q.per_tensor`, all rows of the
-    /// call at one scale ([`crate::quant::fq8_tensor`]), then multiplies by
-    /// `q.dequantize()`.
+    /// with it first quantizes each input row to E4M3 at its own scale
+    /// ([`crate::quant::fq8_rows`]), then multiplies by `q.dequantize()`.
     /// CUDA (sm_89+) runs the GEMM on FP8 tensor cores; the CPU reference and
     /// WebGPU do the same arithmetic in f32.
     ///

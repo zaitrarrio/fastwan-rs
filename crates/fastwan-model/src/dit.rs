@@ -137,9 +137,6 @@ fn load_linear<B: Backend>(
             WeightQuant::Native => be.weight(&w, rows, cols),
             WeightQuant::Int8 => be.weight_q8(&Q8::quantize(&w, rows, cols)),
             WeightQuant::Fp8 => be.weight_fp8(&fastwan_core::quant::F8::quantize(&w, rows, cols)),
-            WeightQuant::Fp8Tensor => {
-                be.weight_fp8(&fastwan_core::quant::F8::quantize(&w, rows, cols).per_tensor())
-            }
             WeightQuant::Int4 { group, hqq, .. } => {
                 be.weight_q4(&Q4::quantize(&w, rows, cols, group, hqq))
             }
