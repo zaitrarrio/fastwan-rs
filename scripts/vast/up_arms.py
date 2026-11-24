@@ -17,7 +17,7 @@ with sync_playwright() as p:
     b = p.chromium.launch(args=args, channel="chromium")
     pg = b.new_page(viewport={"width": 1280, "height": 1000})
     pg.on("pageerror", lambda e: print("pageerror:", e, flush=True))
-    pg.goto(base + "?updebug=1")
+    pg.goto(base + ("&" if "?" in base else "?") + "updebug=1")
     pg.click('#modes button[data-mode="browser"]')
     pg.wait_for_function("document.querySelectorAll('#bw-variant option').length > 0", timeout=60000)
     pg.select_option("#bw-variant", variant); pg.click("#bw-load")

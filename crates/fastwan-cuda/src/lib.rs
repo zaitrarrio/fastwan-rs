@@ -170,9 +170,14 @@ pub fn sass_arch(maj: i32, min: i32) -> Option<&'static str> {
 /// NVRTC newer than the driver (13.4 against R595 rejected the PTX with
 /// CUDA_ERROR_UNSUPPORTED_PTX_VERSION) still loads. Needs only libnvrtc.
 pub fn compile_cubin(arch: &str) -> Result<Vec<u8>, CudaError> {
+    compile_cubin_src(KERNELS, arch)
+}
+
+/// [`compile_cubin`] for any CUDA source (examples and benchmarks).
+pub fn compile_cubin_src(source: &str, arch: &str) -> Result<Vec<u8>, CudaError> {
     use cudarc::nvrtc::{result, sys};
     use std::ffi::{CStr, CString};
-    let src = CString::new(KERNELS).map_err(|e| CudaError(format!("nvrtc source: {e}")))?;
+    let src = CString::new(source).map_err(|e| CudaError(format!("nvrtc source: {e}")))?;
     let prog = result::create_program(&src, None)
         .map_err(|e| CudaError(format!("nvrtc create: {e:?}")))?;
     let options = vec![
