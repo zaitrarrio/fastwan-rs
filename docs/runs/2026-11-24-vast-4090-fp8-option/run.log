@@ -1,0 +1,86 @@
+NVIDIA GeForce RTX 4090, 595.112.07, 450.00 W, 24564 MiB
+--- check cuda (fp8 tensor cores)
+cuda NVIDIA GeForce RTX 4090 (sm_89)
+linear fp8 37x70x33 None                         rel 1.49e-2  ok
+linear fp8 130x96x200 GeluTanh                   rel 1.62e-2  ok
+linear fp8 65x256x64 None                        rel 1.66e-2  ok
+linear fp8 300x96x260 GeluTanh                   rel 2.00e-2  ok
+linear fp8 129x1536x130 None                     rel 1.37e-2  ok
+linear fp8 1100x1536x200 GeluTanh                rel 1.44e-2  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps, fp8 (latent) rel 4.58e-3  ok
+all 82 checks pass (tolerance 3e-2)
+--- check cuda FASTWAN_CUDA_NO_FP8=1 (bf16 fallback)
+linear fp8 37x70x33 None                         rel 1.49e-2  ok
+linear fp8 130x96x200 GeluTanh                   rel 1.62e-2  ok
+linear fp8 65x256x64 None                        rel 1.61e-2  ok
+linear fp8 300x96x260 GeluTanh                   rel 2.00e-2  ok
+linear fp8 129x1536x130 None                     rel 1.37e-2  ok
+linear fp8 1100x1536x200 GeluTanh                rel 1.44e-2  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps, fp8 (latent) rel 4.49e-3  ok
+all 82 checks pass (tolerance 3e-2)
+2838076944
+--- clip-astro-native
+run 0: total 4.12s  prompt 0.25s  denoise 3.42s (["1.14", "1.14", "1.14"])  decode 0.40s
+run 1: total 3.95s  prompt 0.11s  denoise 3.42s (["1.14", "1.14", "1.14"])  decode 0.37s
+clip-astro-native peak GPU MiB: 5054
+--- clip-astro-fp8
+run 0: total 3.92s  prompt 0.27s  denoise 3.23s (["1.08", "1.07", "1.07"])  decode 0.37s
+run 1: total 3.80s  prompt 0.12s  denoise 3.23s (["1.07", "1.08", "1.08"])  decode 0.40s
+clip-astro-fp8 peak GPU MiB: 3998
+--- clip-astro-int8
+run 0: total 4.14s  prompt 0.26s  denoise 3.43s (["1.14", "1.14", "1.14"])  decode 0.40s
+run 1: total 3.98s  prompt 0.13s  denoise 3.42s (["1.14", "1.14", "1.14"])  decode 0.37s
+clip-astro-int8 peak GPU MiB: 3742
+--- clip-fox-native
+run 0: total 4.11s  prompt 0.24s  denoise 3.42s (["1.14", "1.14", "1.14"])  decode 0.40s
+run 1: total 3.95s  prompt 0.11s  denoise 3.42s (["1.13", "1.14", "1.14"])  decode 0.37s
+clip-fox-native peak GPU MiB: 5054
+--- clip-fox-fp8
+run 0: total 3.92s  prompt 0.27s  denoise 3.23s (["1.08", "1.07", "1.08"])  decode 0.38s
+run 1: total 3.79s  prompt 0.12s  denoise 3.22s (["1.07", "1.08", "1.08"])  decode 0.40s
+clip-fox-fp8 peak GPU MiB: 3998
+psnr clip-astro-native vs clip-astro-fp8: average:21.585789
+psnr clip-astro-native vs clip-astro-int8: average:29.945060
+psnr clip-fox-native vs clip-fox-fp8: average:27.435460
+--- long-native
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 15.67s (10.5 fps, first frames at 0.95s)
+long-native peak GPU MiB: 8286
+--- long-fp8
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 14.45s (11.4 fps, first frames at 0.88s)
+long-fp8 peak GPU MiB: 6974
+psnr long-native vs long-fp8: average:21.355973
+--- profile clip native
+run 0: total 4.35s  prompt 0.25s  denoise 3.52s (["1.19", "1.19", "1.14"])  decode 0.53s
+  vsa fine (mma)                              1430.7 ms  38.2%      90 calls    15.896 ms/call
+  gemm+bias+gelu n=8960 k=1536                 501.7 ms  13.4%      90 calls     5.574 ms/call
+  gemm+bias n=1536 k=8960                      485.9 ms  13.0%      90 calls     5.399 ms/call
+  gemm+bias n=1536 k=1536                      340.7 ms   9.1%     360 calls     0.946 ms/call
+  conv2d (mma)                                 293.7 ms   7.8%     385 calls     0.763 ms/call
+  gemm+bias n=4608 k=1536                      249.2 ms   6.7%      90 calls     2.769 ms/call
+  head_split (qk-norm + rope)                  102.9 ms   2.7%     510 calls     0.202 ms/call
+  norm                                          98.8 ms   2.6%     273 calls     0.362 ms/call
+  vsa coarse + top-k                            72.0 ms   1.9%      90 calls     0.800 ms/call
+  attention (mma)                               69.9 ms   1.9%      90 calls     0.776 ms/call
+  vsa pool                                      35.7 ms   1.0%      90 calls     0.397 ms/call
+  gate_residual                                 27.8 ms   0.7%      90 calls     0.309 ms/call
+  alloc (zeroed)                                13.5 ms   0.4%     116 calls     0.117 ms/call
+--- profile clip fp8
+run 0: total 5.29s  prompt 0.27s  denoise 4.46s (["1.47", "1.46", "1.53"])  decode 0.50s
+  vsa fine (mma)                              1414.6 ms  40.4%      90 calls    15.718 ms/call
+  fp8 scale+bias+act                           310.4 ms   8.9%     660 calls     0.470 ms/call
+  conv2d (mma)                                 293.4 ms   8.4%     385 calls     0.762 ms/call
+  gemm fp8 n=8960 k=1536                       254.6 ms   7.3%      90 calls     2.829 ms/call
+  gemm fp8 n=1536 k=8960                       247.1 ms   7.1%      90 calls     2.746 ms/call
+  fp8 quantize rows                            189.0 ms   5.4%     660 calls     0.286 ms/call
+  gemm fp8 n=1536 k=1536                       181.9 ms   5.2%     360 calls     0.505 ms/call
+  gemm fp8 n=4608 k=1536                       151.2 ms   4.3%      90 calls     1.680 ms/call
+  head_split (qk-norm + rope)                  108.6 ms   3.1%     510 calls     0.213 ms/call
+  norm                                         105.0 ms   3.0%     273 calls     0.385 ms/call
+  vsa coarse + top-k                            73.9 ms   2.1%      90 calls     0.821 ms/call
+  attention (mma)                               69.4 ms   2.0%      90 calls     0.771 ms/call
+  vsa pool                                      38.3 ms   1.1%      90 calls     0.425 ms/call
+uploaded
+exit 0
+

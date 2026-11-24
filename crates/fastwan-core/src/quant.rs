@@ -1,5 +1,7 @@
-//! Weight-only quantization of the DiT block linears: int8 ([`Q8`]) and
-//! 4-bit ([`Q4`]), and which linears get which ([`WeightQuant::for_key`]).
+//! Quantization of the DiT block linears: weight-only int8 ([`Q8`]) and
+//! 4-bit ([`Q4`]), FP8 E4M3 weights *and* activations ([`F8`], W8A8, for
+//! CUDA's FP8 tensor cores), and which linears get which
+//! ([`WeightQuant::for_key`]).
 //!
 //! Symmetric round-to-nearest, one f32 scale per group of [`Q8_GROUP`]
 //! consecutive input columns of a row (per row when the row length is not a
@@ -27,6 +29,12 @@ pub enum WeightQuant {
         hqq: bool,
         ffn_only: bool,
     },
+    /// [`F8`]: E4M3 weights with one scale per output row, and each input
+    /// row (token) quantized to E4M3 with its own scale at every linear
+    /// ([`fq8_rows`]). On CUDA (sm_89+) the GEMM runs on FP8 tensor cores;
+    /// elsewhere the same arithmetic in f32 / bf16. Load-time only: not a
+    /// stored file format.
+    Fp8,
 }
 
 impl WeightQuant {
@@ -64,6 +72,7 @@ impl std::fmt::Display for WeightQuant {
         match self {
             Self::Native => f.write_str("native"),
             Self::Int8 => f.write_str("int8"),
+            Self::Fp8 => f.write_str("fp8"),
             Self::Int4 {
                 group,
                 hqq,
@@ -84,6 +93,7 @@ impl std::str::FromStr for WeightQuant {
         match s {
             "native" | "bf16" | "f16" => Ok(Self::Native),
             "int8" | "q8" => Ok(Self::Int8),
+            "fp8" | "e4m3" => Ok(Self::Fp8),
             _ => {
                 // int4[-hqq][-g<N>][-ffn]
                 let (s, ffn_only) = match s.strip_suffix("-ffn") {
@@ -91,7 +101,9 @@ impl std::str::FromStr for WeightQuant {
                     None => (s, false),
                 };
                 let rest = s.strip_prefix("int4").ok_or_else(|| {
-                    format!("unknown weight format `{s}` (native | int8 | int4[-hqq][-gN][-ffn])")
+                    format!(
+                        "unknown weight format `{s}` (native | int8 | fp8 | int4[-hqq][-gN][-ffn])"
+                    )
                 })?;
                 let (hqq, rest) = match rest.strip_prefix("-hqq") {
                     Some(r) => (true, r),
@@ -185,6 +197,121 @@ impl Q8 {
     /// Device bytes (codes + scales).
     pub fn bytes(&self) -> usize {
         self.q.len() + 4 * self.scales.len()
+    }
+}
+
+/// The largest finite E4M3 value (OCP FP8: 1 sign, 4 exponent bits with bias
+/// 7, 3 mantissa bits; `S.1111.111` is NaN, so 448 = `0x7e` is the top).
+pub const E4M3_MAX: f32 = 448.0;
+
+/// `v` as E4M3, rounded to nearest (ties to even) and saturated to ±448, as
+/// CUDA's `cvt.rn.satfinite.e4m3x2.f32` does. NaN gives 0.
+pub fn e4m3_encode(v: f32) -> u8 {
+    if v.is_nan() {
+        return 0;
+    }
+    let sign = if v.is_sign_negative() { 0x80u8 } else { 0 };
+    let a = v.abs();
+    let mag = if a >= E4M3_MAX {
+        0x7e
+    } else if a < 1.0 / 64.0 {
+        // Subnormal: m · 2^-9; m = 8 is the smallest normal (code 8).
+        (a * 512.0).round_ties_even() as u8
+    } else {
+        let e = ((a.to_bits() >> 23) & 0xff) as i32 - 127;
+        let m = (a / 2f32.powi(e - 3)).round_ties_even() as i32 - 8;
+        let (e, m) = if m == 8 { (e + 1, 0) } else { (e, m) };
+        (((e + 7) << 3) | m).min(0x7e) as u8
+    };
+    sign | mag
+}
+
+/// The value of an E4M3 code (`0x7f` / `0xff`, NaN, are never produced).
+pub fn e4m3_decode(b: u8) -> f32 {
+    let (e, m) = ((b >> 3) & 15, (b & 7) as f32);
+    let v = if e == 0 {
+        m / 512.0
+    } else {
+        (8.0 + m) * 2f32.powi(e as i32 - 10)
+    };
+    if b & 0x80 != 0 { -v } else { v }
+}
+
+/// `(scale, 1 / scale)` for a row whose largest magnitude is `amax`:
+/// `scale = amax / 448` (0 for an all-zero row). Every backend computes the
+/// codes as `e4m3(v · inv)` with these two f32 values.
+pub fn e4m3_row_scale(amax: f32) -> (f32, f32) {
+    if amax > 0.0 {
+        (amax / E4M3_MAX, E4M3_MAX / amax)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+/// The activation side of an FP8 linear: each of `rows` rows of `cols`
+/// values replaced by its E4M3 rounding at the row's own scale (per token).
+/// The CPU reference applies this before the matmul; CUDA quantizes for
+/// real, WebGPU in a pre-pass, both checked against this.
+pub fn fq8_rows(x: &mut [f32], cols: usize) {
+    for row in x.chunks_mut(cols) {
+        let amax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let (s, inv) = e4m3_row_scale(amax);
+        for v in row.iter_mut() {
+            *v = e4m3_decode(e4m3_encode(*v * inv)) * s;
+        }
+    }
+}
+
+/// A `[rows, cols]` matrix as E4M3 codes with one f32 scale per row (output
+/// channel): `w ≈ e4m3(q) · s`.
+#[derive(Debug, Clone)]
+pub struct F8 {
+    pub q: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl F8 {
+    pub fn quantize(data: &[f32], rows: usize, cols: usize) -> Self {
+        assert_eq!(data.len(), rows * cols);
+        let mut q = vec![0u8; data.len()];
+        let mut scales = Vec::with_capacity(rows);
+        for (src, dst) in data.chunks(cols).zip(q.chunks_mut(cols)) {
+            let amax = src.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let (s, inv) = e4m3_row_scale(amax);
+            for (d, v) in dst.iter_mut().zip(src) {
+                *d = e4m3_encode(v * inv);
+            }
+            scales.push(s);
+        }
+        Self {
+            q,
+            scales,
+            rows,
+            cols,
+        }
+    }
+
+    pub fn dequantize(&self) -> Vec<f32> {
+        self.q
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| e4m3_decode(q) * self.scales[i / self.cols])
+            .collect()
+    }
+
+    /// Stack matrices with the same columns by rows (fused QKV).
+    pub fn concat(parts: Vec<F8>) -> Self {
+        let mut it = parts.into_iter();
+        let mut a = it.next().expect("at least one matrix");
+        for b in it {
+            assert_eq!(a.cols, b.cols);
+            a.q.extend(b.q);
+            a.scales.extend(b.scales);
+            a.rows += b.rows;
+        }
+        a
     }
 }
 
@@ -366,6 +493,84 @@ impl Q4 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every finite code decodes and re-encodes to itself; known values;
+    /// saturation; ties to even; and random values land on the nearest code
+    /// (checked by brute force over all codes).
+    #[test]
+    fn e4m3_round_trips_and_rounds_to_nearest() {
+        for b in 0u8..=255 {
+            if b & 0x7f == 0x7f {
+                continue; // NaN
+            }
+            let v = e4m3_decode(b);
+            let back = e4m3_encode(v);
+            assert!(
+                back == b || (v == 0.0 && back & 0x7f == 0),
+                "{b:#x} -> {v} -> {back:#x}"
+            );
+        }
+        assert_eq!(e4m3_encode(448.0), 0x7e);
+        assert_eq!(e4m3_encode(1e6), 0x7e);
+        assert_eq!(e4m3_encode(-1e6), 0xfe);
+        assert_eq!(e4m3_encode(1.0), 0x38);
+        assert_eq!(e4m3_decode(0x38), 1.0);
+        assert_eq!(e4m3_encode(1.0625), 0x38, "tie to even (1.0)");
+        assert_eq!(e4m3_encode(1.1875), 0x3a, "tie to even (1.25)");
+        assert_eq!(e4m3_encode(2f32.powi(-10)), 0, "subnormal tie to even (0)");
+        assert_eq!(
+            e4m3_encode(3.0 * 2f32.powi(-10)),
+            2,
+            "subnormal tie to even (2)"
+        );
+        assert_eq!(e4m3_decode(1), 2f32.powi(-9));
+        let codes: Vec<(u8, f32)> = (0u8..0x7f).map(|b| (b, e4m3_decode(b))).collect();
+        let mut r = crate::rng::Rng::new(3);
+        for v in r.normal(20_000) {
+            let v = v * 40.0;
+            let got = e4m3_decode(e4m3_encode(v)).abs();
+            let a = v.abs().min(E4M3_MAX);
+            let best = codes
+                .iter()
+                .map(|&(_, c)| (c - a).abs())
+                .fold(f32::MAX, f32::min);
+            assert!(
+                (got - a).abs() <= best * (1.0 + 1e-6),
+                "{v}: {got}, nearest is {best} away"
+            );
+        }
+    }
+
+    /// `F8` keeps each row's largest value exact (it maps to 448) and stays
+    /// within E4M3's half-step (1/16 relative) elsewhere; `fq8_rows` likewise.
+    #[test]
+    fn f8_rows_are_scaled_to_448() {
+        let mut r = crate::rng::Rng::new(5);
+        let (rows, cols) = (7, 96);
+        let w = r.normal(rows * cols);
+        let f = F8::quantize(&w, rows, cols);
+        let d = f.dequantize();
+        for row in 0..rows {
+            let src = &w[row * cols..][..cols];
+            let amax = src.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for (a, b) in src.iter().zip(&d[row * cols..][..cols]) {
+                assert!(
+                    (a - b).abs() <= a.abs() / 16.0 + amax / 448.0 / 512.0 * 1.01,
+                    "{a} vs {b}"
+                );
+            }
+        }
+        let mut x = w.clone();
+        fq8_rows(&mut x, cols);
+        assert_eq!(
+            x, d,
+            "per-row activation quantize = per-row weight quantize"
+        );
+        let mut z = vec![0.0; cols];
+        fq8_rows(&mut z, cols);
+        assert!(z.iter().all(|&v| v == 0.0));
+    }
+
     use super::*;
 
     #[test]

@@ -1,0 +1,159 @@
+=== command 1
+NVIDIA GeForce RTX 4090, 580.65.06, 450.00 W, 24564 MiB
+--- fp8 bench
+device NVIDIA GeForce RTX 4090 (sm_89)
+linear           rows    bf16 ms    fp8 ms   fp8f ms       x x fast  quant ms
+attn q/k/v/o     1530      0.059     0.031     0.031    1.88   1.90     0.006
+ffn up           1530      0.287     0.145     0.145    1.97   1.97     0.006
+ffn down         1530      0.275     0.151     0.156    1.82   1.76     0.020
+attn q/k/v/o     4680      0.148     0.080     0.078    1.84   1.90     0.014
+ffn up           4680      0.833     0.420     0.417    1.98   2.00     0.014
+ffn down         4680      0.823     0.413     0.409    1.99   2.01     0.139
+attn q/k/v/o    32760      0.975     0.495     0.492    1.97   1.98     0.162
+ffn up          32760      5.452     2.605     2.624    2.09   2.08     0.162
+ffn down        32760      5.152     2.606     2.839    1.98   1.82     0.948
+17
+--- quantize
+int8: 1215 tensors, 1.563 GB (source 5.959 GB) -> /w/v1/fastwan-1.3b-i8.safetensors in 14.0s
+int8: 1125 tensors, 1.490 GB (source 2.838 GB) -> /w/v1/self-forcing-1.3b-i8.safetensors in 13.8s
+822300091 /w/v1/fastwan-1.3b-f16.safetensors
+1562717184 /w/v1/fastwan-1.3b-i8.safetensors
+2490032 /w/v1/realesr-animevideov3.safetensors
+2838076944 /w/v1/self-forcing-1.3b-f16.safetensors
+1489624408 /w/v1/self-forcing-1.3b-i8.safetensors
+22642902 /w/v1/taew2_1.safetensors
+--- clip-cuda-f16
+Error: weights: /w/v1/fastwan-1.3b-f16.safetensors: incomplete metadata, file not fully covered
+clip-cuda-f16 peak GPU MiB: 430
+--- clip-cuda-i8
+run 0: total 4.11s  prompt 0.28s  denoise 3.39s (["1.13", "1.13", "1.13"])  decode 0.38s
+clip-cuda-i8 peak GPU MiB: 3742
+--- clip-wgpu-f16
+Error: weights: /w/v1/fastwan-1.3b-f16.safetensors: incomplete metadata, file not fully covered
+clip-wgpu-f16 peak GPU MiB: 24
+--- clip-wgpu-i8
+run 0: total 25.11s  prompt 1.33s  denoise 22.18s (["7.59", "7.28", "7.32"])  decode 1.50s
+clip-wgpu-i8 peak GPU MiB: 7709
+psnr clip-cuda-f16 vs clip-cuda-i8: 
+psnr clip-wgpu-f16 vs clip-wgpu-i8: 
+psnr clip-cuda-f16 vs clip-wgpu-f16: 
+[in#0 @ 0x56325403c340] Error opening input: No such file or directory
+Error opening input file /w/clip-cuda-f16.y4m.
+Error opening input files: No such file or directory
+--- long-cuda-f16
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 15.76s (10.5 fps, first frames at 0.98s)
+long-cuda-f16 peak GPU MiB: 8286
+--- long-wgpu-f16
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 28.44s (5.8 fps, first frames at 3.36s)
+long-wgpu-f16 peak GPU MiB: 6575
+--- long-cuda-i8
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 16.14s (10.2 fps, first frames at 1.01s)
+long-cuda-i8 peak GPU MiB: 7038
+--- long-wgpu-i8
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 27.74s (5.9 fps, first frames at 3.11s)
+long-wgpu-i8 peak GPU MiB: 5230
+psnr long-cuda-f16 vs long-cuda-i8: average:21.196153
+psnr long-wgpu-f16 vs long-wgpu-i8: average:17.959239
+playwright ok
+manifest variants: ['f4', 'f16', 'sf16', 'sf4', 'i8', 'si8']
+--- chrome f16-832x480-81-x0
+f16-832x480-81-x0 peak GPU MiB: 92
+--- chrome i8-832x480-81-x0
+load: Model ready in 19.6 s.
+hint: 
+i8-832x480-81-x0: generated in 22.1s | 81 frames · 832×480 · seed 7 · prompt 0.0 s · denoise 17.7 s · decode 1.8 s · total 22.0 s | err: 
+i8-832x480-81-x0 playback: 15.0 fps over 10 s (150 frames drawn, playhead 0->69); upscaled 0 frames in that time (0 ms/frame); total 0 frames at 0 ms/frame; no upscale
+i8-832x480-81-x0 peak GPU MiB: 6412
+--- chrome sf16-480x272-321-x0
+load: Model ready in 38.4 s.
+hint: 
+sf16-480x272-321-x0: generated in 37.2s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 2.9 s · total 37.2 s | err: 
+sf16-480x272-321-x0 block s: 1.6 1.1 1.2 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3 1.3
+sf16-480x272-321-x0 playback: 15.0 fps over 10 s (150 frames drawn, playhead 0->150); upscaled 0 frames in that time (0 ms/frame); total 0 frames at 0 ms/frame; no upscale
+sf16-480x272-321-x0 peak GPU MiB: 6344
+--- chrome si8-480x272-321-x0
+load: Model ready in 19.3 s.
+hint: 
+si8-480x272-321-x0: generated in 42.1s | 321 frames (20.1 s) · 480×272 · seed 7 · 27 blocks · first frames 3.1 s · total 42.1 s | err: 
+si8-480x272-321-x0 block s: 1.4 1.3 1.4 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5
+si8-480x272-321-x0 playback: 15.0 fps over 10 s (150 frames drawn, playhead 0->150); upscaled 0 frames in that time (0 ms/frame); total 0 frames at 0 ms/frame; no upscale
+si8-480x272-321-x0 peak GPU MiB: 5227
+--- chrome i8-832x480-81-x2
+load: Model ready in 19.8 s.
+hint: (832×480 → 1664×960, as it plays; Real-ESRGAN compact video model, 2.5 MB)
+i8-832x480-81-x2: generated in 22.2s | 81 frames · 832×480 · seed 7 · prompt 0.1 s · denoise 17.2 s · decode 2.8 s · total 22.1 s · shown ×2 (1664×960, 70 ms/frame) | err: 
+i8-832x480-81-x2 playback: 14.4 fps over 10 s (144 frames drawn, playhead 0->63); upscaled 77 frames in that time (47 ms/frame); total 113 frames at 54 ms/frame; batch 4/8, kept 81 of 81, canvas 1664x960
+i8-832x480-81-x2 peak GPU MiB: 7939
+uploaded
+exit 0
+
+
+=== command 2
+2979733280
+--- clip-cuda-f16
+run 0: total 4.04s  prompt 0.25s  denoise 3.35s (["1.12", "1.12", "1.12"])  decode 0.38s
+clip-cuda-f16 peak GPU MiB: 5054
+--- clip-cuda-i8
+run 0: total 4.08s  prompt 0.25s  denoise 3.38s (["1.13", "1.13", "1.13"])  decode 0.38s
+clip-cuda-i8 peak GPU MiB: 3742
+--- clip-wgpu-f16
+run 0: total 25.63s  prompt 1.47s  denoise 22.53s (["7.67", "7.41", "7.45"])  decode 1.52s
+clip-wgpu-f16 peak GPU MiB: 8989
+--- clip-wgpu-i8
+run 0: total 24.59s  prompt 1.01s  denoise 22.02s (["7.34", "7.33", "7.34"])  decode 1.45s
+clip-wgpu-i8 peak GPU MiB: 7709
+psnr clip-cuda-f16 vs clip-cuda-i8: average:30.938601
+psnr clip-wgpu-f16 vs clip-wgpu-i8: average:29.314258
+psnr clip-cuda-f16 vs clip-wgpu-f16: average:30.526298
+--- long-cuda-f16
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 15.72s (10.5 fps, first frames at 0.97s)
+long-cuda-f16 peak GPU MiB: 8286
+--- long-cuda-i8
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 16.15s (10.2 fps, first frames at 1.00s)
+long-cuda-i8 peak GPU MiB: 7038
+--- long-wgpu832-f16
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 102.18s (1.6 fps, first frames at 5.95s)
+long-wgpu832-f16 peak GPU MiB: 14058
+psnr long-cuda-f16 vs long-cuda-i8: average:21.196153
+psnr long-cuda-f16 vs long-wgpu832-f16: average:20.935801
+--- cuda profile, clip 832x480x81 f16
+run 0: total 4.28s  prompt 0.25s  denoise 3.48s (["1.18", "1.18", "1.12"])  decode 0.50s
+  vsa fine (mma)                              1407.2 ms  38.2%      90 calls    15.635 ms/call
+  gemm+bias+gelu n=8960 k=1536                 495.0 ms  13.4%      90 calls     5.501 ms/call
+  gemm+bias n=1536 k=8960                      475.0 ms  12.9%      90 calls     5.278 ms/call
+  gemm+bias n=1536 k=1536                      336.1 ms   9.1%     360 calls     0.934 ms/call
+  conv2d (mma)                                 288.5 ms   7.8%     385 calls     0.749 ms/call
+  gemm+bias n=4608 k=1536                      244.9 ms   6.6%      90 calls     2.721 ms/call
+  head_split (qk-norm + rope)                  103.2 ms   2.8%     510 calls     0.202 ms/call
+  norm                                          98.9 ms   2.7%     273 calls     0.362 ms/call
+  vsa coarse + top-k                            71.3 ms   1.9%      90 calls     0.792 ms/call
+  attention (mma)                               68.4 ms   1.9%      90 calls     0.760 ms/call
+  vsa pool                                      35.7 ms   1.0%      90 calls     0.397 ms/call
+  gate_residual                                 27.9 ms   0.8%      90 calls     0.310 ms/call
+  alloc (zeroed)                                13.4 ms   0.4%     116 calls     0.115 ms/call
+  gemm+bias+gelu n=1536 k=4096 (text)           11.9 ms   0.3%       1 calls    11.947 ms/call
+  copy (dtod)                                    6.2 ms   0.2%     282 calls     0.022 ms/call
+  gemm+bias n=3072 k=1536 (text)                 1.6 ms   0.0%      30 calls     0.052 ms/call
+  gemm+bias n=64 k=1536                          0.5 ms   0.0%       3 calls     0.167 ms/call
+  kernel                                         0.4 ms   0.0%      11 calls     0.039 ms/call
+  gemm+bias n=1536 k=64                          0.3 ms   0.0%       3 calls     0.114 ms/call
+  tanh_clamp                                     0.2 ms   0.0%      11 calls     0.023 ms/call
+  patchify                                       0.2 ms   0.0%       6 calls     0.025 ms/call
+  gemm+bias n=1536 k=1536 (text)                 0.1 ms   0.0%       1 calls     0.096 ms/call
+  dmd_step                                       0.1 ms   0.0%       3 calls     0.021 ms/call
+--- chrome f16-832x480-81-x0
+load: Model ready in 40.4 s.
+hint: 
+f16-832x480-81-x0: generated in 19.3s | 81 frames · 832×480 · seed 7 · prompt 0.0 s · denoise 15.7 s · decode 1.7 s · total 19.3 s | err: 
+f16-832x480-81-x0 playback: 15.0 fps over 10 s (150 frames drawn, playhead 0->69); upscaled 0 frames in that time (0 ms/frame); total 0 frames at 0 ms/frame; no upscale
+f16-832x480-81-x0 peak GPU MiB: 7542
+uploaded
+exit 0
+

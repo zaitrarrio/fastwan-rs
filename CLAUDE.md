@@ -178,6 +178,20 @@ State and invariants only; the reasoning is in `docs/design.md`.
   4090 it cuts peak VRAM by 1.3 GB (CUDA) / 1.5 GB (WebGPU) at equal speed,
   and moves the clip less than switching backends does: 34.6 dB vs a 33.5 dB
   bf16-vs-f32 baseline (`docs/runs/2026-11-03-vast-4090-int8`). Off by default.
+- `--weights fp8` (opt-in, load-time only; `quant::F8` + `fq8_rows`): W8A8,
+  E4M3 weights per output row and each token's activations per row at every
+  block linear. CUDA sm_89+: `fw_fp8_quant_rows` → cuBLASLt E4M3 GEMM (f32
+  accumulate, bf16 out) → `fw_fp8_epilogue` (scales, bias, GELU); older GPUs
+  or `FASTWAN_CUDA_NO_FP8=1`: the same rounded values in bf16. E4M3 is coded
+  in software on every backend (round to nearest even, saturate at 448) so
+  codes match the CPU bit for bit. RTX 4090: clip denoise −5.6%, long video
+  −7.8%, −1.0 to −1.3 GB, clip 21.6–27.4 dB vs native (int8 29.9), no
+  artifacts. The GEMMs halve but the two extra activation passes eat most of
+  it; fusing them needs a per-tensor activation scale
+  (`docs/runs/2026-11-24-vast-4090-fp8-option`). Not offered in the browser.
+- int8 browser variants are public (`i8`, `si8` in the manifest: 1.56 / 1.49
+  GB vs 2.98 / 2.84 GB f16): GPU memory −1.1 to −1.3 GB, quality like a
+  backend switch, 13–14% slower in Chrome (`docs/runs/2026-11-24-vast-4090-int8-fp8-eval`).
 - 4-bit (`--weights int4[-hqq][-gN][-ffn]`, `quant::Q4`): real kernels on all
   three backends. Every variant changes the sample for a seed (fox 21–23 dB vs
   int8's 34.6) without visible artifacts. Quantized checkpoints

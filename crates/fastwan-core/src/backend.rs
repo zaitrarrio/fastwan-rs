@@ -209,6 +209,14 @@ pub trait Backend {
     /// A 4-bit weight-only matrix: the same contract as [`Backend::weight_q8`]
     /// with `weight(&q.dequantize())`.
     fn weight_q4(&self, q: &crate::quant::Q4) -> Self::Weight;
+    /// An FP8 (E4M3) matrix with one scale per row, used W8A8: [`linear`]
+    /// with it first quantizes each input row to E4M3 at its own scale
+    /// ([`crate::quant::fq8_rows`]), then multiplies by `q.dequantize()`.
+    /// CUDA (sm_89+) runs the GEMM on FP8 tensor cores; the CPU reference and
+    /// WebGPU do the same arithmetic in f32.
+    ///
+    /// [`linear`]: Backend::linear
+    fn weight_fp8(&self, q: &crate::quant::F8) -> Self::Weight;
     /// Wait for queued work (timing only; downloads synchronise themselves).
     fn sync(&self);
 

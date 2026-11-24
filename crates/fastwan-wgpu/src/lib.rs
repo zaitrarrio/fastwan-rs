@@ -40,6 +40,7 @@ const ELEM: &str = include_str!("shaders/elementwise.wgsl");
 const MEMORY: &str = include_str!("shaders/memory.wgsl");
 const PACK: &str = include_str!("shaders/pack.wgsl");
 const UNPACK: &str = include_str!("shaders/unpack.wgsl");
+const FQ8: &str = include_str!("shaders/fq8.wgsl");
 const KV: &str = include_str!("shaders/kv.wgsl");
 const FLASH: &str = include_str!("shaders/flash.wgsl");
 const FLASH3: &str = include_str!("shaders/flash3.wgsl");
@@ -278,6 +279,9 @@ enum Quant {
     Q8,
     /// [`fastwan_core::quant::Q4`]: 8 codes per word.
     Q4,
+    /// [`fastwan_core::quant::F8`]: E4M3 codes 4 per word, one scale per
+    /// row; the input rows go through `fq8.wgsl` first (W8A8).
+    F8,
 }
 
 struct Pending {
@@ -592,6 +596,24 @@ impl Wgpu {
                 "{W_LOAD}",
                 "let b = (w[i >> 2u] >> ((i & 3u) * 8u)) << 24u; \
                  return f32(bitcast<i32>(b) >> 24u) * wscale[i / p._p];",
+            )
+    }
+
+    /// FP8: E4M3 codes packed 4 per word, decoded and scaled per row
+    /// (`p._p` = the row length, so `i / p._p` is the row).
+    fn f8_src(src: &str) -> String {
+        src.replace("{W_TYPE}", "u32")
+            .replace(
+                "fn load_w(",
+                "@group(0) @binding(5) var<storage, read> wscale: array<f32>;\n\
+                 fn e4m3_dec(b: u32) -> f32 {\n\
+                 let e = (b >> 3u) & 15u; let m = f32(b & 7u);\n\
+                 var v = m / 512.0; if (e != 0u) { v = (8.0 + m) * exp2(f32(i32(e) - 10)); }\n\
+                 return select(v, -v, (b & 128u) != 0u);\n}\nfn load_w(",
+            )
+            .replace(
+                "{W_LOAD}",
+                "return e4m3_dec((w[i >> 2u] >> ((i & 3u) * 8u)) & 255u) * wscale[i / p._p];",
             )
     }
 
@@ -1146,6 +1168,22 @@ impl Backend for Wgpu {
         }
     }
 
+    fn weight_fp8(&self, q: &fastwan_core::quant::F8) -> GWeight {
+        let mut bytes = q.q.clone();
+        bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        GWeight {
+            buf: self.upload_u32(&words),
+            rows: q.rows,
+            cols: q.cols,
+            f16: false,
+            quant: Some((Quant::F8, self.upload(&q.scales), q.cols)),
+        }
+    }
+
     fn weight_q4(&self, q: &fastwan_core::quant::Q4) -> GWeight {
         let mut bytes = q.packed();
         bytes.resize(bytes.len().div_ceil(4) * 4, 0);
@@ -1188,6 +1226,21 @@ impl Backend for Wgpu {
         y: &GBuf,
         y_row: usize,
     ) {
+        // FP8 W8A8: the input rows as E4M3 at their own scales, first.
+        let xq;
+        let (x, x_row) = if matches!(&w.quant, Some((Quant::F8, ..))) {
+            xq = self.alloc(rows * w.cols);
+            let pipe = self.pipeline("fq8", || FQ8.to_string());
+            self.dispatch(
+                &pipe,
+                &[rows as u32, w.cols as u32, x_row as u32, 0],
+                &[&xq, x],
+                Self::grid(rows),
+            );
+            (&xq, 0)
+        } else {
+            (x, x_row)
+        };
         let f16 = w.f16;
         if self.prof.is_some() {
             *self.tag.lock().unwrap() = Some(format!(
@@ -1225,6 +1278,7 @@ impl Backend for Wgpu {
             match kind {
                 Quant::Q8 => self.pipeline(&format!("{name}_q8"), || Self::q8_src(src)),
                 Quant::Q4 => self.pipeline(&format!("{name}_q4"), || Self::q4_src(src)),
+                Quant::F8 => self.pipeline(&format!("{name}_f8"), || Self::f8_src(src)),
             }
         } else if half && variant == 4 {
             self.pipeline("linear4h", || LINEAR4H.to_string())
