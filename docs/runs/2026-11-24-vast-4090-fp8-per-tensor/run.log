@@ -1,0 +1,114 @@
+NVIDIA GeForce RTX 4090, 595.99.02, 450.00 W, 24564 MiB
+--- check cuda (fp8 tensor cores)
+cuda NVIDIA GeForce RTX 4090 (sm_89)
+linear fp8 37x70x33 None                         rel 1.49e-2  ok
+linear fp8t 37x70x33 None                        rel 1.48e-2  ok
+linear fp8 130x96x200 GeluTanh                   rel 1.62e-2  ok
+linear fp8t 130x96x200 GeluTanh                  rel 1.36e-2  ok
+linear fp8 65x256x64 None                        rel 1.66e-2  ok
+linear fp8t 65x256x64 None                       rel 1.70e-2  ok
+linear fp8 300x96x260 GeluTanh                   rel 2.00e-2  ok
+linear fp8t 300x96x260 GeluTanh                  rel 1.46e-2  ok
+linear fp8 129x1536x130 None                     rel 1.37e-2  ok
+linear fp8t 129x1536x130 None                    rel 1.54e-2  ok
+linear fp8 1100x1536x200 GeluTanh                rel 1.44e-2  ok
+linear fp8t 1100x1536x200 GeluTanh               rel 1.24e-2  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps, fp8 (latent) rel 4.58e-3  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps, fp8t (latent) rel 4.54e-3  ok
+all 89 checks pass (tolerance 3e-2)
+--- check cuda FASTWAN_CUDA_NO_FP8=1 (bf16 fallback)
+linear fp8 37x70x33 None                         rel 1.49e-2  ok
+linear fp8t 37x70x33 None                        rel 1.48e-2  ok
+linear fp8 130x96x200 GeluTanh                   rel 1.62e-2  ok
+linear fp8t 130x96x200 GeluTanh                  rel 1.36e-2  ok
+linear fp8 65x256x64 None                        rel 1.61e-2  ok
+linear fp8t 65x256x64 None                       rel 1.70e-2  ok
+linear fp8 300x96x260 GeluTanh                   rel 2.00e-2  ok
+linear fp8t 300x96x260 GeluTanh                  rel 1.46e-2  ok
+linear fp8 129x1536x130 None                     rel 1.37e-2  ok
+linear fp8t 129x1536x130 None                    rel 1.54e-2  ok
+linear fp8 1100x1536x200 GeluTanh                rel 1.44e-2  ok
+linear fp8t 1100x1536x200 GeluTanh               rel 1.24e-2  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps, fp8 (latent) rel 4.49e-3  ok
+tiny DiT, VSA 4 tiles, 3 DMD steps, fp8t (latent) rel 4.68e-3  ok
+all 89 checks pass (tolerance 3e-2)
+2838076944
+--- clip-astro-native
+run 0: total 3.96s  prompt 0.17s  denoise 3.41s (["1.14", "1.14", "1.14"])  decode 0.35s
+run 1: total 3.87s  prompt 0.09s  denoise 3.40s (["1.13", "1.14", "1.14"])  decode 0.34s
+clip-astro-native peak GPU MiB: 5054
+--- clip-astro-fp8
+run 0: total 3.75s  prompt 0.17s  denoise 3.21s (["1.07", "1.07", "1.07"])  decode 0.34s
+run 1: total 3.68s  prompt 0.09s  denoise 3.20s (["1.07", "1.07", "1.07"])  decode 0.35s
+clip-astro-fp8 peak GPU MiB: 3998
+--- clip-astro-fp8t
+run 0: total 3.92s  prompt 0.17s  denoise 3.37s (["1.13", "1.12", "1.12"])  decode 0.34s
+run 1: total 3.85s  prompt 0.09s  denoise 3.37s (["1.12", "1.12", "1.13"])  decode 0.35s
+clip-astro-fp8t peak GPU MiB: 3998
+--- clip-fox-native
+run 0: total 3.96s  prompt 0.17s  denoise 3.41s (["1.14", "1.14", "1.14"])  decode 0.35s
+run 1: total 3.87s  prompt 0.09s  denoise 3.40s (["1.13", "1.14", "1.14"])  decode 0.34s
+clip-fox-native peak GPU MiB: 5054
+--- clip-fox-fp8
+run 0: total 3.76s  prompt 0.17s  denoise 3.21s (["1.07", "1.07", "1.07"])  decode 0.34s
+run 1: total 3.68s  prompt 0.09s  denoise 3.20s (["1.07", "1.07", "1.07"])  decode 0.35s
+clip-fox-fp8 peak GPU MiB: 3998
+--- clip-fox-fp8t
+run 0: total 3.92s  prompt 0.17s  denoise 3.38s (["1.13", "1.12", "1.12"])  decode 0.34s
+run 1: total 3.86s  prompt 0.10s  denoise 3.38s (["1.12", "1.13", "1.13"])  decode 0.35s
+clip-fox-fp8t peak GPU MiB: 3998
+psnr clip-astro-native vs clip-astro-fp8: average:21.585789
+psnr clip-astro-native vs clip-astro-fp8t: average:22.032336
+psnr clip-fox-native vs clip-fox-fp8: average:27.435460
+psnr clip-fox-native vs clip-fox-fp8t: average:26.836559
+--- long-native
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 15.40s (10.7 fps, first frames at 0.88s)
+long-native peak GPU MiB: 8286
+--- long-fp8
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 14.16s (11.7 fps, first frames at 0.79s)
+long-fp8 peak GPU MiB: 6974
+--- long-fp8t
+causal: 14 blocks of 3 latent frames, cache 12 (sink 3, Window), timesteps [1000.0, 937.5, 833.3333, 625.0]
+causal: 165 frames in 14.64s (11.3 fps, first frames at 0.84s)
+long-fp8t peak GPU MiB: 6974
+psnr long-native vs long-fp8: average:21.917258
+psnr long-native vs long-fp8t: average:20.662000
+--- profile clip fp8
+run 0: total 4.70s  prompt 0.18s  denoise 4.06s (["1.37", "1.36", "1.33"])  decode 0.43s
+  vsa fine (mma)                              1409.9 ms  40.7%      90 calls    15.666 ms/call
+  fp8 scale+bias+act                           308.7 ms   8.9%     660 calls     0.468 ms/call
+  conv2d (mma)                                 292.6 ms   8.4%     385 calls     0.760 ms/call
+  gemm fp8 n=8960 k=1536                       250.9 ms   7.2%      90 calls     2.788 ms/call
+  gemm fp8 n=1536 k=8960                       243.1 ms   7.0%      90 calls     2.701 ms/call
+  fp8 quantize rows                            187.8 ms   5.4%     660 calls     0.285 ms/call
+  gemm fp8 n=1536 k=1536                       179.2 ms   5.2%     360 calls     0.498 ms/call
+  gemm fp8 n=4608 k=1536                       147.5 ms   4.3%      90 calls     1.639 ms/call
+  head_split (qk-norm + rope)                  108.0 ms   3.1%     510 calls     0.212 ms/call
+  norm                                         104.8 ms   3.0%     273 calls     0.384 ms/call
+  vsa coarse + top-k                            73.0 ms   2.1%      90 calls     0.811 ms/call
+  attention (mma)                               69.1 ms   2.0%      90 calls     0.767 ms/call
+  vsa pool                                      38.1 ms   1.1%      90 calls     0.423 ms/call
+  gate_residual                                 31.7 ms   0.9%      90 calls     0.352 ms/call
+  alloc (zeroed)                                 7.4 ms   0.2%     116 calls     0.064 ms/call
+--- profile clip fp8t
+run 0: total 4.88s  prompt 0.18s  denoise 4.24s (["1.43", "1.42", "1.39"])  decode 0.43s
+  vsa fine (mma)                              1406.5 ms  38.6%      90 calls    15.628 ms/call
+  fp8 scale+bias+act                           308.4 ms   8.5%     660 calls     0.467 ms/call
+  conv2d (mma)                                 292.5 ms   8.0%     385 calls     0.760 ms/call
+  gemm fp8 n=8960 k=1536                       250.8 ms   6.9%      90 calls     2.786 ms/call
+  gemm fp8 n=1536 k=8960                       242.8 ms   6.7%      90 calls     2.698 ms/call
+  fp8 quantize (tensor)                        222.9 ms   6.1%     660 calls     0.338 ms/call
+  gemm fp8 n=1536 k=1536                       179.3 ms   4.9%     360 calls     0.498 ms/call
+  gemm fp8 n=4608 k=1536                       147.5 ms   4.0%      90 calls     1.639 ms/call
+  fp8 amax (tensor)                            146.6 ms   4.0%     660 calls     0.222 ms/call
+  head_split (qk-norm + rope)                  107.9 ms   3.0%     510 calls     0.211 ms/call
+  norm                                         104.8 ms   2.9%     273 calls     0.384 ms/call
+  vsa coarse + top-k                            72.9 ms   2.0%      90 calls     0.810 ms/call
+  attention (mma)                               69.0 ms   1.9%      90 calls     0.766 ms/call
+  vsa pool                                      38.0 ms   1.0%      90 calls     0.423 ms/call
+  gate_residual                                 31.7 ms   0.9%      90 calls     0.352 ms/call
+uploaded
+exit 0
+

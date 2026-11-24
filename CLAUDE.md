@@ -187,8 +187,11 @@ State and invariants only; the reasoning is in `docs/design.md`.
   codes match the CPU bit for bit. RTX 4090: clip denoise −5.6%, long video
   −7.8%, −1.0 to −1.3 GB, clip 21.6–27.4 dB vs native (int8 29.9), no
   artifacts. The GEMMs halve but the two extra activation passes eat most of
-  it; fusing them needs a per-tensor activation scale
-  (`docs/runs/2026-11-24-vast-4090-fp8-option`). Not offered in the browser.
+  it (`docs/runs/2026-11-24-vast-4090-fp8-option`). A per-tensor activation
+  scale (fp8t, tried and removed) does not fuse them: cuBLASLt on sm_89 has
+  no FP8 kernel with a device alpha vector, so it was slower than fp8
+  (`docs/runs/2026-11-24-vast-4090-fp8-per-tensor`); only per-tensor weight
+  scales too would fuse, untried. Not offered in the browser.
 - int8 browser variants are public (`i8`, `si8` in the manifest: 1.56 / 1.49
   GB vs 2.98 / 2.84 GB f16): GPU memory −1.1 to −1.3 GB, quality like a
   backend switch, 13–14% slower in Chrome (`docs/runs/2026-11-24-vast-4090-int8-fp8-eval`).
