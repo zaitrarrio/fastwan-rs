@@ -4,7 +4,10 @@
 
 The bootstrap installs curl / Vulkan / X11-GL libs / ffmpeg, pulls the
 FastWan 2.1 1.3B tree and taew2_1 from the `fv-weights` bucket with presigned
-URLs (R2 egress is free; Vast bills the download per GB), fetches the fastwan
+URLs (R2 egress is free; Vast bills the download per GB; with the static
+`weights` CLI uploaded to `<run>/bin/weights`, weights-rs's release binary, it
+is one ranged, parallel, resumable transfer, otherwise one curl per file),
+fetches the fastwan
 binary from `<run>/BIN_KEY`, then runs `<run>/cmd/N.sh` for N = 1..40 as they
 appear, uploading `<run>/out/N.log` after each. The X11/GL libraries matter:
 without them NVIDIA's Vulkan ICD (libGLX_nvidia) fails to load and wgpu
@@ -22,8 +25,16 @@ for page in s3.get_paginator("list_objects_v2").paginate(Bucket="fv-weights", Pr
     for o in page.get("Contents", []):
         rel = o["Key"][len(SRC):]
         if rel.split("/")[0] in ("transformer", "text_encoder", "tokenizer"):
-            files.append((get("fv-weights", o["Key"]), "/w/fastwan/" + rel))
-files.append((get("fv-weights", TAE), "/w/fastwan/taew2_1.safetensors"))
+            files.append((get("fv-weights", o["Key"]), o["Size"], "/w/fastwan/" + rel))
+tae = s3.head_object(Bucket="fv-weights", Key=TAE)["ContentLength"]
+files.append((get("fv-weights", TAE), tae, "/w/fastwan/taew2_1.safetensors"))
+WBIN = os.environ.get("FASTWAN_WEIGHTS_BIN", "bin/weights")
+try:
+    s3.head_object(Bucket=B, Key=f"{run}/{WBIN}")
+    wbin_url = get(B, f"{run}/{WBIN}")
+except Exception:
+    wbin_url = None
+print("weights CLI: " + ("yes" if wbin_url else f"no ({run}/{WBIN} not uploaded; curl per file)"), file=sys.stderr)
 N = 40
 L = ["#!/bin/bash", "set -u", "LOG=/root/boot.log", "exec >>$LOG 2>&1",
      f"LOGPUT={shlex.quote(put(run + '/boot.log'))}",
@@ -35,9 +46,11 @@ L = ["#!/bin/bash", "set -u", "LOG=/root/boot.log", "exec >>$LOG 2>&1",
      "libx11-6 libxext6 libegl1 libgl1 libglvnd0 >/dev/null && echo 'apt ok'",
      "mkdir -p /w/fastwan/transformer /w/fastwan/text_encoder /w/fastwan/tokenizer",
      "T0=$(date +%s)", "cat > /root/files.txt <<'EOF2'"]
-L += [f"{u} {p}" for u, p in files]
+L += [f"{u} {z} {p}" for u, z, p in files]
 L += ["EOF2",
-      "xargs -P 8 -n 2 sh -c 'curl -sf --retry 5 -o \"$1\" \"$0\" || echo \"FAILED $1\"' < /root/files.txt",
+      (f"curl -sf -o /w/weights {shlex.quote(wbin_url)} && chmod +x /w/weights && "
+       "{ /w/weights plan /root/files.txt -j 32 --progress 30 || echo 'FAILED weights plan'; } || " if wbin_url else "")
+      + "awk '{print $1, $3}' /root/files.txt | xargs -P 8 -n 2 sh -c 'curl -sf --retry 5 -o \"$1\" \"$0\" || echo \"FAILED $1\"'",
       'echo "weights $(du -sh /w/fastwan | cut -f1) in $(( $(date +%s) - T0 ))s"',
       f"curl -sf -o /w/fastwan-bin {shlex.quote(get(B, run + '/' + sys.argv[1]))} && chmod +x /w/fastwan-bin",
       'up $LOG "$LOGPUT"', "echo READY",
