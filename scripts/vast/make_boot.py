@@ -4,8 +4,8 @@
 
 The bootstrap installs curl / Vulkan / X11-GL libs / ffmpeg, pulls the
 FastWan 2.1 1.3B tree and taew2_1 from the `fv-weights` bucket with presigned
-URLs (R2 egress is free; Vast bills the download per GB; with the static
-`weights` CLI uploaded to `<run>/bin/weights`, weights-rs's release binary, it
+URLs (R2 egress is free; Vast bills the download per GB; with weights-rs's static
+`weights` CLI (its GitHub release, or a build uploaded to `<run>/bin/weights`) it
 is one ranged, parallel, resumable transfer, otherwise one curl per file),
 fetches the fastwan
 binary from `<run>/BIN_KEY`, then runs `<run>/cmd/N.sh` for N = 1..40 as they
@@ -28,13 +28,16 @@ for page in s3.get_paginator("list_objects_v2").paginate(Bucket="fv-weights", Pr
             files.append((get("fv-weights", o["Key"]), o["Size"], "/w/fastwan/" + rel))
 tae = s3.head_object(Bucket="fv-weights", Key=TAE)["ContentLength"]
 files.append((get("fv-weights", TAE), tae, "/w/fastwan/taew2_1.safetensors"))
+# The CLI: a build uploaded to <run>/FASTWAN_WEIGHTS_BIN wins, else weights-rs's
+# static release binary (FASTWAN_WEIGHTS_URL; "" falls back to curl per file).
 WBIN = os.environ.get("FASTWAN_WEIGHTS_BIN", "bin/weights")
+WURL = os.environ.get("FASTWAN_WEIGHTS_URL", "https://github.com/zaitrarrio/weights-rs/releases/download/v0.1.0/weights-x86_64-linux")
 try:
     s3.head_object(Bucket=B, Key=f"{run}/{WBIN}")
-    wbin_url = get(B, f"{run}/{WBIN}")
+    wbin_url, wbin_from = get(B, f"{run}/{WBIN}"), f"{run}/{WBIN}"
 except Exception:
-    wbin_url = None
-print("weights CLI: " + ("yes" if wbin_url else f"no ({run}/{WBIN} not uploaded; curl per file)"), file=sys.stderr)
+    wbin_url, wbin_from = (WURL or None), WURL
+print("weights CLI: " + (wbin_from if wbin_url else "none (curl per file)"), file=sys.stderr)
 N = 40
 L = ["#!/bin/bash", "set -u", "LOG=/root/boot.log", "exec >>$LOG 2>&1",
      f"LOGPUT={shlex.quote(put(run + '/boot.log'))}",
@@ -48,7 +51,7 @@ L = ["#!/bin/bash", "set -u", "LOG=/root/boot.log", "exec >>$LOG 2>&1",
      "T0=$(date +%s)", "cat > /root/files.txt <<'EOF2'"]
 L += [f"{u} {z} {p}" for u, z, p in files]
 L += ["EOF2",
-      (f"curl -sf -o /w/weights {shlex.quote(wbin_url)} && chmod +x /w/weights && "
+      (f"curl -sfL -o /w/weights {shlex.quote(wbin_url)} && chmod +x /w/weights && "
        "{ /w/weights plan /root/files.txt -j 32 --progress 30 || echo 'FAILED weights plan'; } || " if wbin_url else "")
       + "awk '{print $1, $3}' /root/files.txt | xargs -P 8 -n 2 sh -c 'curl -sf --retry 5 -o \"$1\" \"$0\" || echo \"FAILED $1\"'",
       'echo "weights $(du -sh /w/fastwan | cut -f1) in $(( $(date +%s) - T0 ))s"',
