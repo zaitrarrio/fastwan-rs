@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+
+# Tests run the CPU reference (the checker, hf_parity, the WebGPU suite's
+# reference side): unoptimized it was ~10x slower (check::tests 1034 s in CI).
+# Debug assertions and overflow checks stay on.
+[profile.test]
+opt-level = 3

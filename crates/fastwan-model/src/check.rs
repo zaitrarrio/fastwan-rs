@@ -1485,9 +1485,26 @@ fn model_vsa<B: Backend>(p: &mut Pair<'_, B>, quant: WeightQuant) {
 mod tests {
     use super::*;
 
+    /// The CPU is deterministic on the op cases (pack / unpack included).
+    /// Not the model-level cases or `vsa_real`: the WebGPU suite
+    /// (`fastwan-wgpu/tests`) holds every case to the CPU, and `vsa_real`'s
+    /// two model-grid VSA cases alone took 108 s of CPU-vs-CPU here (most of
+    /// CI's test time) while proving nothing about a GPU kernel.
     #[test]
     fn cpu_matches_itself() {
-        for r in run_all(&Cpu, 0.0) {
+        let mut p = Pair {
+            be: &Cpu,
+            tol: 0.0,
+            out: Vec::new(),
+            defer: false,
+            pending: Vec::new(),
+        };
+        let mut rng = Rng::new(42);
+        ops(&mut p, &mut rng);
+        pack(&mut p, &mut rng);
+        unpack(&mut p, &mut rng);
+        assert!(!p.out.is_empty());
+        for r in p.out {
             assert!(r.ok, "{r:?}");
         }
     }
